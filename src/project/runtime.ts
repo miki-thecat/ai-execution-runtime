@@ -8,6 +8,7 @@ import type { Operation } from "../operations/operation.ts";
 import { Tracer } from "../observability/index.ts";
 import type { StateEntity, StateStore } from "../state/store.ts";
 import { ProjectRegistry } from "./registry.ts";
+import { ensureTracerEventsPersisted } from "./events.ts";
 import { LocalGitSnapshot, type GitSnapshotMetrics } from "./git.ts";
 import type {
   GitSnapshot,
@@ -27,7 +28,7 @@ import type {
 } from "./types.ts";
 import type { RuntimeEvent } from "../observability/events.ts";
 
-const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
 const MEANINGFUL_EVENTS = new Set([
   "run.started", "run.completed", "run.failed",
   "task.created", "task.started", "task.blocked", "task.completed", "task.failed", "task.cancelled",
@@ -138,6 +139,27 @@ function latest(entities: readonly StateEntity[]): StateEntity | undefined {
   return [...entities].sort((a, b) => (b.updatedAt ?? b.createdAt ?? "").localeCompare(a.updatedAt ?? a.createdAt ?? ""))[0];
 }
 
+function newestEntities(entities: readonly StateEntity[]): StateEntity[] {
+  return [...entities].sort((a, b) => {
+    const timestamp = (b.updatedAt ?? b.createdAt ?? "").localeCompare(a.updatedAt ?? a.createdAt ?? "");
+    return timestamp === 0 ? b.id.localeCompare(a.id) : timestamp;
+  });
+}
+
+function recentProjectEvents(state: StateStore | undefined, projectId: ProjectId, runIds: ReadonlySet<string>): RuntimeEvent[] {
+  if (state === undefined) return [];
+  const events = new Map<string, RuntimeEvent>();
+  const add = (entries: readonly RuntimeEvent[]): void => {
+    for (const event of entries) events.set(event.eventId, event);
+  };
+  add(state.listEvents({ projectId, limit: STATE_CONTEXT_LIMIT }));
+  for (const runId of runIds) add(state.listEvents({ runId: runId as import("../core/ids.ts").RunId, limit: STATE_CONTEXT_LIMIT }));
+  return [...events.values()].sort((a, b) => {
+    const timestamp = b.timestamp.localeCompare(a.timestamp);
+    return timestamp === 0 ? b.eventId.localeCompare(a.eventId) : timestamp;
+  });
+}
+
 function eventMeasurements(event: RuntimeEvent): Readonly<Record<string, number | string>> {
   return {
     durationMs: event.durationMs,
@@ -178,6 +200,8 @@ export class ProjectRuntime {
   constructor(options: ProjectRuntimeOptions = {}) {
     this.state = options.state;
     this.tracer = options.tracer ?? (options.state === undefined ? new Tracer() : new Tracer({ sink: options.state }));
+    ensureTracerEventsPersisted(this.tracer, this.state);
+    if (options.direct !== undefined) ensureTracerEventsPersisted(options.direct.tracer, this.state);
     this.registry = options.registry ?? new ProjectRegistry({ ...(options.state === undefined ? {} : { state: options.state }) });
     this.direct = options.direct ?? new DirectExecutor({
       tracer: this.tracer,
@@ -274,11 +298,11 @@ export class ProjectRuntime {
   }
 
   inspectData(project: ProjectIdentity, git: GitSnapshot): ProjectInspect {
-    const tasks = this.state?.listEntities("tasks", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? [];
-    const runs = this.state?.listEntities("runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? [];
+    const tasks = newestEntities(this.state?.listEntities("tasks", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
+    const runs = newestEntities(this.state?.listEntities("runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
     const runIds = new Set([...runs.map((entity) => entity.id), ...tasks.map((entity) => entity.runId).filter((runId): runId is string => runId !== undefined)]);
-    const processes = (this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
-    const verifications = this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? [];
+    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
+    const verifications = newestEntities(this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
     const activeTasks = tasks.filter((task) => active(task.status)).map(taskSummary).filter((task): task is TaskSummary => task !== undefined).slice(0, 50).reverse();
     const activeProcesses = processes.filter((process) => active(process.status)).map((process) => ({
       id: process.id,
@@ -311,13 +335,14 @@ export class ProjectRuntime {
   resumeData(project: ProjectIdentity, git: GitSnapshot, options: ProjectResumeOptions = {}): ProjectResume {
     const itemLimit = validateLimit(options.itemLimit, 20);
     const eventLimit = validateLimit(options.eventLimit, 20);
-    const tasks = this.state?.listEntities("tasks", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? [];
-    const decisions = this.state?.listEntities("decisions", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? [];
-    const runs = this.state?.listEntities("runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? [];
-    const verifications = this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? [];
-    const agents = this.state?.listEntities("agent_runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? [];
+    const tasks = newestEntities(this.state?.listEntities("tasks", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
+    const decisions = newestEntities(this.state?.listEntities("decisions", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
+    const runs = newestEntities(this.state?.listEntities("runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
+    const verifications = newestEntities(this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
+    const agents = newestEntities(this.state?.listEntities("agent_runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
     const runIds = new Set([...runs.map((entity) => entity.id), ...tasks.map((entity) => entity.runId).filter((runId): runId is string => runId !== undefined)]);
-    const processes = (this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
+    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
+    const eventRunIds = new Set([...runIds, ...processes.map((process) => process.runId).filter((runId): runId is string => runId !== undefined)]);
     const taskSummaries = tasks.filter((task) => active(task.status)).map(taskSummary).filter((task): task is TaskSummary => task !== undefined).slice(0, itemLimit).reverse();
     const taskRunIds = new Set(tasks.filter((task) => active(task.status)).map((task) => task.runId).filter((runId): runId is string => runId !== undefined));
     const activeRuns: RunSummary[] = runs.filter((run) => active(run.status)).slice(0, itemLimit).map((run) => ({
@@ -335,8 +360,8 @@ export class ProjectRuntime {
     const latestVerification = verificationSummary(latest(verifications));
     const lastAgentEntity = latest(agents);
     const lastAgent = lastAgentEntity === undefined ? undefined : compactData(lastAgentEntity);
-    const meaningfulTypes = [...MEANINGFUL_EVENTS] as RuntimeEvent["type"][];
-    const events = (this.state?.listEvents({ projectId: project.projectId, types: meaningfulTypes, limit: eventLimit, order: "desc" }) ?? [])
+    const events = recentProjectEvents(this.state, project.projectId, eventRunIds)
+      .filter((event) => MEANINGFUL_EVENTS.has(event.type))
       .slice(0, eventLimit)
       .reverse()
       .map((event): ResumeEvent => ({
@@ -356,10 +381,10 @@ export class ProjectRuntime {
       blockers.push({ source: `verification:${verification.id}`, message: boundedText(stringValue(verification, "summary") ?? "Latest verification failed", 1_000), status: "failed" });
     }
     const unknownEffects: ResumeBlocker[] = [];
-    for (const entity of [...tasks, ...processes, ...agents, ...verifications].filter((candidate) => candidate.status === "unknown" || candidate.data?.effectState === "unknown")) {
+    for (const entity of [...tasks, ...runs, ...processes, ...agents, ...verifications].filter((candidate) => candidate.status === "unknown" || candidate.data?.effectState === "unknown")) {
       unknownEffects.push({ source: `${entity.kind}:${entity.id}`, message: boundedText(stringValue(entity, "reason") ?? stringValue(entity, "summary") ?? "Effect or runtime state is unknown", 1_000), status: entity.status ?? "unknown" });
     }
-    for (const event of this.state?.listEvents({ projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []) {
+    for (const event of recentProjectEvents(this.state, project.projectId, eventRunIds)) {
       if (event.effectState === "unknown") unknownEffects.push({ source: `event:${event.eventId}`, message: boundedText(event.summary ?? "An operation recorded an unknown effect", 1_000), status: "unknown" });
     }
     const refs: ArtifactRef[] = [];

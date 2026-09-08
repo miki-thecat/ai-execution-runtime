@@ -56,6 +56,8 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
 
     const reopenedTasks = new TaskManager({ state, tracer });
     assert.equal(reopenedTasks.get(task.taskId)?.status, "completed");
+    const unknownTask = tasks.create({ projectId: project.projectId, title: "reconcile unknown effect" });
+    tasks.markUnknown(unknownTask.taskId, { reason: "process ownership was lost" });
 
     const run = tracer.startRun({ projectId: project.projectId, actor: "runtime" });
     const context = createOperationContext({ traceId: run.traceId, runId: run.runId, projectId: project.projectId, actor: "runtime" });
@@ -71,6 +73,8 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
     assert.equal(checked.data.passed, true);
     assert.equal(checked.data.checks[0]?.status, "passed");
     assert.ok(state.getEntity("verifications", checked.data.verificationId));
+    assert.ok(state.listEvents({ type: "process.started" }).length > 0);
+    assert.ok(state.listEvents({ type: "process.completed" }).length > 0);
     run.complete();
 
     const resumed = await runtime.resume(project, undefined, { eventLimit: 8, itemLimit: 8 });
@@ -79,6 +83,9 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
     assert.equal(resumed.data.identity.goal, "Prove FA-04");
     assert.equal(resumed.data.git.head, inspected.data.git.head);
     assert.equal(resumed.data.lastVerification?.passed, true);
+    assert.equal(resumed.data.activeTasks.some((entry) => entry.taskId === unknownTask.taskId), false);
+    assert.ok(resumed.data.unknownEffects.some((entry) => entry.source === `tasks:${unknownTask.taskId}`));
+    assert.ok(resumed.data.unknownEffects.some((entry) => entry.source.startsWith("runs:")));
     assert.ok(resumed.data.recentEvents.length <= 8);
     assert.equal(JSON.stringify(resumed.data).includes("disposable project"), false);
     const eventTypes = new Set(sink.events.map((event) => event.type));
@@ -104,5 +111,24 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
     try { state.close(); } catch { /* already closed in the reopen assertion */ }
     rmSync(root, { recursive: true, force: true });
     rmSync(runtimeRoot, { recursive: true, force: true });
+  }
+});
+
+test("committed project configuration remains authoritative until explicitly written", () => {
+  const root = mkdtempSync(join(tmpdir(), "aer-fa04-registry-"));
+  try {
+    const registry = new ProjectRegistry();
+    const committed = registry.register({ rootDir: root, name: "Committed", goal: "Keep this goal", verify: ["node -e pass"] });
+    const reopened = registry.register({ rootDir: root, name: "Transient", goal: "Do not persist", verify: ["node -e fail"] });
+    assert.equal(reopened.projectId, committed.projectId);
+    assert.equal(reopened.name, "Committed");
+    assert.equal(reopened.goal, "Keep this goal");
+    assert.deepEqual(reopened.config.verify, ["node -e pass"]);
+
+    const updated = registry.register({ rootDir: root, name: "Updated", goal: "New goal", writeConfig: true });
+    assert.equal(updated.name, "Updated");
+    assert.equal(updated.goal, "New goal");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

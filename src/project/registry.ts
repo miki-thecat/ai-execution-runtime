@@ -41,36 +41,42 @@ export class ProjectRegistry {
     const rootDir = this.projectRoot(registration.rootDir);
     const existingConfig = readProjectConfig(rootDir);
     const persisted = this.persistedForRoot(rootDir);
-    const suppliedConfig = registration.config === undefined ? {} : { ...registration.config };
+    const shouldWriteConfig = registration.writeConfig ?? (existingConfig === undefined || existingConfig.id === undefined);
+    // A committed config is authoritative. Registration-time overrides are
+    // accepted only when this call is going to commit them, otherwise the
+    // returned identity must describe the same config a later reopen reads.
+    const acceptsOverrides = existingConfig === undefined || shouldWriteConfig;
+    const suppliedConfig = acceptsOverrides && registration.config !== undefined ? { ...registration.config } : {};
     const configCandidate: Record<string, unknown> = {
       ...(existingConfig ?? {}),
       ...suppliedConfig,
-      ...(registration.name === undefined ? {} : { name: registration.name }),
-      ...(registration.goal === undefined ? {} : { goal: registration.goal }),
-      ...(registration.verify === undefined ? {} : { verify: registration.verify }),
+      ...(acceptsOverrides && registration.name !== undefined ? { name: registration.name } : {}),
+      ...(acceptsOverrides && registration.goal !== undefined ? { goal: registration.goal } : {}),
+      ...(acceptsOverrides && registration.verify !== undefined ? { verify: registration.verify } : {}),
       version: 1,
     };
-    const requestedId = registration.projectId ?? registration.id;
+    const requestedId = acceptsOverrides ? registration.projectId ?? registration.id : undefined;
     const id = requestedId ?? (typeof configCandidate.id === "string" ? configCandidate.id as ProjectId : undefined) ?? persisted?.projectId ?? createProjectId();
     configCandidate.id = id;
     const config = parseProjectConfig(configCandidate);
     const name = nonEmpty(registration.name ?? config.name, basename(rootDir));
     const goal = registration.goal ?? config.goal;
-    const shouldWriteConfig = registration.writeConfig ?? (existingConfig === undefined || existingConfig.id === undefined);
+    const authoritativeName = acceptsOverrides ? name : nonEmpty(config.name, basename(rootDir));
+    const authoritativeGoal = acceptsOverrides ? goal : config.goal;
     const configPath = projectConfigPath(rootDir);
-    if (shouldWriteConfig) writeProjectConfig(rootDir, { ...config, name, ...(goal === undefined ? {} : { goal }) });
+    if (shouldWriteConfig) writeProjectConfig(rootDir, { ...config, name: authoritativeName, ...(authoritativeGoal === undefined ? {} : { goal: authoritativeGoal }) });
     const project: ProjectIdentity = {
       projectId: id,
       id,
-      name,
+      name: authoritativeName,
       rootDir,
       root: rootDir,
       configPath,
-      ...(goal === undefined ? {} : { goal }),
+      ...(authoritativeGoal === undefined ? {} : { goal: authoritativeGoal }),
       config: {
         ...config,
-        name,
-        ...(goal === undefined ? {} : { goal }),
+        name: authoritativeName,
+        ...(authoritativeGoal === undefined ? {} : { goal: authoritativeGoal }),
       },
     };
     this.projects.set(id, project);
@@ -124,7 +130,9 @@ export class ProjectRegistry {
       const entity = this.state.listEntities("projects").find((candidate) => dataFor(candidate).rootDir === rootDir);
       if (entity === undefined) return undefined;
       const data = dataFor(entity);
-      return { projectId: entity.id as ProjectId, id: entity.id as ProjectId, name: String(data.name ?? basename(rootDir)), rootDir, root: rootDir, configPath: projectConfigPath(rootDir), config: parseProjectConfig(data.config ?? {}) };
+      const config = parseProjectConfig(data.config ?? {});
+      const projectId = (config.id as ProjectId | undefined) ?? entity.id as ProjectId;
+      return { projectId, id: projectId, name: config.name ?? String(data.name ?? basename(rootDir)), rootDir, root: rootDir, configPath: projectConfigPath(rootDir), config };
     })();
   }
 
@@ -137,11 +145,12 @@ export class ProjectRegistry {
       const config = (() => {
         try { return readProjectConfig(rootDir) ?? parseProjectConfig(data.config ?? {}); } catch { return parseProjectConfig(data.config ?? {}); }
       })();
+      const projectId = (config.id as ProjectId | undefined) ?? entity.id as ProjectId;
       const name = config.name ?? (typeof data.name === "string" ? data.name : basename(rootDir));
       const goal = config.goal ?? (typeof data.goal === "string" ? data.goal : undefined);
-      this.projects.set(entity.id as ProjectId, {
-        projectId: entity.id as ProjectId,
-        id: entity.id as ProjectId,
+      this.projects.set(projectId, {
+        projectId,
+        id: projectId,
         name,
         rootDir,
         root: rootDir,

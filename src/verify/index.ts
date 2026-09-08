@@ -8,6 +8,7 @@ import { Tracer } from "../observability/index.ts";
 import type { StateEntity, StateStore } from "../state/store.ts";
 import { configuredVerificationCommands, type ConfiguredVerification, type VerificationCommandConfig } from "../project/config.ts";
 import { ProjectRegistry } from "../project/registry.ts";
+import { ensureTracerEventsPersisted } from "../project/events.ts";
 import type { ProjectIdentity, ProjectOperationInput, ProjectRef } from "../project/types.ts";
 
 export type VerificationCheckStatus = "passed" | "failed" | "cancelled" | "unknown";
@@ -177,6 +178,8 @@ export class VerificationRunner {
   constructor(options: VerificationRunnerOptions = {}) {
     this.state = options.state;
     this.tracer = options.tracer ?? (options.state === undefined ? new Tracer() : new Tracer({ sink: options.state }));
+    ensureTracerEventsPersisted(this.tracer, this.state);
+    if (options.direct !== undefined) ensureTracerEventsPersisted(options.direct.tracer, this.state);
     this.registry = options.registry ?? new ProjectRegistry({ ...(options.state === undefined ? {} : { state: options.state }) });
     this.direct = options.direct ?? new DirectExecutor({
       tracer: this.tracer,
