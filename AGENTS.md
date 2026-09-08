@@ -1,25 +1,55 @@
 # AGENTS.md
 
 ## Product goal
-Build an AI-native execution runtime that lets ChatGPT/AI clients operate a computer directly or delegate work to specialized agents.
+Build AI Execution Runtime: a persistent, AI-native execution layer that lets ChatGPT/AI clients operate a computer directly or delegate bounded work to specialized agents, with durable state, verification, rollback evidence, and observability.
 
-## Delivery rule
-Prefer a thin end-to-end implementation over deep isolated subsystems. Keep the main branch runnable and observable.
+## Architecture authority
+During Product-complete Full Alpha, these files are canonical:
 
-## Core architecture
-- Direct execution is first-class; Codex is optional, not a mandatory hop.
-- Runtime owns persistent project/task state; chats and agents do not.
-- Every meaningful execution emits structured events from day one.
-- Large outputs become artifacts; model-facing results stay compact.
-- Writes should be diff-first, reversible where practical, and independently verifiable.
-- Sandbox is a provider abstraction. Start with direct/local execution; add stronger isolation behind the same contract.
+1. `docs/ARCHITECTURE.md`
+2. `docs/OBSERVABILITY.md`
+3. `docs/FULL_ALPHA_PLAN.md`
+4. the exact GitHub Issue contract being implemented
 
-## Full-alpha scope
-Direct shell/process/files/search, project inspect/resume, SQLite state/event log, artifacts, verification, MCP surface, Codex adapter skeleton, remote-transport abstraction, sandbox abstraction, and benchmark hooks.
+If implementation convenience conflicts with those documents, the documents win. Do not redesign architecture inside an implementation Issue.
 
-## Engineering constraints
-- TypeScript on Node.js 24+, pnpm, strict types, Vitest.
-- Avoid premature cloud, billing, RBAC, GraphRAG, custom VM infrastructure, or fancy UI.
-- Never store secrets or full sensitive content in telemetry by default.
-- Tests and typecheck are required for implemented behavior.
-- Keep interfaces small and capability-driven.
+## Current delivery phase
+**PRODUCT-COMPLETE FULL ALPHA — breadth first.**
+
+Priority order:
+1. preserve canonical contracts and dependency direction;
+2. complete the requested vertical capability;
+3. keep the product path runnable and observable;
+4. add only tests required for the contract, happy path, and critical workspace/effect safety;
+5. defer exhaustive edge cases, compatibility polish, performance tuning, and speculative abstractions.
+
+## Non-negotiable architecture
+- ChatGPT/AI client is the planner/control brain; AER v0 has no second LLM planner.
+- Direct execution is first-class. Codex is an optional sibling executor, never a mandatory hop.
+- Project/runtime owns durable state; chat and agent sessions do not.
+- Every meaningful operation emits canonical structured observability.- Large/raw outputs become local artifacts; model-facing results stay bounded.
+- Long waits happen inside AER rather than through repeated model polling.
+- Semantic operations retain raw CLI fallback through direct execution.
+- Writes/effects expose effect state and are idempotent/reversible where the Issue contract requires it.
+- MCP/CLI/App/remote are adapters over one internal runtime, not separate implementations.
+- Sandbox is a provider abstraction. Do not implement custom Firecracker infrastructure in Full Alpha.
+
+## Issue discipline
+- Work only on the exact Issue scope and owned paths.
+- Do not expand into deferred subsystems just because they are nearby.
+- Do not silently change shared core interfaces from a downstream Issue. If the contract is insufficient, stop and report the blocker.
+- Do not create another planner/router/agent framework inside AER.
+- Do not mutate GitHub task authority from the worker unless the controller explicitly owns that effect.
+
+## Engineering baseline
+- TypeScript / Node.js 24+, pnpm, strict types.
+- Official MCP TypeScript SDK v2 for MCP work.
+- Local-first SQLite state behind an interface.
+- `git` and `gh` are providers/sources of truth, not things to reimplement.
+- Prefer structured `gh --json` / API / GraphQL and compact semantic snapshots.
+- Never persist secrets or full sensitive content in telemetry by default.
+
+## Full Alpha testing rule
+Each implemented capability needs one happy path, required downstream contract tests, critical workspace/effect safety tests where relevant, and evidence that observability is emitted.
+
+Do not spend an Issue on exhaustive test matrices unless the Issue explicitly asks for hardening.
