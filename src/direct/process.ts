@@ -218,10 +218,17 @@ export class DirectProcessManager {
       stdio: ["ignore", "pipe", "pipe"],
     };
 
+    // Establish a durable restart-reconciliation point before creating the
+    // detached child. If the runtime stops after spawn but before the running
+    // update below, this queued record is enough for a new runtime to mark the
+    // process UNKNOWN rather than losing track of a live process.
+    this.persist(record, "queued");
+
     let child: ChildProcessLike;
     try {
       child = spawn(options.command.executable, args, spawnOptions);
     } catch (error) {
+      this.persist(record, "failed", { error: error instanceof Error ? error.message : "Process could not be started" });
       throw this.spawnError(error);
     }
 
@@ -229,7 +236,8 @@ export class DirectProcessManager {
     const stderr = new OutputCollector(maxOutputBytes, id, "stderr");
     child.stdout?.on("data", (chunk) => stdout.add(chunk));
     child.stderr?.on("data", (chunk) => stderr.add(chunk));
-    this.persist(record, "running");
+    const runningRecord: ProcessRecord = { ...record, ...(child.pid === undefined ? {} : { pid: child.pid }) };
+    this.persist(runningRecord, "running");
     this.tracer.emit({
       traceId: options.context.traceId,
       runId: options.context.runId,
@@ -306,7 +314,7 @@ export class DirectProcessManager {
         cancelled,
         ...(error === undefined ? {} : { error }),
       };
-      this.persist(record, status, {
+      this.persist(runningRecord, status, {
         completedAt: endedAt.toISOString(),
         ...(code === null ? {} : { exitCode: code }),
         ...(signal === null ? {} : { signal }),
