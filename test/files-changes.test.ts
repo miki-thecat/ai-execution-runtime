@@ -40,6 +40,28 @@ test("file reads and searches are bounded and carry content identity", () => {
     assert.equal(search.data.matches[0]?.path, "notes.txt");
     assert.equal(search.data.matches[0]?.line, 2);
     assert.equal(search.data.truncated, true);
+    const sameFileSearch = files.search({ query: "needle", maxResults: 2 }, context);
+    assert.equal(sameFileSearch.ok, true);
+    if (!sameFileSearch.ok) return;
+    assert.equal(sameFileSearch.data.matches.length, 2);
+    assert.equal(sameFileSearch.meta.metrics.filesRead, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bounded line reads continue from a partial line", () => {
+  const root = fixture();
+  try {
+    writeFileSync(join(root, "long.txt"), "abcdefghij\nnext\n");
+    const tracer = new Tracer();
+    const { context } = contextFor(tracer);
+    const result = new FileOperations({ rootDir: root }).read({ path: "long.txt", maxBytes: 5 }, context);
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.data.content, "abcde");
+    assert.equal(result.data.nextLine, 1);
+    assert.equal(result.data.hasMore, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -103,6 +125,32 @@ test("guarded patch records evidence and rollback refuses stale files", () => {
     assert.equal(new TextDecoder().decode(readFileSync(path)), "before\n");
     assert.ok(sink.events.some((event) => event.type === "changeset.rolled_back" && event.changesetId === patched.data.changeset.id));
     run.complete();
+  } finally {
+    state.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("persisted ChangeSet evidence supports rollback after manager recreation", () => {
+  const root = fixture();
+  const state = new SqliteStateStore(":memory:");
+  try {
+    const path = join(root, "fixture.txt");
+    writeFileSync(path, "before\n");
+    const tracer = new Tracer();
+    const { context } = contextFor(tracer);
+    const first = new FileOperations({ rootDir: root, state });
+    const before = first.read({ path: "fixture.txt" }, context);
+    assert.equal(before.ok, true);
+    if (!before.ok) return;
+    const patched = first.patch({ path: "fixture.txt", expectedHash: before.data.contentHash, content: "after\n" }, context);
+    assert.equal(patched.ok, true);
+    if (!patched.ok) return;
+
+    const recreated = new FileOperations({ rootDir: root, state });
+    const rolledBack = recreated.rollback(patched.data.changeset, context);
+    assert.equal(rolledBack.ok, true);
+    assert.equal(new TextDecoder().decode(readFileSync(path)), "before\n");
   } finally {
     state.close();
     rmSync(root, { recursive: true, force: true });

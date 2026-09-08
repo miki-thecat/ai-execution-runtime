@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative } from "node:path";
 import { pid } from "node:process";
 import {
   createOperationMeta,
@@ -226,8 +226,12 @@ export class FileOperations {
       const selected = selectedLines.join("\n") + (fullText.endsWith("\n") && endLine >= lines.length && selectedLines.length > 0 ? "\n" : "");
       const selectedBytes = new TextEncoder().encode(selected);
       const bounded = boundedText(selectedBytes, maxBytes);
-      const shownLines = bounded.text === "" ? 0 : bounded.text.endsWith("\n") ? bounded.text.split("\n").length - 1 : bounded.text.split("\n").length;
-      const nextLine = bounded.truncated || endLine < lines.length ? startLine + shownLines : undefined;
+      // A byte bound may end in the middle of a line. In that case the next
+      // continuation starts on the same line, not on the following line.
+      const completeLines = bounded.truncated
+        ? [...bounded.text].filter((character) => character === "\n").length
+        : selectedLines.length;
+      const nextLine = bounded.truncated || endLine < lines.length ? startLine + completeLines : undefined;
       const hasMore = nextLine !== undefined;
       const refs = bounded.truncated ? this.putArtifact(bytes, "file.read", operationContext) : [];
       const data: FileReadResult = {
@@ -269,7 +273,8 @@ export class FileOperations {
       const boundedResult: FileSearchResult = { ...boundedByBytes, artifactRefs: refs };
       const returnedOutputBytes = byteLength(JSON.stringify(boundedResult));
       const rawOutputBytes = computation.rawOutputBytes;
-      return runtimeSuccess(boundedResult, this.finish(instrumentation, operationContext, "file.search", "read", { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes, returnedOutputBytes, artifactBytes: refs.length === 0 ? 0 : rawOutputBytes, filesRead: result.matches.length }, refs, "completed", boundedResult.hasMore ? "bounded search results" : "search completed"));
+      const filesRead = new Set(result.matches.map((match) => match.path)).size;
+      return runtimeSuccess(boundedResult, this.finish(instrumentation, operationContext, "file.search", "read", { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes, returnedOutputBytes, artifactBytes: refs.length === 0 ? 0 : rawOutputBytes, filesRead }, refs, "completed", boundedResult.hasMore ? "bounded search results" : "search completed"));
     } catch (cause: unknown) {
       return this.failure(instrumentation, operationContext, "file.search", "read", safeError(cause, "FILE_SEARCH_FAILED"), inputBytes(input));
     }
@@ -295,11 +300,15 @@ export class FileOperations {
       const replacement = input.content !== undefined ? input.content : unifiedPatch(source, input.patch!);
       const after = typeof replacement === "string" ? new TextEncoder().encode(replacement) : replacement;
       const outputPath = resolveConfinedPath(this.rootDir, input.path, true);
-      const parent = join(outputPath, "..");
-      // The path was resolved through realpath above, so this replacement is
-      // atomic and cannot follow a newly introduced outside-root symlink.
-      if (!existsSync(parent)) throw createRuntimeError({ code: "FILE_PARENT_MISSING", message: `Parent directory does not exist: ${input.path}`, retryable: false, effect: "none" });
-      atomicWrite(outputPath, after);
+      const current = existsSync(outputPath) ? readFileSync(outputPath) : undefined;
+      const currentHash = current === undefined ? undefined : sha256(current);
+      const beforeHash = before === undefined ? undefined : sha256(before);
+      if (currentHash !== beforeHash || (current === undefined) !== (before === undefined)) {
+        throw createRuntimeError({ code: "FILE_HASH_MISMATCH", message: `Refusing to overwrite ${input.path}; the file changed while preparing the patch`, retryable: false, effect: "none", details: { path: input.path, expectedHash: beforeHash, actualHash: currentHash } });
+      }
+      const parent = dirname(outputPath);
+      if (!existsSync(parent) || !statSync(parent).isDirectory()) throw createRuntimeError({ code: "FILE_PARENT_MISSING", message: `Parent directory does not exist: ${input.path}`, retryable: false, effect: "none" });
+      atomicWrite(this.rootDir, outputPath, after);
       const afterHash = sha256(after);
       const changeset = this.changes.record({ context: operationContext, files: [{ path: relativeFile(this.rootDir, outputPath), ...(before === undefined ? {} : { before }), after }] });
       const data: FilePatchResult = { path: relativeFile(this.rootDir, outputPath), ...(before === undefined ? {} : { beforeHash: sha256(before) }), afterHash, changeset, changeSet: changeset };
@@ -332,10 +341,11 @@ export class FileOperations {
     const args = ["--json", "--color", "never", "--no-heading", "--max-count", String(maxResults)];
     if (!input.regex) args.push("--fixed-strings");
     args.push(input.query, searchRoot);
-    const processResult = spawnSync("rg", args, { encoding: "utf8", maxBuffer: Math.max(1024 * 1024, (input.maxBytes ?? DEFAULT_MAX_FILE_READ_BYTES) * 4) });
+    const processResult = spawnSync("rg", args, { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
     if (processResult.error?.message.includes("ENOENT")) return undefined;
-    if (processResult.error) throw processResult.error;
-    if (processResult.status !== 0 && processResult.status !== 1) throw new Error(String(processResult.stderr) || "rg search failed");
+    const outputTruncated = processResult.error !== undefined && /maxbuffer|enobufs/i.test(processResult.error.message);
+    if (processResult.error && !outputTruncated) throw processResult.error;
+    if (!outputTruncated && processResult.status !== 0 && processResult.status !== 1) throw new Error(String(processResult.stderr) || "rg search failed");
     const matches: FileSearchMatch[] = [];
     for (const line of String(processResult.stdout).split("\n")) {
       if (line === "") continue;
@@ -357,7 +367,7 @@ export class FileOperations {
       if (matches.length >= maxResults) break;
     }
     matches.sort(compareMatches);
-    return { result: { query: input.query, matches, resultCount: matches.length, hasMore: matches.length >= maxResults, truncated: matches.length >= maxResults, backend: "rg", artifactRefs: [] }, rawOutputBytes: byteLength(String(processResult.stdout)) };
+    return { result: { query: input.query, matches, resultCount: matches.length, hasMore: outputTruncated || matches.length >= maxResults, truncated: outputTruncated || matches.length >= maxResults, backend: "rg", artifactRefs: [] }, rawOutputBytes: byteLength(String(processResult.stdout)) };
   }
 
   private searchFallback(input: FileSearchInput, searchRoot: string, maxResults: number): SearchComputation {
@@ -426,7 +436,7 @@ function boundSearchBytes(result: FileSearchResult, maxBytes: number | undefined
   const matches: FileSearchMatch[] = [];
   for (const match of result.matches) {
     const candidate = [...matches, match];
-    if (byteLength(JSON.stringify(candidate)) > limit && matches.length > 0) break;
+    if (byteLength(JSON.stringify(candidate)) > limit) break;
     matches.push(match);
   }
   const hasMore = result.hasMore || matches.length < result.matches.length;
@@ -451,10 +461,23 @@ function walk(directory: string, root: string, files: string[]): void {
   }
 }
 
-function atomicWrite(path: string, content: Uint8Array): void {
-  const temporary = `${path}.aer-tmp-${pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  try { writeFileSync(temporary, content, { flag: "wx", mode: 0o600 }); renameSync(temporary, path); }
-  finally { if (existsSync(temporary)) unlinkSync(temporary); }
+function atomicWrite(rootDir: string, path: string, content: Uint8Array): void {
+  const parent = dirname(path);
+  const confinedParent = resolveConfinedPath(rootDir, relative(rootDir, parent) || ".", false);
+  if (confinedParent !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
+  const directoryFd = openSync(parent, "r");
+  const anchoredParent = `/proc/self/fd/${directoryFd}`;
+  const temporaryName = `.aer-tmp-${pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const temporary = join(anchoredParent, temporaryName);
+  const destination = join(anchoredParent, basename(path));
+  try {
+    if (realpathSync(anchoredParent) !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
+    writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+    renameSync(temporary, destination);
+  } finally {
+    if (existsSync(temporary)) unlinkSync(temporary);
+    closeSync(directoryFd);
+  }
 }
 
 export function createFileOperations(options: FileOperationsOptions): FileOperations { return new FileOperations(options); }

@@ -1,15 +1,16 @@
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   existsSync,
   lstatSync,
-  mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pid } from "node:process";
 import type { OperationContext } from "../core/context.ts";
 import {
@@ -156,13 +157,21 @@ function assertInside(root: string, candidate: string): void {
   }
 }
 
-function atomicReplace(path: string, content: Uint8Array): void {
-  const temporary = `${path}.aer-tmp-${pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+function atomicReplace(rootDir: string, path: string, content: Uint8Array): void {
+  const parent = dirname(path);
+  const confinedParent = resolveConfinedPath(rootDir, relative(rootDir, parent) || ".", false);
+  if (confinedParent !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
+  const directoryFd = openSync(parent, "r");
+  const anchoredParent = `/proc/self/fd/${directoryFd}`;
+  const temporary = join(anchoredParent, `.aer-tmp-${pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const destination = join(anchoredParent, basename(path));
   try {
+    if (realpathSync(anchoredParent) !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
     writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
-    renameSync(temporary, path);
+    renameSync(temporary, destination);
   } finally {
     if (existsSync(temporary)) unlinkSync(temporary);
+    closeSync(directoryFd);
   }
 }
 
@@ -263,7 +272,7 @@ export class ChangeSetManager {
       summary: input.summary ?? `${files.length} file${files.length === 1 ? "" : "s"} changed (${diffSummary.addedLines} additions, ${diffSummary.removedLines} removals)`,
     };
     this.snapshots.set(id, snapshots);
-    this.persist(changeset);
+    this.persist(changeset, snapshots);
     this.emit("changeset.created", changeset, input.context);
     this.emit("changeset.applied", changeset, input.context);
     return changeset;
@@ -274,7 +283,7 @@ export class ChangeSetManager {
     try {
       const snapshots = this.snapshots.get(changeset.id);
       const planned = changeset.files.map((file, index) => ({ file, snapshot: snapshots?.[index] }));
-      const beforeContent = planned.map(({ file, snapshot }) => ({ file, content: this.contentForRollback(file, snapshot) }));
+      const beforeContent = planned.map(({ file, snapshot }) => ({ file, content: this.contentForRollback(changeset.id, file, snapshot) }));
 
       // Preflight every file before changing any of them. This keeps a multi-file
       // rollback from partially applying after one file was edited externally.
@@ -297,8 +306,7 @@ export class ChangeSetManager {
       for (const { file, content } of beforeContent) {
         const path = resolveConfinedPath(this.rootDir, file.path, true);
         if (file.beforeExists && content !== undefined) {
-          mkdirSync(dirname(path), { recursive: true });
-          atomicReplace(path, content);
+          atomicReplace(this.rootDir, path, content);
         } else if (!file.beforeExists && existsSync(path)) {
           unlinkSync(path);
         }
@@ -315,10 +323,16 @@ export class ChangeSetManager {
     }
   }
 
-  private contentForRollback(file: ChangeSetFile, snapshot: Snapshot | undefined): Uint8Array | undefined {
+  private contentForRollback(changesetId: ChangesetId, file: ChangeSetFile, snapshot: Snapshot | undefined): Uint8Array | undefined {
     if (!file.beforeExists) return undefined;
     if (snapshot?.before !== undefined) return snapshot.before;
     if (file.beforeArtifactRef !== undefined && this.artifacts !== undefined) return this.artifacts.read(file.beforeArtifactRef);
+    const persisted = this.state?.getEntity("changeset_files", `${changesetId}:${file.path}`);
+    const value = persisted?.data?.rollbackBeforeBytes;
+    if (Array.isArray(value) && value.every((byte): byte is number => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+      const before = Uint8Array.from(value);
+      if (file.beforeHash === sha256(before)) return before;
+    }
     throw createRuntimeError({ code: "ROLLBACK_EVIDENCE_MISSING", message: `Rollback evidence is unavailable for ${file.path}`, retryable: false, effect: "none" });
   }
 
@@ -335,7 +349,7 @@ export class ChangeSetManager {
     });
   }
 
-  private persist(changeset: ChangeSet): void {
+  private persist(changeset: ChangeSet, snapshots: readonly Snapshot[] | undefined = undefined): void {
     if (this.state === undefined) return;
     this.state.saveEntity({
       kind: "changesets",
@@ -348,7 +362,12 @@ export class ChangeSetManager {
       updatedAt: changeset.updatedAt,
       data: { changesetId: changeset.id, summary: changeset.summary, diffSummary: changeset.diffSummary, files: changeset.files },
     });
-    for (const file of changeset.files) {
+    for (const [index, file] of changeset.files.entries()) {
+      const previous = this.state.getEntity("changeset_files", `${changeset.id}:${file.path}`);
+      const snapshot = snapshots?.[index];
+      const rollbackBeforeBytes = snapshot?.before !== undefined
+        ? [...snapshot.before]
+        : previous?.data?.rollbackBeforeBytes;
       this.state.saveEntity({
         kind: "changeset_files",
         id: `${changeset.id}:${file.path}`,
@@ -357,7 +376,7 @@ export class ChangeSetManager {
         runId: changeset.runId,
         status: changeset.status,
         traceId: changeset.traceId,
-        data: { ...file },
+        data: { ...file, ...(rollbackBeforeBytes === undefined ? {} : { rollbackBeforeBytes }) },
       });
     }
   }
