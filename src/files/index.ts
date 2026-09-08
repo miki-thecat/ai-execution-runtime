@@ -249,7 +249,7 @@ export class FileOperations {
         artifactRefs: refs,
       };
       const metrics = { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes: bytes.byteLength, returnedOutputBytes: byteLength(data.content), artifactBytes: refs.length === 0 ? 0 : bytes.byteLength, filesRead: 1 };
-      return runtimeSuccess(data, this.finish(instrumentation, operationContext, "file.read", "read", metrics, refs, "completed", bounded.truncated ? "bounded file read; full content is in an artifact" : "bounded file read"));
+      return runtimeSuccess(data, this.finish(instrumentation, operationContext, "file.read", "read", metrics, refs, "completed", bounded.truncated ? "bounded file read; full content is in an artifact" : "bounded file read", "none", bounded.truncated));
     } catch (cause: unknown) {
       return this.failure(instrumentation, operationContext, "file.read", "read", safeError(cause, "FILE_READ_FAILED"), inputBytes(input));
     }
@@ -268,13 +268,13 @@ export class FileOperations {
       const rg = this.searchWithRg(input, searchRoot, maxResults);
       const computation = rg ?? this.searchFallback(input, searchRoot, maxResults);
       const result = computation.result;
-      const boundedByBytes = boundSearchBytes(result, input.maxBytes);
+      const boundedByBytes = boundSearchBytes(result, input.maxBytes ?? DEFAULT_MAX_FILE_READ_BYTES);
       const refs = boundedByBytes.hasMore ? this.putArtifact(new TextEncoder().encode(JSON.stringify(result.matches)), "file.search", operationContext) : [];
       const boundedResult: FileSearchResult = { ...boundedByBytes, artifactRefs: refs };
       const returnedOutputBytes = byteLength(JSON.stringify(boundedResult));
       const rawOutputBytes = computation.rawOutputBytes;
       const filesRead = new Set(result.matches.map((match) => match.path)).size;
-      return runtimeSuccess(boundedResult, this.finish(instrumentation, operationContext, "file.search", "read", { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes, returnedOutputBytes, artifactBytes: refs.length === 0 ? 0 : rawOutputBytes, filesRead }, refs, "completed", boundedResult.hasMore ? "bounded search results" : "search completed"));
+      return runtimeSuccess(boundedResult, this.finish(instrumentation, operationContext, "file.search", "read", { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes, returnedOutputBytes, artifactBytes: refs.length === 0 ? 0 : rawOutputBytes, filesRead }, refs, "completed", boundedResult.hasMore ? "bounded search results" : "search completed", "none", boundedResult.truncated));
     } catch (cause: unknown) {
       return this.failure(instrumentation, operationContext, "file.search", "read", safeError(cause, "FILE_SEARCH_FAILED"), inputBytes(input));
     }
@@ -283,6 +283,7 @@ export class FileOperations {
   patch(input: FilePatchInput, context: OperationContext, options: InternalOptions = {}): RuntimeResult<FilePatchResult> {
     const instrumentation = this.start("file.patch", "write", context, options.instrument !== false);
     const operationContext = instrumentation.context;
+    let writeApplied = false;
     try {
       assertEffectAllowed(operationContext, "write");
       if ((input.content === undefined) === (input.patch === undefined)) throw createRuntimeError({ code: "PATCH_INPUT_INVALID", message: "Provide exactly one of content or patch", retryable: false, effect: "none" });
@@ -299,23 +300,31 @@ export class FileOperations {
       const source = before === undefined ? "" : new TextDecoder().decode(before);
       const replacement = input.content !== undefined ? input.content : unifiedPatch(source, input.patch!);
       const after = typeof replacement === "string" ? new TextEncoder().encode(replacement) : replacement;
-      const outputPath = resolveConfinedPath(this.rootDir, input.path, true);
-      const current = existsSync(outputPath) ? readFileSync(outputPath) : undefined;
-      const currentHash = current === undefined ? undefined : sha256(current);
       const beforeHash = before === undefined ? undefined : sha256(before);
-      if (currentHash !== beforeHash || (current === undefined) !== (before === undefined)) {
-        throw createRuntimeError({ code: "FILE_HASH_MISMATCH", message: `Refusing to overwrite ${input.path}; the file changed while preparing the patch`, retryable: false, effect: "none", details: { path: input.path, expectedHash: beforeHash, actualHash: currentHash } });
-      }
+      const outputPath = resolveConfinedPath(this.rootDir, input.path, true);
       const parent = dirname(outputPath);
       if (!existsSync(parent) || !statSync(parent).isDirectory()) throw createRuntimeError({ code: "FILE_PARENT_MISSING", message: `Parent directory does not exist: ${input.path}`, retryable: false, effect: "none" });
-      atomicWrite(this.rootDir, outputPath, after);
       const afterHash = sha256(after);
-      const changeset = this.changes.record({ context: operationContext, files: [{ path: relativeFile(this.rootDir, outputPath), ...(before === undefined ? {} : { before }), after }] });
+      const changeset = this.changes.apply({ context: operationContext, files: [{ path: relativeFile(this.rootDir, outputPath), ...(before === undefined ? {} : { before }), after }] }, () => {
+        // Re-read under the mutation lock immediately before replacement. This
+        // check closes the gap between the caller's precondition and the write.
+        const current = existsSync(outputPath) ? readFileSync(outputPath) : undefined;
+        const currentHash = current === undefined ? undefined : sha256(current);
+        if (currentHash !== beforeHash || (current === undefined) !== (before === undefined)) {
+          throw createRuntimeError({ code: "FILE_HASH_MISMATCH", message: `Refusing to overwrite ${input.path}; the file changed while preparing the patch`, retryable: false, effect: "none", details: { path: input.path, expectedHash: beforeHash, actualHash: currentHash } });
+        }
+        atomicWrite(this.rootDir, outputPath, after);
+        const written = existsSync(outputPath) ? readFileSync(outputPath) : undefined;
+        if (written === undefined || sha256(written) !== afterHash) {
+          throw createRuntimeError({ code: "FILE_WRITE_RACE", message: `The file changed while applying ${input.path}`, retryable: false, effect: "unknown", details: { path: input.path, expectedHash: afterHash, actualHash: written === undefined ? undefined : sha256(written) } });
+        }
+        writeApplied = true;
+      });
       const data: FilePatchResult = { path: relativeFile(this.rootDir, outputPath), ...(before === undefined ? {} : { beforeHash: sha256(before) }), afterHash, changeset, changeSet: changeset };
       const refs = changeset.files.flatMap((file) => [file.beforeArtifactRef, file.afterArtifactRef].filter((ref): ref is ArtifactRef => ref !== undefined));
       return runtimeSuccess(data, this.finish(instrumentation, operationContext, "file.patch", "write", { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes: byteLength(after), returnedOutputBytes: byteLength(JSON.stringify(data)), artifactBytes: refs.length === 0 ? 0 : (before?.byteLength ?? 0) + after.byteLength, filesChanged: 1 }, refs, "completed", changeset.summary, "applied"));
     } catch (cause: unknown) {
-      return this.failure(instrumentation, operationContext, "file.patch", "write", safeError(cause, "FILE_PATCH_FAILED"), inputBytes(input));
+      return this.failure(instrumentation, operationContext, "file.patch", "write", safeError(cause, "FILE_PATCH_FAILED", writeApplied ? "unknown" : "none"), inputBytes(input));
     }
   }
 
@@ -338,9 +347,9 @@ export class FileOperations {
   }
 
   private searchWithRg(input: FileSearchInput, searchRoot: string, maxResults: number): SearchComputation | undefined {
-    const args = ["--json", "--color", "never", "--no-heading", "--max-count", String(maxResults)];
+    const args = ["--json", "--color", "never", "--no-heading", "--max-count", String(Math.min(Number.MAX_SAFE_INTEGER, maxResults + 1))];
     if (!input.regex) args.push("--fixed-strings");
-    args.push(input.query, searchRoot);
+    args.push("--", input.query, searchRoot);
     const processResult = spawnSync("rg", args, { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
     if (processResult.error?.message.includes("ENOENT")) return undefined;
     const outputTruncated = processResult.error !== undefined && /maxbuffer|enobufs/i.test(processResult.error.message);
@@ -364,10 +373,12 @@ export class FileOperations {
       if (typeof pathText !== "string" || typeof lineText !== "string" || typeof lineNumber !== "number") continue;
       const absolute = resolveConfinedPath(this.rootDir, pathText, false);
       matches.push({ path: relativeFile(this.rootDir, absolute), line: lineNumber, text: lineText.replace(/\n$/, "") });
-      if (matches.length >= maxResults) break;
+      if (matches.length > maxResults) break;
     }
     matches.sort(compareMatches);
-    return { result: { query: input.query, matches, resultCount: matches.length, hasMore: outputTruncated || matches.length >= maxResults, truncated: outputTruncated || matches.length >= maxResults, backend: "rg", artifactRefs: [] }, rawOutputBytes: byteLength(String(processResult.stdout)) };
+    const hasMore = outputTruncated || matches.length > maxResults;
+    const boundedMatches = matches.slice(0, maxResults);
+    return { result: { query: input.query, matches: boundedMatches, resultCount: boundedMatches.length, hasMore, truncated: hasMore, backend: "rg", artifactRefs: [] }, rawOutputBytes: byteLength(String(processResult.stdout)) };
   }
 
   private searchFallback(input: FileSearchInput, searchRoot: string, maxResults: number): SearchComputation {
@@ -385,7 +396,10 @@ export class FileOperations {
         const found = expression === undefined ? text.indexOf(input.query) : expression.exec(text)?.index ?? -1;
         if (found < 0) continue;
         matches.push({ path: relativeFile(this.rootDir, file), line: index + 1, column: found + 1, text });
-        if (matches.length >= maxResults) return { result: { query: input.query, matches, resultCount: matches.length, hasMore: true, truncated: true, backend: "fallback", artifactRefs: [] }, rawOutputBytes: matches.reduce((total, match) => total + byteLength(JSON.stringify(match)), 0) };
+        if (matches.length > maxResults) {
+          const boundedMatches = matches.slice(0, maxResults);
+          return { result: { query: input.query, matches: boundedMatches, resultCount: boundedMatches.length, hasMore: true, truncated: true, backend: "fallback", artifactRefs: [] }, rawOutputBytes: matches.reduce((total, match) => total + byteLength(JSON.stringify(match)), 0) };
+        }
       }
     }
     return { result: { query: input.query, matches, resultCount: matches.length, hasMore: false, truncated: false, backend: "fallback", artifactRefs: [] }, rawOutputBytes: matches.reduce((total, match) => total + byteLength(JSON.stringify(match)), 0) };
@@ -405,13 +419,13 @@ export class FileOperations {
     return { span, startedAt: span.startedAt, context: { ...context, spanId: span.spanId, ...(parentSpanId === undefined ? {} : { parentSpanId }) } };
   }
 
-  private finish(instrumentation: Instrumentation, context: OperationContext, operation: string, effectClass: "read" | "write", metrics: Record<string, number>, refs: readonly ArtifactRef[], status: "completed" | "failed", summary: string, effectState: "none" | "applied" = "none") {
+  private finish(instrumentation: Instrumentation, context: OperationContext, operation: string, effectClass: "read" | "write", metrics: Record<string, number>, refs: readonly ArtifactRef[], status: "completed" | "failed", summary: string, effectState: "none" | "applied" = "none", truncated = false) {
     const event = instrumentation.span === undefined ? undefined : (() => { instrumentation.span.record(metrics); return instrumentation.span.complete({ artifactRefs: refs, effectState, summary }); })();
-    return this.finishMeta(context, operation, effectClass, status, metrics, instrumentation, event?.timestamp, effectState, summary, refs, event?.durationMs);
+    return this.finishMeta(context, operation, effectClass, status, metrics, instrumentation, event?.timestamp, effectState, summary, refs, event?.durationMs, truncated);
   }
 
-  private finishMeta(context: OperationContext, operation: string, effectClass: "read" | "write", status: "completed" | "failed", metrics: Record<string, number>, instrumentation: Instrumentation, completedAt: string | undefined, effectState: "none" | "unknown" | "applied", summary: string, refs: readonly ArtifactRef[] = [], eventDuration?: number) {
-    return createOperationMeta({ context: { ...context, ...(instrumentation.span === undefined ? {} : { spanId: instrumentation.span.spanId }) }, operation, status, effectClass, effectState, startedAt: instrumentation.startedAt, completedAt: completedAt ?? new Date().toISOString(), metrics: { ...metrics, ...(eventDuration === undefined ? {} : { durationMs: eventDuration }) }, artifactRefs: refs, summary, truncated: false, executor: "direct", provider: "node:fs" });
+  private finishMeta(context: OperationContext, operation: string, effectClass: "read" | "write", status: "completed" | "failed", metrics: Record<string, number>, instrumentation: Instrumentation, completedAt: string | undefined, effectState: "none" | "unknown" | "applied", summary: string, refs: readonly ArtifactRef[] = [], eventDuration?: number, truncated = false) {
+    return createOperationMeta({ context: { ...context, ...(instrumentation.span === undefined ? {} : { spanId: instrumentation.span.spanId }) }, operation, status, effectClass, effectState, startedAt: instrumentation.startedAt, completedAt: completedAt ?? new Date().toISOString(), metrics: { ...metrics, ...(eventDuration === undefined ? {} : { durationMs: eventDuration }) }, artifactRefs: refs, summary, truncated, executor: "direct", provider: "node:fs" });
   }
 
   private failure(instrumentation: Instrumentation, context: OperationContext, operation: string, effectClass: "read" | "write", error: RuntimeError, inputSize: number): RuntimeResult<never> {
@@ -431,7 +445,6 @@ function compareMatches(left: FileSearchMatch, right: FileSearchMatch): number {
 }
 
 function boundSearchBytes(result: FileSearchResult, maxBytes: number | undefined): FileSearchResult {
-  if (maxBytes === undefined) return result;
   const limit = validLimit(maxBytes, DEFAULT_MAX_FILE_READ_BYTES, "maxBytes");
   const matches: FileSearchMatch[] = [];
   for (const match of result.matches) {

@@ -27,7 +27,7 @@ import type { ArtifactStore } from "../artifacts/store.ts";
 import type { StateStore } from "../state/store.ts";
 import type { Tracer } from "../observability/tracer.ts";
 
-export type ChangeSetStatus = "applied" | "rolled_back";
+export type ChangeSetStatus = "prepared" | "applied" | "rolled_back";
 
 export interface ChangeSetFile {
   readonly path: string;
@@ -157,7 +157,26 @@ function assertInside(root: string, candidate: string): void {
   }
 }
 
-function atomicReplace(rootDir: string, path: string, content: Uint8Array): void {
+function currentBytes(path: string): Uint8Array | undefined {
+  return existsSync(path) ? readFileSync(path) : undefined;
+}
+
+function assertCurrent(path: string, expectedHash: string | undefined, expectedExists: boolean): void {
+  const current = currentBytes(path);
+  const actualHash = current === undefined ? undefined : sha256(current);
+  if ((current !== undefined) !== expectedExists || actualHash !== expectedHash) {
+    throw createRuntimeError({
+      code: "FILE_HASH_MISMATCH",
+      message: "The file changed while applying the guarded change",
+      retryable: false,
+      effect: "none",
+      details: { path, expectedHash, actualHash },
+    });
+  }
+}
+
+function atomicReplace(rootDir: string, path: string, content: Uint8Array, expectedHash: string | undefined, expectedExists: boolean): void {
+  assertCurrent(path, expectedHash, expectedExists);
   const parent = dirname(path);
   const confinedParent = resolveConfinedPath(rootDir, relative(rootDir, parent) || ".", false);
   if (confinedParent !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
@@ -169,6 +188,10 @@ function atomicReplace(rootDir: string, path: string, content: Uint8Array): void
     if (realpathSync(anchoredParent) !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
     writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
     renameSync(temporary, destination);
+    const actual = currentBytes(path);
+    if (actual === undefined || sha256(actual) !== sha256(content)) {
+      throw createRuntimeError({ code: "FILE_WRITE_RACE", message: "The file changed while applying the guarded change", retryable: false, effect: "unknown", details: { path } });
+    }
   } finally {
     if (existsSync(temporary)) unlinkSync(temporary);
     closeSync(directoryFd);
@@ -215,7 +238,8 @@ export class ChangeSetManager {
     this.clock = options.clock ?? (() => new Date());
   }
 
-  record(input: ChangeSetInput): ChangeSet {
+  /** Persist evidence before a physical file mutation takes place. */
+  prepare(input: ChangeSetInput): ChangeSet {
     if (input.files.length === 0) throw new Error("A ChangeSet must contain at least one file");
     const now = this.clock().toISOString();
     const files: ChangeSetFile[] = [];
@@ -264,7 +288,7 @@ export class ChangeSetManager {
       runId: input.context.runId,
       ...(input.context.projectId === undefined ? {} : { projectId: input.context.projectId }),
       actor: input.context.actor,
-      status: "applied",
+      status: "prepared",
       createdAt: now,
       updatedAt: now,
       files,
@@ -274,47 +298,89 @@ export class ChangeSetManager {
     this.snapshots.set(id, snapshots);
     this.persist(changeset, snapshots);
     this.emit("changeset.created", changeset, input.context);
-    this.emit("changeset.applied", changeset, input.context);
     return changeset;
+  }
+
+  markApplied(changeset: ChangeSet, context: OperationContext): ChangeSet {
+    const applied: ChangeSet = { ...changeset, status: "applied", updatedAt: this.clock().toISOString() };
+    this.persist(applied);
+    this.emit("changeset.applied", applied, context);
+    return applied;
+  }
+
+  record(input: ChangeSetInput): ChangeSet {
+    return this.withMutationLock(() => this.markApplied(this.prepare(input), input.context));
+  }
+
+  /** Prepare durable evidence, perform the guarded mutation, then mark it applied. */
+  apply(input: ChangeSetInput, mutation: (prepared: ChangeSet) => void): ChangeSet {
+    return this.withMutationLock(() => {
+      const prepared = this.prepare(input);
+      mutation(prepared);
+      return this.markApplied(prepared, input.context);
+    });
+  }
+
+  /** Serialize AER-mediated mutations in this project root. */
+  withMutationLock<T>(operation: () => T): T {
+    const lockPath = join(this.rootDir, ".aer-mutation.lock");
+    let lockFd: number | undefined;
+    try {
+      lockFd = openSync(lockPath, "wx");
+      return operation();
+    } finally {
+      if (lockFd !== undefined) {
+        closeSync(lockFd);
+        if (existsSync(lockPath)) unlinkSync(lockPath);
+      }
+    }
   }
 
   rollback(input: RollbackInput): RuntimeResult<ChangeSet> {
     const { changeset, context } = input;
     try {
-      const snapshots = this.snapshots.get(changeset.id);
-      const planned = changeset.files.map((file, index) => ({ file, snapshot: snapshots?.[index] }));
-      const beforeContent = planned.map(({ file, snapshot }) => ({ file, content: this.contentForRollback(changeset.id, file, snapshot) }));
+      return this.withMutationLock(() => {
+        const snapshots = this.snapshots.get(changeset.id);
+        const planned = changeset.files.map((file, index) => ({ file, snapshot: snapshots?.[index] }));
+        const beforeContent = planned.map(({ file, snapshot }) => ({ file, content: this.contentForRollback(changeset.id, file, snapshot) }));
+        const currentStates = planned.map(({ file }) => {
+          const path = resolveConfinedPath(this.rootDir, file.path, true);
+          const current = currentBytes(path);
+          return { file, path, currentHash: current === undefined ? undefined : sha256(current) };
+        });
 
-      // Preflight every file before changing any of them. This keeps a multi-file
-      // rollback from partially applying after one file was edited externally.
-      for (const { file } of planned) {
-        const path = resolveConfinedPath(this.rootDir, file.path, true);
-        const current = existsSync(path) ? readFileSync(path) : undefined;
-        const currentHash = current === undefined ? undefined : sha256(current);
-        if (currentHash === file.beforeHash || (!file.beforeExists && current === undefined)) continue;
-        if (currentHash !== file.afterHash) {
-          return runtimeFailure(createRuntimeError({
-            code: "ROLLBACK_PRECONDITION_FAILED",
-            message: `Cannot safely roll back ${file.path}; the file changed after the ChangeSet was applied`,
-            retryable: false,
-            effect: "none",
-            details: { path: file.path, expectedHash: file.afterHash, actualHash: currentHash },
-          }), this.rollbackMeta(context, "failed", 0));
+        // Preflight every file while holding the mutation lock. A rollback only
+        // proceeds when each path is still the applied after-image (or is already
+        // at its before-image, which is a safe idempotent state).
+        for (const { file, currentHash } of currentStates) {
+          if (currentHash === file.beforeHash || (!file.beforeExists && currentHash === undefined)) continue;
+          if (currentHash !== file.afterHash) {
+            return runtimeFailure(createRuntimeError({
+              code: "ROLLBACK_PRECONDITION_FAILED",
+              message: `Cannot safely roll back ${file.path}; the file changed after the ChangeSet was applied`,
+              retryable: false,
+              effect: "none",
+              details: { path: file.path, expectedHash: file.afterHash, actualHash: currentHash },
+            }), this.rollbackMeta(context, "failed", 0));
+          }
         }
-      }
 
-      for (const { file, content } of beforeContent) {
-        const path = resolveConfinedPath(this.rootDir, file.path, true);
-        if (file.beforeExists && content !== undefined) {
-          atomicReplace(this.rootDir, path, content);
-        } else if (!file.beforeExists && existsSync(path)) {
-          unlinkSync(path);
+        for (const { file, path, currentHash } of currentStates) {
+          if (currentHash === file.beforeHash || (!file.beforeExists && currentHash === undefined)) continue;
+          const content = beforeContent.find((entry) => entry.file === file)?.content;
+          if (file.beforeExists && content !== undefined) {
+            atomicReplace(this.rootDir, path, content, file.afterHash, true);
+          } else if (!file.beforeExists) {
+            assertCurrent(path, file.afterHash, true);
+            unlinkSync(path);
+            if (existsSync(path)) throw createRuntimeError({ code: "FILE_WRITE_RACE", message: `Could not remove ${file.path} safely`, retryable: false, effect: "unknown" });
+          }
         }
-      }
-      const rolledBack: ChangeSet = { ...changeset, status: "rolled_back", updatedAt: this.clock().toISOString() };
-      this.persist(rolledBack);
-      this.emit("changeset.rolled_back", rolledBack, context);
-      return runtimeSuccess(rolledBack, this.rollbackMeta(context, "completed", changeset.files.length));
+        const rolledBack: ChangeSet = { ...changeset, status: "rolled_back", updatedAt: this.clock().toISOString() };
+        this.persist(rolledBack);
+        this.emit("changeset.rolled_back", rolledBack, context);
+        return runtimeSuccess(rolledBack, this.rollbackMeta(context, "completed", changeset.files.length));
+      });
     } catch (cause: unknown) {
       const error = cause && typeof cause === "object" && "code" in cause
         ? cause as ReturnType<typeof createRuntimeError>
@@ -411,7 +477,7 @@ export class ChangeSetManager {
       changesetId: changeset.id,
       status: "completed",
       effectClass: "write",
-      effectState: type === "changeset.rolled_back" ? "applied" : "applied",
+      effectState: type === "changeset.created" ? "none" : "applied",
       measurements: { filesChanged: changeset.files.length, internalCalls: 1 },
       summary: changeset.summary,
       metadata: { paths: changeset.diffSummary.paths, diffSummary: changeset.diffSummary },
