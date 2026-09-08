@@ -13,6 +13,7 @@ The repository is in **Product-complete Full Alpha** development. The priority i
 - [Architecture](docs/ARCHITECTURE.md)
 - [Observability](docs/OBSERVABILITY.md)
 - [Full Alpha implementation plan](docs/FULL_ALPHA_PLAN.md)
+- [Full Alpha Issue DAG](docs/ISSUE_DAG.md)
 - [Agent/worker rules](AGENTS.md)
 
 ## Core model
