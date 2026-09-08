@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { FileArtifactStore, MAX_ARTIFACT_READ_BYTES } from "../src/artifacts/index.ts";
-import { createTraceId } from "../src/core/index.ts";
+import { createProjectId, createTaskId, createTraceId } from "../src/core/index.ts";
+import { createRuntimeEvent } from "../src/observability/events.ts";
 import { Tracer } from "../src/observability/index.ts";
 import { SqliteStateStore } from "../src/state/index.ts";
 
@@ -56,5 +57,43 @@ test("artifacts use stable SHA-256 references and bounded reads", () => {
     assert.equal(store.metadata(first.ref)?.mediaType, "text/plain");
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("canonical task events infer materialized status and preserve run project association", () => {
+  const store = new SqliteStateStore(":memory:");
+  const traceId = createTraceId();
+  const projectId = createProjectId();
+  const taskId = createTaskId();
+  const runId = "run_review" as import("../src/core/index.ts").RunId;
+  const started = createRuntimeEvent({
+    traceId,
+    runId,
+    taskId,
+    projectId,
+    spanId: "span_started" as import("../src/core/index.ts").SpanId,
+    actor: "test",
+    type: "run.started",
+    timestamp: "2026-01-01T00:00:00.000Z",
+    payload: null,
+  });
+  const completed = createRuntimeEvent({
+    traceId,
+    runId,
+    taskId,
+    spanId: "span_completed" as import("../src/core/index.ts").SpanId,
+    actor: "test",
+    type: "task.completed",
+    timestamp: "2026-01-01T00:00:01.000Z",
+  });
+
+  try {
+    store.append(started);
+    store.append(completed);
+    assert.equal(store.getRun(runId)?.projectId, projectId);
+    assert.equal(store.getTask(taskId)?.status, "completed");
+    assert.equal(store.getEvent(started.eventId)?.payload, null);
+  } finally {
+    store.close();
   }
 });

@@ -150,9 +150,21 @@ function nullable(value: unknown): unknown {
 }
 
 function json(value: unknown): string {
-  const encoded = JSON.stringify(value ?? {});
+  const encoded = JSON.stringify(value === undefined ? {} : value);
   if (encoded === undefined) throw new TypeError("State values must be JSON serializable");
   return encoded;
+}
+
+function taskStatusForEvent(type: RuntimeEvent["type"]): RuntimeStatus | undefined {
+  switch (type) {
+    case "task.created": return "queued";
+    case "task.started": return "running";
+    case "task.blocked": return "blocked";
+    case "task.completed": return "completed";
+    case "task.failed": return "failed";
+    case "task.cancelled": return "cancelled";
+    default: return undefined;
+  }
 }
 
 function parseJson(value: unknown): unknown {
@@ -466,21 +478,23 @@ export class SqliteStateStore implements StateStore {
     if (event.type === "run.started" || event.type === "run.completed" || event.type === "run.failed") {
       const existing = this.getRun(event.runId);
       const status = terminalRunStatus[event.type] ?? event.status ?? existing?.status ?? "running";
+      const projectId = event.projectId ?? existing?.projectId;
       const startedAt = existing?.startedAt ?? event.timestamp;
       this.database.prepare(`
         INSERT INTO runs (run_id, trace_id, project_id, status, actor, created_at, started_at, completed_at, updated_at, data_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')
         ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, project_id=excluded.project_id, actor=excluded.actor, completed_at=excluded.completed_at, updated_at=excluded.updated_at
-      `).run(event.runId, event.traceId, nullable(event.projectId), status, event.actor, startedAt, startedAt, status === "completed" || status === "failed" ? event.timestamp : null, event.timestamp);
+      `).run(event.runId, event.traceId, nullable(projectId), status, event.actor, startedAt, startedAt, status === "completed" || status === "failed" ? event.timestamp : null, event.timestamp);
     }
     if (event.taskId !== undefined && (event.type.startsWith("task.") || event.type === "run.started")) {
       const existing = this.getTask(event.taskId);
-      const status = event.status ?? existing?.status ?? "queued";
+      const status = event.status ?? taskStatusForEvent(event.type) ?? existing?.status ?? "queued";
+      const projectId = event.projectId ?? existing?.projectId;
       this.database.prepare(`
         INSERT INTO tasks (task_id, run_id, project_id, status, created_at, updated_at, data_json)
         VALUES (?, ?, ?, ?, ?, ?, '{}')
         ON CONFLICT(task_id) DO UPDATE SET status=excluded.status, project_id=excluded.project_id, updated_at=excluded.updated_at
-      `).run(event.taskId, event.runId, nullable(event.projectId), status, existing?.createdAt ?? event.timestamp, event.timestamp);
+      `).run(event.taskId, event.runId, nullable(projectId), status, existing?.createdAt ?? event.timestamp, event.timestamp);
     }
   }
 
