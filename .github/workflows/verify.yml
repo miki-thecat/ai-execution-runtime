@@ -1,0 +1,45 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Use Node 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Diff sanity
+        run: git diff --check
+      - name: Install pnpm
+        if: ${{ hashFiles('package.json') != '' }}
+        run: npm install --global pnpm@11.20.0
+      - name: Install dependencies
+        if: ${{ hashFiles('package.json') != '' }}
+        shell: bash
+        run: |
+          if [[ -f pnpm-lock.yaml ]]; then
+            pnpm install --frozen-lockfile
+          else
+            pnpm install
+          fi
+      - name: Typecheck
+        if: ${{ hashFiles('package.json') != '' }}
+        run: pnpm run --if-present typecheck
+      - name: Lint
+        if: ${{ hashFiles('package.json') != '' }}
+        run: pnpm run --if-present lint
+      - name: Test
+        if: ${{ hashFiles('package.json') != '' }}
+        run: pnpm run --if-present test
