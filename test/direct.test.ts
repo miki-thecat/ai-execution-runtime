@@ -89,6 +89,7 @@ test("a long process is cancelled through its runtime-owned handle", async () =>
   assert.equal(result.cancelled, true);
   assert.equal(result.timedOut, false);
   assert.equal(sink.events.at(-1)?.type, "process.cancelled");
+  assert.equal(sink.events.at(-1)?.effectState, "unknown");
 });
 
 test("deadline timeout returns a truthful cancelled result and event", async () => {
@@ -101,7 +102,10 @@ test("deadline timeout returns a truthful cancelled result and event", async () 
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.error.code, "PROCESS_TIMEOUT");
+  assert.equal(result.error.effect, "unknown");
   assert.equal(result.meta.status, "cancelled");
+  assert.equal(result.meta.effectState, "unknown");
+  assert.equal(sink.events.at(-1)?.effectState, "unknown");
   assert.deepEqual(sink.events.map((event) => event.type), [
     "run.started",
     "operation.started",

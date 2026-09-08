@@ -210,10 +210,10 @@ export class DirectExecutor {
           code: processResult.timedOut ? "PROCESS_TIMEOUT" : "PROCESS_CANCELLED",
           message: processResult.timedOut ? "Process exceeded its deadline" : "Process was cancelled",
           retryable: processResult.timedOut,
-          effect: "none",
+          effect: "unknown",
           details: { processId: processResult.processId },
         });
-        const event = span?.cancel({ effectState: "none", artifactRefs: processResult.artifactRefs, summary: error.message });
+        const event = span?.cancel({ effectState: "unknown", artifactRefs: processResult.artifactRefs, summary: error.message });
         return runtimeFailure(error, failureMeta(
           operationContext,
           operation,

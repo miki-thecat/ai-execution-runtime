@@ -30,6 +30,22 @@ declare module "node:child_process" {
   ): ChildProcessLike;
 }
 
+declare module "node:fs" {
+  export function openSync(path: string, flags: string): number;
+  export function readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number): number;
+  export function writeSync(fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number): number;
+  export function closeSync(fd: number): void;
+  export function unlinkSync(path: string): void;
+}
+
+declare module "node:os" {
+  export function tmpdir(): string;
+}
+
+declare module "node:path" {
+  export function join(...paths: string[]): string;
+}
+
 declare module "node:process" {
   export const env: Readonly<Record<string, string | undefined>>;
   export const platform: string;

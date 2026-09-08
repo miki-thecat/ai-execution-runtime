@@ -1,5 +1,8 @@
 import { spawn, type ChildProcessLike, type SpawnOptions } from "node:child_process";
 import { env as parentEnvironment, kill as killProcess, platform } from "node:process";
+import { closeSync, openSync, readSync, unlinkSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createOperationId, createSpanId, type ArtifactRef } from "../core/ids.ts";
 import { createRuntimeError, type OperationContext, type RuntimeError } from "../core/index.ts";
 import { FileArtifactStore, type ArtifactStore } from "../artifacts/store.ts";
@@ -10,6 +13,7 @@ import type { ExecutableCommand } from "./types.ts";
 
 export const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024;
 export const DEFAULT_CANCEL_GRACE_MS = 250;
+const ARTIFACT_CHUNK_BYTES = 64 * 1024;
 
 export interface ProcessStartOptions {
   readonly command: ExecutableCommand;
@@ -35,34 +39,83 @@ interface ProcessRecord {
 }
 
 class OutputCollector {
-  private readonly chunks: Uint8Array[] = [];
+  private readonly returned: Uint8Array;
+  private returnedBytes = 0;
   private total = 0;
   private readonly maxBytes: number;
+  private readonly path: string;
+  private file: number | undefined;
 
-  constructor(maxBytes: number) {
+  constructor(maxBytes: number, id: ProcessId, stream: "stdout" | "stderr") {
     this.maxBytes = maxBytes;
+    this.returned = new Uint8Array(maxBytes);
+    this.path = join(tmpdir(), `aer-direct-${id}-${stream}-${Date.now()}`);
+    this.file = openSync(this.path, "wx");
   }
 
   add(chunk: Uint8Array | string): void {
     const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
-    this.chunks.push(bytes);
     this.total += bytes.byteLength;
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const written = writeSync(this.file!, bytes, offset, bytes.byteLength - offset);
+      if (written <= 0) throw new Error("Unable to spill process output");
+      offset += written;
+    }
+    if (this.returnedBytes < this.maxBytes) {
+      const count = Math.min(this.maxBytes - this.returnedBytes, bytes.byteLength);
+      this.returned.set(bytes.subarray(0, count), this.returnedBytes);
+      this.returnedBytes += count;
+    }
   }
 
   get byteLength(): number { return this.total; }
 
-  bytes(): Uint8Array {
-    const result = new Uint8Array(this.total);
-    let offset = 0;
-    for (const chunk of this.chunks) {
-      result.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return result;
+  boundedBytes(): Uint8Array {
+    this.close();
+    return this.returned.slice(0, this.returnedBytes);
   }
 
-  boundedBytes(): Uint8Array {
-    return this.bytes().slice(0, this.maxBytes);
+  spill(put: (bytes: Uint8Array) => void): void {
+    this.close();
+    if (this.total <= this.maxBytes) {
+      this.remove();
+      return;
+    }
+    const file = openSync(this.path, "r");
+    try {
+      const buffer = new Uint8Array(ARTIFACT_CHUNK_BYTES);
+      let offset = 0;
+      while (offset < this.total) {
+        const count = readSync(file, buffer, 0, Math.min(buffer.byteLength, this.total - offset), offset);
+        if (count === 0) throw new Error("Unable to read spilled process output");
+        put(buffer.slice(0, count));
+        offset += count;
+      }
+    } finally {
+      closeSync(file);
+      this.remove();
+    }
+  }
+
+  cleanup(): void {
+    this.close();
+    this.remove();
+  }
+
+  private close(): void {
+    if (this.file !== undefined) {
+      closeSync(this.file);
+      this.file = undefined;
+    }
+  }
+
+  private remove(): void {
+    try {
+      unlinkSync(this.path);
+    } catch {
+      // The file may already have been removed after a completed artifact write.
+    }
   }
 }
 
@@ -172,8 +225,8 @@ export class DirectProcessManager {
       throw this.spawnError(error);
     }
 
-    const stdout = new OutputCollector(maxOutputBytes);
-    const stderr = new OutputCollector(maxOutputBytes);
+    const stdout = new OutputCollector(maxOutputBytes, id, "stdout");
+    const stderr = new OutputCollector(maxOutputBytes, id, "stderr");
     child.stdout?.on("data", (chunk) => stdout.add(chunk));
     child.stderr?.on("data", (chunk) => stderr.add(chunk));
     this.persist(record, "running");
@@ -211,19 +264,25 @@ export class DirectProcessManager {
       if (forceTimer !== undefined) clearTimeout(forceTimer);
       const stdoutBytes = stdout.byteLength;
       const stderrBytes = stderr.byteLength;
-      const stdoutFull = stdout.bytes();
-      const stderrFull = stderr.bytes();
       const refs: ArtifactRef[] = [];
       let artifactBytes = 0;
       if (stdoutBytes > maxOutputBytes && this.artifacts !== undefined) {
-        const artifact = this.putArtifact(stdoutFull, "stdout", options, id);
-        refs.push(artifact.ref);
-        artifactBytes += artifact.size;
+        stdout.spill((bytes) => {
+          const artifact = this.putArtifact(bytes, "stdout", options, id);
+          refs.push(artifact.ref);
+          artifactBytes += artifact.size;
+        });
+      } else {
+        stdout.cleanup();
       }
       if (stderrBytes > maxOutputBytes && this.artifacts !== undefined) {
-        const artifact = this.putArtifact(stderrFull, "stderr", options, id);
-        refs.push(artifact.ref);
-        artifactBytes += artifact.size;
+        stderr.spill((bytes) => {
+          const artifact = this.putArtifact(bytes, "stderr", options, id);
+          refs.push(artifact.ref);
+          artifactBytes += artifact.size;
+        });
+      } else {
+        stderr.cleanup();
       }
       const endedAt = this.tracer.now();
       const status = cancelled ? "cancelled" : error === undefined ? "completed" : "failed";
@@ -256,6 +315,7 @@ export class DirectProcessManager {
         artifactRefs: refs,
         rawOutputBytes: result.rawOutputBytes,
         returnedOutputBytes,
+        effectState: cancelled ? "unknown" : "none",
       });
       this.tracer.emit({
         traceId: options.context.traceId,
@@ -284,7 +344,7 @@ export class DirectProcessManager {
         },
         artifactRefs: refs,
         effectClass: "destructive",
-        effectState: "none",
+        effectState: cancelled ? "unknown" : "none",
         metadata: { processId: id, timedOut, cancelled },
       });
       this.handles.delete(id);
