@@ -147,6 +147,7 @@ export class TaskManager {
       ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
     };
     this.emitTaskEvent(task, "task.created", "queued", context?.actor ?? "runtime", { summary: "Task created" }, context?.spanId);
+    this.persistRun(task);
     this.persist(task);
     this.memory.set(taskId, task);
     return task;
@@ -207,6 +208,7 @@ export class TaskManager {
       summary: transitionInput.reason ?? `Task ${status}`,
       metadata: { from: current.status, to: status, ...(transitionInput.metadata ?? {}) },
     }, context?.spanId);
+    this.syncTaskRun(task);
     this.persist(task);
     this.memory.set(taskId, task);
     return task;
@@ -272,6 +274,38 @@ export class TaskManager {
         ...(task.reason === undefined ? {} : { reason: task.reason }),
         ...(task.metadata === undefined ? {} : { metadata: task.metadata }),
       },
+    });
+  }
+
+  private persistRun(task: TaskRecord): void {
+    if (this.state === undefined || this.state.getEntity("runs", task.runId) !== undefined) return;
+    this.state.saveEntity({
+      kind: "runs",
+      id: task.runId,
+      ...(task.projectId === undefined ? {} : { projectId: task.projectId }),
+      status: "queued",
+      traceId: task.traceId,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+      data: { taskId: task.taskId, summary: task.title },
+    });
+  }
+
+  private syncTaskRun(task: TaskRecord): void {
+    if (this.state === undefined) return;
+    const run = this.state.getEntity("runs", task.runId);
+    if (run?.data?.taskId !== task.taskId) return;
+    const terminalStatus: Readonly<Record<string, TaskStatus>> = {
+      completed: "completed",
+      failed: "failed",
+      cancelled: "cancelled",
+      unknown: "unknown",
+    };
+    this.state.saveEntity({
+      ...run,
+      status: terminalStatus[task.status] ?? task.status,
+      updatedAt: task.updatedAt,
+      data: { ...(run.data ?? {}), summary: task.reason ?? task.title },
     });
   }
 

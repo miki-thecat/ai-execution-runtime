@@ -14,7 +14,22 @@ export interface ProjectIdentity {
   readonly config: ProjectConfig;
 }
 
-export type ProjectRef = ProjectIdentity | ProjectId | string;
+/**
+ * Bounded identity exposed by live project context operations. Repository
+ * configuration is intentionally kept in the registry and is not copied into
+ * resume or inspect payloads.
+ */
+export interface ProjectIdentityView {
+  readonly projectId: ProjectId;
+  readonly id: ProjectId;
+  readonly name: string;
+  readonly rootDir: string;
+  readonly root: string;
+  readonly configPath: string;
+  readonly goal?: string;
+}
+
+export type ProjectRef = ProjectIdentity | ProjectIdentityView | ProjectId | string;
 
 export interface GitDiffSummary {
   readonly filesChanged: number;
@@ -70,7 +85,7 @@ export interface VerificationSummary {
 }
 
 export interface ProjectInspect {
-  readonly project: ProjectIdentity;
+  readonly project: ProjectIdentityView;
   readonly projectId: ProjectId;
   readonly name: string;
   readonly root: string;
@@ -99,7 +114,7 @@ export interface ResumeBlocker {
 }
 
 export interface ProjectResume {
-  readonly project: ProjectIdentity;
+  readonly project: ProjectIdentityView;
   readonly projectId: ProjectId;
   readonly identity: {
     readonly name: string;

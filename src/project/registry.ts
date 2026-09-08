@@ -88,7 +88,11 @@ export class ProjectRegistry {
   }
 
   get(ref: ProjectRef): ProjectIdentity | undefined {
-    if (typeof ref !== "string") return ref;
+    if (typeof ref !== "string") {
+      const registered = this.projects.get(ref.projectId);
+      if (registered !== undefined) return registered;
+      return "config" in ref ? ref : undefined;
+    }
     const byId = this.projects.get(ref as ProjectId);
     if (byId !== undefined) return byId;
     const normalized = (() => {

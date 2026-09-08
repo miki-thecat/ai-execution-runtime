@@ -4,6 +4,14 @@ import type { GitDiffSummary, GitSnapshot } from "./types.ts";
 
 const GIT_OUTPUT_LIMIT = 128 * 1024;
 
+/** Measurements for the direct Git commands making up one live snapshot. */
+export interface GitSnapshotMetrics {
+  internalCalls: number;
+  rawOutputBytes: number;
+  returnedOutputBytes: number;
+  artifactBytes: number;
+}
+
 function text(value: string): string {
   return value.replace(/\r\n/g, "\n").trim();
 }
@@ -55,19 +63,19 @@ export class LocalGitSnapshot {
     this.direct = options.direct ?? new DirectExecutor();
   }
 
-  async snapshot(rootDir: string, context: OperationContext): Promise<GitSnapshot> {
+  async snapshot(rootDir: string, context: OperationContext, metrics?: GitSnapshotMetrics): Promise<GitSnapshot> {
     try {
-      const gitRoot = text(await this.command(rootDir, ["rev-parse", "--show-toplevel"], context));
-      const head = text(await this.command(rootDir, ["rev-parse", "HEAD"], context));
-      const branchValue = text(await this.command(rootDir, ["rev-parse", "--abbrev-ref", "HEAD"], context));
-      const status = await this.command(rootDir, ["status", "--porcelain=v1", "--untracked-files=all"], context);
+      const gitRoot = text(await this.command(rootDir, ["rev-parse", "--show-toplevel"], context, metrics));
+      const head = text(await this.command(rootDir, ["rev-parse", "HEAD"], context, metrics));
+      const branchValue = text(await this.command(rootDir, ["rev-parse", "--abbrev-ref", "HEAD"], context, metrics));
+      const status = await this.command(rootDir, ["status", "--porcelain=v1", "--untracked-files=all"], context, metrics);
       const statusLines = text(status) === "" ? [] : text(status).split("\n");
       const untrackedFiles = statusLines.filter((line) => line.startsWith("?? ")).length;
       const dirty = statusLines.length > 0;
 
       let upstream: string | undefined;
       try {
-        upstream = text(await this.command(rootDir, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], context)) || undefined;
+        upstream = text(await this.command(rootDir, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], context, metrics)) || undefined;
       } catch {
         // A branch without an upstream is normal and is represented as 0/0.
       }
@@ -76,7 +84,7 @@ export class LocalGitSnapshot {
       let behind = 0;
       if (upstream !== undefined) {
         try {
-          const divergence = text(await this.command(rootDir, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], context));
+          const divergence = text(await this.command(rootDir, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], context, metrics));
           const values = divergence.split(/\s+/);
           ahead = parseNumber(values[0]);
           behind = parseNumber(values[1]);
@@ -87,11 +95,11 @@ export class LocalGitSnapshot {
 
       let stats = { filesChanged: 0, insertions: 0, deletions: 0 };
       try {
-        stats = parseShortStat(await this.command(rootDir, ["diff", "HEAD", "--shortstat"], context));
+        stats = parseShortStat(await this.command(rootDir, ["diff", "HEAD", "--shortstat"], context, metrics));
       } catch {
         // An unborn repository has no HEAD to diff against.
         try {
-          stats = parseShortStat(await this.command(rootDir, ["diff", "--shortstat"], context));
+          stats = parseShortStat(await this.command(rootDir, ["diff", "--shortstat"], context, metrics));
         } catch {
           // Diff statistics are explicitly best-effort.
         }
@@ -133,14 +141,27 @@ export class LocalGitSnapshot {
     return this.snapshot(rootDir, context);
   }
 
-  private async command(rootDir: string, args: readonly string[], context: OperationContext): Promise<string> {
+  private async command(rootDir: string, args: readonly string[], context: OperationContext, metrics?: GitSnapshotMetrics): Promise<string> {
+    if (metrics !== undefined) metrics.internalCalls += 1;
     const result = await this.direct.runExecutable({
       executable: "git",
       args,
       cwd: rootDir,
       maxOutputBytes: GIT_OUTPUT_LIMIT,
     }, context, { instrument: false });
-    if (!result.ok) throw result.error;
+    if (!result.ok) {
+      if (metrics !== undefined) {
+        metrics.rawOutputBytes += result.meta.metrics.rawOutputBytes;
+        metrics.returnedOutputBytes += result.meta.metrics.returnedOutputBytes;
+        metrics.artifactBytes += result.meta.metrics.artifactBytes;
+      }
+      throw result.error;
+    }
+    if (metrics !== undefined) {
+      metrics.rawOutputBytes += result.data.rawOutputBytes;
+      metrics.returnedOutputBytes += result.data.returnedOutputBytes;
+      metrics.artifactBytes += result.data.artifactBytes;
+    }
     if (result.data.exitCode !== 0) {
       throw createRuntimeError({
         code: "GIT_COMMAND_FAILED",

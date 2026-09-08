@@ -33,6 +33,8 @@ interface ProcessRecord {
   readonly startedAt: string;
   readonly traceId: string;
   readonly runId: string;
+  readonly projectId?: string;
+  readonly taskId?: string;
   readonly spanId: string;
   readonly operationId: string;
   readonly reattachable: false;
@@ -206,6 +208,8 @@ export class DirectProcessManager {
       startedAt: startedAt.toISOString(),
       traceId: options.context.traceId,
       runId: options.context.runId,
+      ...(options.context.projectId === undefined ? {} : { projectId: options.context.projectId }),
+      ...(options.context.taskId === undefined ? {} : { taskId: options.context.taskId }),
       spanId,
       operationId,
       reattachable: false,
@@ -432,6 +436,8 @@ export class DirectProcessManager {
         actor: "runtime",
         ...(data.operation === undefined ? {} : { operation: data.operation }),
         operationId: data.operationId as import("../core/ids.ts").OperationId,
+        ...(data.projectId === undefined ? {} : { projectId: data.projectId as import("../core/ids.ts").ProjectId }),
+        ...(data.taskId === undefined ? {} : { taskId: data.taskId as import("../core/ids.ts").TaskId }),
         status: "unknown",
         executor: "direct",
         provider: "node:child_process",
@@ -447,7 +453,9 @@ export class DirectProcessManager {
     this.state?.saveEntity({
       kind: "processes",
       id: record.processId,
+      ...(record.projectId === undefined ? {} : { projectId: record.projectId }),
       runId: record.runId,
+      ...(record.taskId === undefined ? {} : { taskId: record.taskId }),
       status,
       createdAt: record.startedAt,
       updatedAt: new Date().toISOString(),
