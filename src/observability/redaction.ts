@@ -65,8 +65,12 @@ function redacted(
 }
 
 function keyIsSensitive(key: string, policy: RedactionPolicy): boolean {
-  const normalized = key.toLowerCase().replaceAll("-", "_");
-  return policy.sensitiveKeys.some((candidate) => normalized.includes(candidate.toLowerCase()));
+  // Compare key names without separators so snake_case, kebab-case, and
+  // camelCase spellings receive the same default protection.
+  const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+  return policy.sensitiveKeys.some((candidate) =>
+    normalized.includes(candidate.toLowerCase().replaceAll(/[^a-z0-9]/g, "")),
+  );
 }
 
 export class Redactor {

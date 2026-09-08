@@ -9,8 +9,11 @@
   },
   "packageManager": "pnpm@11.20.0",
   "scripts": {
-    "typecheck": "node scripts/typecheck.mjs",
-    "lint": "node scripts/typecheck.mjs",
-    "test": "node --experimental-strip-types --test"
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "lint": "tsc --project tsconfig.json --noEmit",
+    "test": "node --experimental-strip-types --test test/**/*.test.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
   }
 }

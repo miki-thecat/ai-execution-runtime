@@ -8,7 +8,7 @@ import {
   Redactor,
   Tracer,
 } from "../src/index.ts";
-import { createFakeOperation } from "../src/operations/fake.ts";
+import { createFakeOperation, MAX_FAKE_OUTPUT_BYTES } from "../src/operations/fake.ts";
 import { OperationRegistry } from "../src/operations/registry.ts";
 
 function contextFor(run: ReturnType<Tracer["startRun"]>) {
@@ -37,6 +37,7 @@ test("fake operation emits correlated run and operation lifecycle events", async
   assert.equal(result.meta.runId, run.runId);
   assert.equal(result.meta.effectClass, "read");
   assert.equal(result.meta.metrics.internalCalls, 1);
+  assert.equal(result.meta.metrics.inputBytes, 5);
   assert.equal(result.meta.metrics.pollCountModel, 0);
   assert.equal(result.meta.metrics.rawOutputBytes, result.meta.metrics.returnedOutputBytes);
   assert.equal(result.meta.metrics.compressionRatio, 1);
@@ -92,14 +93,44 @@ test("content capture is disabled by default while measurements remain available
     type: "artifact.created",
     actor: "runtime",
     payload: { content: "do not persist this", token: "secret-token" },
-    metadata: { provider: "fake", rawOutputBytes: 20 },
+    metadata: { provider: "fake", rawOutputBytes: 20, privateKey: "secret-value" },
   });
 
   const event = sink.events[1];
   assert.ok(event !== undefined);
   assert.equal("payload" in event, false);
-  assert.deepEqual(event.metadata, { provider: "fake", rawOutputBytes: 20 });
+  assert.deepEqual(event.metadata, {
+    provider: "fake",
+    rawOutputBytes: 20,
+    privateKey: {
+      redacted: true,
+      sensitivity: "secret",
+      byteLength: 12,
+      reason: "sensitive_field",
+    },
+  });
   assert.equal(new Redactor().capture("secret").captured, false);
+});
+
+test("fake operation bounds model-facing output and records input bytes", async () => {
+  const sink = new InMemoryEventSink();
+  const tracer = new Tracer({ sink });
+  const run = tracer.startRun();
+  const registry = new OperationRegistry({ tracer }).register(createFakeOperation());
+  const value = "x".repeat(MAX_FAKE_OUTPUT_BYTES + 10);
+
+  const result = await registry.execute("fake.echo", { value }, contextFor(run));
+  run.complete();
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  const returnedBytes = new TextEncoder().encode(result.data.value).byteLength;
+  assert.equal(result.data.truncated, true);
+  assert.ok(returnedBytes <= MAX_FAKE_OUTPUT_BYTES);
+  assert.equal(result.meta.metrics.inputBytes, value.length);
+  assert.equal(result.meta.metrics.rawOutputBytes, value.length);
+  assert.equal(result.meta.metrics.returnedOutputBytes, returnedBytes);
+  assert.ok(result.meta.metrics.rawOutputBytes > result.meta.metrics.returnedOutputBytes);
 });
 
 test("runtime errors remain a machine-actionable envelope", () => {

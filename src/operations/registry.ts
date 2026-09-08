@@ -134,13 +134,13 @@ export class OperationRegistry {
     }
 
     try {
-      const result = await registered.execute(input, operationContext);
+      const result = await registered.execute(input, operationContext) as RuntimeResult<Output>;
       span.record(result.meta.metrics);
       if (result.ok) {
         const event = span.complete({
           effectState: result.meta.effectState,
           artifactRefs: result.meta.artifactRefs,
-          summary: result.meta.summary,
+          ...(result.meta.summary === undefined ? {} : { summary: result.meta.summary }),
         });
         return {
           ok: true,
@@ -152,7 +152,7 @@ export class OperationRegistry {
       const event = span.fail(result.error, {
         effectState: result.error.effect,
         artifactRefs: result.meta.artifactRefs,
-        summary: result.meta.summary,
+        ...(result.meta.summary === undefined ? {} : { summary: result.meta.summary }),
       });
       return {
         ok: false,
@@ -178,8 +178,8 @@ export class OperationRegistry {
         startedAt: span.startedAt,
         completedAt: event.timestamp,
         metrics: eventMeasurements(event),
-        executor: registered.executor,
-        provider: registered.provider,
+        ...(registered.executor === undefined ? {} : { executor: registered.executor }),
+        ...(registered.provider === undefined ? {} : { provider: registered.provider }),
       }));
     }
   }
@@ -225,10 +225,10 @@ function normalizedMeta(
     completedAt: event.timestamp,
     metrics: eventMeasurements(event),
     artifactRefs: original.artifactRefs,
-    summary: original.summary,
+    ...(original.summary === undefined ? {} : { summary: original.summary }),
     truncated: original.truncated,
-    executor: operation.executor,
-    provider: operation.provider,
-    verificationId: original.verificationId,
+    ...(operation.executor === undefined ? {} : { executor: operation.executor }),
+    ...(operation.provider === undefined ? {} : { provider: operation.provider }),
+    ...(original.verificationId === undefined ? {} : { verificationId: original.verificationId }),
   });
 }

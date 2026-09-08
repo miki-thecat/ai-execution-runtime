@@ -16,10 +16,25 @@ export interface FakeOperationInput {
 export interface FakeOperationOutput {
   readonly value: string;
   readonly summary: string;
-  readonly truncated: false;
+  readonly truncated: boolean;
 }
 
 const byteLength = (value: string): number => new TextEncoder().encode(value).byteLength;
+export const MAX_FAKE_OUTPUT_BYTES = 256;
+
+function boundOutput(value: string): { readonly value: string; readonly truncated: boolean } {
+  if (byteLength(value) <= MAX_FAKE_OUTPUT_BYTES) {
+    return { value, truncated: false };
+  }
+
+  let bounded = "";
+  for (const character of value) {
+    const candidate = bounded + character;
+    if (byteLength(candidate) > MAX_FAKE_OUTPUT_BYTES) break;
+    bounded = candidate;
+  }
+  return { value: bounded, truncated: true };
+}
 
 /** A provider-free operation used by the foundation contract smoke test. */
 export function createFakeOperation(): Operation<FakeOperationInput, FakeOperationOutput> {
@@ -30,6 +45,8 @@ export function createFakeOperation(): Operation<FakeOperationInput, FakeOperati
     provider: "fake",
     execute(input: FakeOperationInput, context: OperationContext): RuntimeResult<FakeOperationOutput> {
       const rawBytes = byteLength(input.value);
+      const output = boundOutput(input.value);
+      const returnedBytes = byteLength(output.value);
       const meta = (status: "completed" | "failed") => createOperationMeta({
         context,
         operation: "fake.echo",
@@ -37,11 +54,12 @@ export function createFakeOperation(): Operation<FakeOperationInput, FakeOperati
         effectClass: "read",
         metrics: {
           internalCalls: 1,
+          inputBytes: rawBytes,
           rawOutputBytes: rawBytes,
-          returnedOutputBytes: rawBytes,
+          returnedOutputBytes: returnedBytes,
         },
         summary: input.fail ? "fake operation failed" : "echoed one bounded value",
-        truncated: false,
+        truncated: output.truncated,
         executor: "runtime-test",
         provider: "fake",
       });
@@ -57,7 +75,7 @@ export function createFakeOperation(): Operation<FakeOperationInput, FakeOperati
       }
 
       return runtimeSuccess(
-        { value: input.value, summary: "echoed one bounded value", truncated: false },
+        { value: output.value, summary: "echoed one bounded value", truncated: output.truncated },
         meta("completed"),
       );
     },
