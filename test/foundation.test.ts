@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createOperationContext,
+  createOperationMeta,
   createRuntimeError,
   createTraceId,
   InMemoryEventSink,
   Redactor,
   Tracer,
+  runtimeFailure,
 } from "../src/index.ts";
 import { createFakeOperation, MAX_FAKE_OUTPUT_BYTES } from "../src/operations/fake.ts";
 import { OperationRegistry } from "../src/operations/registry.ts";
@@ -79,6 +81,40 @@ test("failed operation emits a failed span and preserves a machine-actionable er
   assert.equal(result.error.effect, "none");
   assert.equal(sink.events[2]?.type, "operation.failed");
   assert.equal(sink.events[2]?.errorCode, "FAKE_OPERATION_FAILED");
+});
+
+test("registry preserves cancelled and unknown operation states", async () => {
+  for (const status of ["cancelled", "unknown"] as const) {
+    const sink = new InMemoryEventSink();
+    const tracer = new Tracer({ sink });
+    const run = tracer.startRun();
+    const registry = new OperationRegistry({ tracer }).register({
+      name: `fake.${status}`,
+      effectClass: "read",
+      execute(_input: undefined, context) {
+        const error = createRuntimeError({
+          code: status === "cancelled" ? "OPERATION_CANCELLED" : "EFFECT_UNKNOWN",
+          message: status,
+          retryable: false,
+          effect: status === "unknown" ? "unknown" : "none",
+        });
+        return runtimeFailure(error, createOperationMeta({
+          context,
+          operation: `fake.${status}`,
+          status,
+          effectClass: "read",
+          effectState: error.effect,
+        }));
+      },
+    });
+
+    const result = await registry.execute(`fake.${status}`, undefined, contextFor(run));
+
+    assert.equal(result.ok, false);
+    assert.equal(result.meta.status, status);
+    assert.equal(sink.events[2]?.type, status === "cancelled" ? "operation.cancelled" : "operation.failed");
+    assert.equal(sink.events[2]?.status, status);
+  }
 });
 
 test("content capture is disabled by default while measurements remain available", () => {

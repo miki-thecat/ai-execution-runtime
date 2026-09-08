@@ -145,19 +145,15 @@ export class OperationRegistry {
         return {
           ok: true,
           data: result.data,
-          meta: normalizedMeta(result.meta, operationContext, registered, "completed", span, event),
+          meta: normalizedMeta(result.meta, operationContext, registered, result.meta.status, span, event),
         };
       }
 
-      const event = span.fail(result.error, {
-        effectState: result.error.effect,
-        artifactRefs: result.meta.artifactRefs,
-        ...(result.meta.summary === undefined ? {} : { summary: result.meta.summary }),
-      });
+      const event = finishFailure(span, result.error, result.meta);
       return {
         ok: false,
         error: result.error,
-        meta: normalizedMeta(result.meta, operationContext, registered, "failed", span, event),
+        meta: normalizedMeta(result.meta, operationContext, registered, result.meta.status, span, event),
       };
     } catch (cause: unknown) {
       const error: RuntimeError = isRuntimeError(cause)
@@ -211,7 +207,7 @@ function normalizedMeta(
   original: OperationMeta,
   context: OperationContext,
   operation: RegisteredOperation,
-  status: "completed" | "failed",
+  status: OperationMeta["status"],
   span: OperationSpan,
   event: RuntimeEvent,
 ): OperationMeta {
@@ -231,4 +227,26 @@ function normalizedMeta(
     ...(operation.provider === undefined ? {} : { provider: operation.provider }),
     ...(original.verificationId === undefined ? {} : { verificationId: original.verificationId }),
   });
+}
+
+function finishFailure(
+  span: OperationSpan,
+  error: RuntimeError,
+  meta: OperationMeta,
+): RuntimeEvent {
+  const options = {
+    effectState: error.effect,
+    artifactRefs: meta.artifactRefs,
+    ...(meta.summary === undefined ? {} : { summary: meta.summary }),
+  };
+
+  switch (meta.status) {
+    case "cancelled":
+      return span.cancel(options);
+    case "unknown":
+      return span.unknown(error, options);
+    case "failed":
+    case "completed":
+      return span.fail(error, options);
+  }
 }

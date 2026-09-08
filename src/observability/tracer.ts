@@ -284,9 +284,17 @@ export class OperationSpan {
     return this.finish("operation.cancelled", "cancelled", options, "OPERATION_CANCELLED");
   }
 
+  unknown(error: RuntimeError, options: EndOptions = {}): RuntimeEvent {
+    return this.finish("operation.failed", "unknown", {
+      ...options,
+      effectState: options.effectState ?? error.effect,
+      ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
+    }, error.code);
+  }
+
   private finish(
     type: "operation.completed" | "operation.failed" | "operation.cancelled",
-    status: "completed" | "failed" | "cancelled",
+    status: "completed" | "failed" | "cancelled" | "unknown",
     options: EndOptions,
     errorCode?: string,
   ): RuntimeEvent {
