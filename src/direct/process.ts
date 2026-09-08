@@ -33,6 +33,8 @@ interface ProcessRecord {
   readonly startedAt: string;
   readonly traceId: string;
   readonly runId: string;
+  readonly projectId?: string;
+  readonly taskId?: string;
   readonly spanId: string;
   readonly operationId: string;
   readonly reattachable: false;
@@ -206,6 +208,8 @@ export class DirectProcessManager {
       startedAt: startedAt.toISOString(),
       traceId: options.context.traceId,
       runId: options.context.runId,
+      ...(options.context.projectId === undefined ? {} : { projectId: options.context.projectId }),
+      ...(options.context.taskId === undefined ? {} : { taskId: options.context.taskId }),
       spanId,
       operationId,
       reattachable: false,
@@ -409,11 +413,13 @@ export class DirectProcessManager {
   reconcile(): readonly ProcessId[] {
     if (this.state === undefined) return [];
     const orphaned: ProcessId[] = [];
-    for (const entity of this.state.listEntities("processes")) {
+    for (const entity of this.state.listEntities("processes", { order: "desc" })) {
       if (entity.status !== "running" && entity.status !== "queued") continue;
       const data = entity.data as Partial<ProcessRecord> | undefined;
       if (data?.traceId === undefined || data.runId === undefined || data.spanId === undefined) continue;
       const id = entity.id as ProcessId;
+      const projectId = data.projectId ?? entity.projectId;
+      const taskId = data.taskId ?? entity.taskId;
       orphaned.push(id);
       this.state.saveEntity({
         ...entity,
@@ -430,6 +436,8 @@ export class DirectProcessManager {
         spanId: data.spanId as import("../core/ids.ts").SpanId,
         type: "process.unknown",
         actor: "runtime",
+        ...(projectId === undefined ? {} : { projectId: projectId as import("../core/ids.ts").ProjectId }),
+        ...(taskId === undefined ? {} : { taskId: taskId as import("../core/ids.ts").TaskId }),
         ...(data.operation === undefined ? {} : { operation: data.operation }),
         operationId: data.operationId as import("../core/ids.ts").OperationId,
         status: "unknown",
@@ -447,7 +455,9 @@ export class DirectProcessManager {
     this.state?.saveEntity({
       kind: "processes",
       id: record.processId,
+      ...(record.projectId === undefined ? {} : { projectId: record.projectId }),
       runId: record.runId,
+      ...(record.taskId === undefined ? {} : { taskId: record.taskId }),
       status,
       createdAt: record.startedAt,
       updatedAt: new Date().toISOString(),

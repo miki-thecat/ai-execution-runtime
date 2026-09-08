@@ -152,8 +152,8 @@ function recentProjectEvents(state: StateStore | undefined, projectId: ProjectId
   const add = (entries: readonly RuntimeEvent[]): void => {
     for (const event of entries) events.set(event.eventId, event);
   };
-  add(state.listEvents({ projectId, limit: STATE_CONTEXT_LIMIT }));
-  for (const runId of runIds) add(state.listEvents({ runId: runId as import("../core/ids.ts").RunId, limit: STATE_CONTEXT_LIMIT }));
+  add(state.listEvents({ projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }));
+  for (const runId of runIds) add(state.listEvents({ runId: runId as import("../core/ids.ts").RunId, limit: STATE_CONTEXT_LIMIT, order: "desc" }));
   return [...events.values()].sort((a, b) => {
     const timestamp = b.timestamp.localeCompare(a.timestamp);
     return timestamp === 0 ? b.eventId.localeCompare(a.eventId) : timestamp;
@@ -298,11 +298,11 @@ export class ProjectRuntime {
   }
 
   inspectData(project: ProjectIdentity, git: GitSnapshot): ProjectInspect {
-    const tasks = newestEntities(this.state?.listEntities("tasks", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
-    const runs = newestEntities(this.state?.listEntities("runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
+    const tasks = newestEntities(this.state?.listEntities("tasks", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
+    const runs = newestEntities(this.state?.listEntities("runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
     const runIds = new Set([...runs.map((entity) => entity.id), ...tasks.map((entity) => entity.runId).filter((runId): runId is string => runId !== undefined)]);
-    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
-    const verifications = newestEntities(this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
+    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
+    const verifications = newestEntities(this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
     const activeTasks = tasks.filter((task) => active(task.status)).map(taskSummary).filter((task): task is TaskSummary => task !== undefined).slice(0, 50).reverse();
     const activeProcesses = processes.filter((process) => active(process.status)).map((process) => ({
       id: process.id,
@@ -335,13 +335,16 @@ export class ProjectRuntime {
   resumeData(project: ProjectIdentity, git: GitSnapshot, options: ProjectResumeOptions = {}): ProjectResume {
     const itemLimit = validateLimit(options.itemLimit, 20);
     const eventLimit = validateLimit(options.eventLimit, 20);
-    const tasks = newestEntities(this.state?.listEntities("tasks", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
-    const decisions = newestEntities(this.state?.listEntities("decisions", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
-    const runs = newestEntities(this.state?.listEntities("runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
-    const verifications = newestEntities(this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
-    const agents = newestEntities(this.state?.listEntities("agent_runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT }) ?? []);
+    const tasks = newestEntities([
+      ...(this.state?.listEntities("tasks", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []),
+      ...(this.state?.listEntities("tasks", { projectId: project.projectId, status: "failed", limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []),
+    ].filter((entity, index, entities) => entities.findIndex((candidate) => candidate.id === entity.id) === index));
+    const decisions = newestEntities(this.state?.listEntities("decisions", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
+    const runs = newestEntities(this.state?.listEntities("runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
+    const verifications = newestEntities(this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
+    const agents = newestEntities(this.state?.listEntities("agent_runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
     const runIds = new Set([...runs.map((entity) => entity.id), ...tasks.map((entity) => entity.runId).filter((runId): runId is string => runId !== undefined)]);
-    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
+    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
     const eventRunIds = new Set([...runIds, ...processes.map((process) => process.runId).filter((runId): runId is string => runId !== undefined)]);
     const taskSummaries = tasks.filter((task) => active(task.status)).map(taskSummary).filter((task): task is TaskSummary => task !== undefined).slice(0, itemLimit).reverse();
     const taskRunIds = new Set(tasks.filter((task) => active(task.status)).map((task) => task.runId).filter((runId): runId is string => runId !== undefined));
@@ -374,7 +377,7 @@ export class ProjectRuntime {
         artifactRefs: [...event.artifactRefs].slice(0, 20),
       }));
     const blockers: ResumeBlocker[] = [];
-    for (const task of tasks.filter((candidate) => candidate.status === "blocked" || candidate.status === "waiting_user" || candidate.status === "waiting_approval")) {
+    for (const task of tasks.filter((candidate) => candidate.status === "blocked" || candidate.status === "waiting_user" || candidate.status === "waiting_approval" || candidate.status === "failed")) {
       blockers.push({ source: `task:${task.id}`, message: boundedText(stringValue(task, "reason") ?? `Task is ${task.status}`, 1_000), ...(task.status === undefined ? {} : { status: task.status }) });
     }
     for (const verification of verifications.filter((candidate) => candidate.status === "failed")) {

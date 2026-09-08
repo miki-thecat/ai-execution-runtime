@@ -48,6 +48,8 @@ export interface StateEntityQuery {
   readonly taskId?: string;
   readonly status?: string;
   readonly limit?: number;
+  /** Defaults to ascending for compatibility; context readers can request newest first. */
+  readonly order?: "asc" | "desc";
 }
 
 export interface StoredArtifactMetadata {
@@ -103,6 +105,8 @@ export interface EventQuery {
   readonly projectId?: ProjectId;
   readonly type?: RuntimeEvent["type"];
   readonly limit?: number;
+  /** Defaults to ascending for compatibility; context readers can request newest first. */
+  readonly order?: "asc" | "desc";
 }
 
 export interface SqliteStateStoreOptions {
@@ -315,7 +319,8 @@ export class SqliteStateStore implements StateStore {
     if (options.projectId !== undefined) { clauses.push("project_id = ?"); parameters.push(options.projectId); }
     if (options.type !== undefined) { clauses.push("type = ?"); parameters.push(options.type); }
     const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
-    const rows = this.database.prepare(`SELECT * FROM events${where} ORDER BY timestamp ASC, rowid ASC LIMIT ?`).all(
+    const order = options.order === "desc" ? "DESC" : "ASC";
+    const rows = this.database.prepare(`SELECT * FROM events${where} ORDER BY timestamp ${order}, rowid ${order} LIMIT ?`).all(
       ...parameters,
       limitValue(options.limit, 1_000),
     );
@@ -414,7 +419,8 @@ export class SqliteStateStore implements StateStore {
       if (value !== undefined) { clauses.push(`${column} = ?`); parameters.push(value); }
     }
     const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
-    return this.database.prepare(`SELECT * FROM ${kind}${where} ORDER BY updated_at ASC, ${table.idColumn} ASC LIMIT ?`).all(...parameters, limitValue(query.limit, 1_000)).map((row) => this.entityFromRow(kind, row));
+    const order = query.order === "desc" ? "DESC" : "ASC";
+    return this.database.prepare(`SELECT * FROM ${kind}${where} ORDER BY updated_at ${order}, ${table.idColumn} ${order} LIMIT ?`).all(...parameters, limitValue(query.limit, 1_000)).map((row) => this.entityFromRow(kind, row));
   }
 
   registerArtifact(metadata: StoredArtifactMetadata): void {

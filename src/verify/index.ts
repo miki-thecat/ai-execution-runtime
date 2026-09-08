@@ -1,6 +1,6 @@
 import { createOperationContext, createRunId, createRuntimeError, createTraceId, createVerificationId, runtimeFailure, runtimeSuccess, type OperationContext, type ProjectId, type RuntimeError, type RuntimeResult } from "../core/index.ts";
 import type { ArtifactRef, VerificationId } from "../core/ids.ts";
-import { createOperationMeta, type RuntimeStatus } from "../core/result.ts";
+import { createOperationMeta, type OperationMeta, type RuntimeStatus } from "../core/result.ts";
 import { DirectExecutor } from "../direct/index.ts";
 import type { ExecutableCommand, ProcessResult, ShellRunInput } from "../direct/types.ts";
 import type { Operation } from "../operations/operation.ts";
@@ -121,19 +121,22 @@ function normalizeCommand(command: ConfiguredVerification, index: number): Norma
   };
 }
 
-function processEvidence(check: NormalizedCheck, result: ProcessResult | undefined, error: RuntimeError | undefined, forcedStatus?: VerificationCheckStatus): VerificationCheckEvidence {
+function processEvidence(check: NormalizedCheck, result: ProcessResult | undefined, error: RuntimeError | undefined, forcedStatus?: VerificationCheckStatus, failureMeta?: OperationMeta): VerificationCheckEvidence {
   if (result === undefined) {
     const status: VerificationCheckStatus = forcedStatus ?? (error?.effect === "unknown" ? "unknown" : "failed");
+    const metrics = failureMeta?.metrics;
     return {
       name: check.name,
       command: check.command,
       status,
+      ...(metrics?.exitCode === undefined ? {} : { exitCode: metrics.exitCode }),
+      ...(metrics?.signal === undefined ? {} : { signal: metrics.signal }),
       stdout: "",
       stderr: "",
-      rawOutputBytes: 0,
-      returnedOutputBytes: 0,
-      artifactRefs: [],
-      durationMs: 0,
+      rawOutputBytes: metrics?.rawOutputBytes ?? 0,
+      returnedOutputBytes: metrics?.returnedOutputBytes ?? 0,
+      artifactRefs: [...(failureMeta?.artifactRefs ?? [])],
+      durationMs: metrics?.durationMs ?? 0,
       ...(error === undefined ? {} : { error: error.message }),
     };
   }
@@ -242,7 +245,7 @@ export class VerificationRunner {
             span.record({ internalCalls: 1, rawOutputBytes: result.data.rawOutputBytes, returnedOutputBytes: result.data.returnedOutputBytes, artifactBytes: result.data.artifactBytes });
           } else {
             const checkStatus: VerificationCheckStatus = result.meta.status === "cancelled" ? "cancelled" : result.meta.status === "unknown" || result.error.effect === "unknown" ? "unknown" : "failed";
-            evidence.push(processEvidence(check, undefined, result.error, checkStatus));
+            evidence.push(processEvidence(check, undefined, result.error, checkStatus, result.meta));
             span.record({ internalCalls: 1, artifactBytes: result.meta.metrics.artifactBytes, rawOutputBytes: result.meta.metrics.rawOutputBytes, returnedOutputBytes: result.meta.metrics.returnedOutputBytes });
           }
         } catch (cause) {
@@ -307,7 +310,7 @@ export class VerificationRunner {
   }
 
   latest(projectId: ProjectId): VerificationEvidence | undefined {
-    const entity = [...(this.state?.listEntities("verifications", { projectId }) ?? [])].sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""))[0];
+    const entity = [...(this.state?.listEntities("verifications", { projectId, order: "desc" }) ?? [])].sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""))[0];
     return entity === undefined ? [...this.memory.values()].filter((evidence) => evidence.projectId === projectId).sort((a, b) => b.completedAt.localeCompare(a.completedAt))[0] : this.get(entity.id as VerificationId);
   }
 
