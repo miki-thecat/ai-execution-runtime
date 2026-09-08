@@ -4,3 +4,5 @@ export * from "./operations/index.ts";
 export * from "./state/index.ts";
 export * from "./artifacts/index.ts";
 export * from "./direct/index.ts";
+export * from "./files/index.ts";
+export * from "./changes/index.ts";
