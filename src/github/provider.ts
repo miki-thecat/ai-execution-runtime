@@ -10,7 +10,7 @@ import {
   type RuntimeError,
   type RuntimeResult,
 } from "../core/result.ts";
-import { createRunId, createTraceId } from "../core/ids.ts";
+import { createRunId, createTraceId, type ArtifactRef } from "../core/ids.ts";
 import { DirectExecutor } from "../direct/index.ts";
 import type { ExecutableCommand, ShellRunInput } from "../direct/types.ts";
 import { Tracer, type OperationSpan } from "../observability/index.ts";
@@ -49,6 +49,7 @@ const PR_JSON_FIELDS = [
   "number", "title", "state", "url", "isDraft", "headRefName", "headRefOid",
   "baseRefName", "baseRefOid", "statusCheckRollup", "reviewDecision", "reviews",
 ].join(",");
+const PR_LOOKUP_JSON_FIELDS = `${PR_JSON_FIELDS},headRepositoryOwner,headRepository`;
 const REPO_JSON_FIELDS = "name,nameWithOwner,url,defaultBranchRef,owner";
 const ISSUE_JSON_FIELDS = "number,title,state,url,labels,assignees";
 
@@ -58,6 +59,7 @@ interface ProviderWorkResult<T> {
   readonly data: T;
   readonly effectState?: EffectState;
   readonly summary?: string;
+  readonly artifactRefs?: readonly ArtifactRef[];
   readonly truncated?: boolean;
 }
 
@@ -90,6 +92,8 @@ class ProviderMetrics {
   rawOutputBytes = 0;
   returnedOutputBytes = 0;
   artifactBytes = 0;
+  readonly artifactRefs: ArtifactRef[] = [];
+  truncated = false;
 
   call(input: unknown): void {
     this.internalCalls += 1;
@@ -100,6 +104,8 @@ class ProviderMetrics {
     this.rawOutputBytes += result.rawOutputBytes ?? byteLength(`${result.stdout}${result.stderr}`);
     this.returnedOutputBytes += result.returnedOutputBytes ?? byteLength(`${result.stdout}${result.stderr}`);
     this.artifactBytes += result.artifactBytes ?? 0;
+    this.artifactRefs.push(...(result.artifactRefs ?? []));
+    this.truncated ||= result.truncated === true;
   }
 
   setReturnedOutputBytes(value: number): void {
@@ -148,7 +154,7 @@ class DirectGitHubCommandRunner implements GitHubCommandRunner {
   }
 }
 
-function processResult(result: { readonly stdout: string; readonly stderr: string; readonly exitCode?: number; readonly rawOutputBytes: number; readonly returnedOutputBytes: number; readonly artifactBytes: number }): GitHubCommandResult {
+function processResult(result: { readonly stdout: string; readonly stderr: string; readonly exitCode?: number; readonly rawOutputBytes: number; readonly returnedOutputBytes: number; readonly artifactBytes: number; readonly artifactRefs: readonly ArtifactRef[]; readonly truncated: boolean }): GitHubCommandResult {
   return {
     stdout: result.stdout,
     stderr: result.stderr,
@@ -156,6 +162,8 @@ function processResult(result: { readonly stdout: string; readonly stderr: strin
     rawOutputBytes: result.rawOutputBytes,
     returnedOutputBytes: result.returnedOutputBytes,
     artifactBytes: result.artifactBytes,
+    artifactRefs: result.artifactRefs,
+    truncated: result.truncated,
   };
 }
 
@@ -274,7 +282,7 @@ function normalizeStatus(value: unknown): string {
 
 function authenticatedHostState(value: unknown): boolean {
   const state = normalizeStatus(value);
-  return state === "" || ["authenticated", "authorized", "active", "logged_in", "logged-in"].includes(state);
+  return state === "" || ["authenticated", "authorized", "active", "success", "logged_in", "logged-in"].includes(state);
 }
 
 function parseCheck(value: unknown): GitHubCheck | undefined {
@@ -310,14 +318,19 @@ function isFailedCheck(check: GitHubCheck): boolean {
 function checksSummary(checks: readonly GitHubCheck[]): GitHubChecksSummary {
   const pending = checks.filter(isPendingCheck).length;
   const failed = checks.filter(isFailedCheck).length;
-  const passed = checks.length - pending - failed;
+  const passed = checks.filter(isSuccessfulCheck).length;
   return {
-    state: pending > 0 ? "pending" : failed > 0 ? "failure" : checks.length === 0 ? "neutral" : "success",
+    state: pending > 0 ? "pending" : failed > 0 ? "failure" : passed > 0 ? "success" : "neutral",
     total: checks.length,
     passed,
     failed,
     pending,
   };
+}
+
+function isSuccessfulCheck(check: GitHubCheck): boolean {
+  return ["pass", "passed", "success"].includes(check.status) ||
+    ["pass", "passed", "success"].includes(check.conclusion ?? "");
 }
 
 function parseChecks(value: unknown): GitHubCheck[] {
@@ -342,7 +355,7 @@ const RAW_CHECK_STATUSES = new Set([
 function parseRawChecks(stdout: string): GitHubCheck[] {
   return stdout.split("\n")
     .map((line) => line.trim())
-    .filter((line) => line !== "" && !/^(all checks|no checks)/i.test(line))
+    .filter((line) => line !== "" && !/^(all checks|no checks|some checks were not successful)/i.test(line))
     .map((line) => {
       const parts = line.split(/\s+/);
       const urlIndex = parts.findIndex((part) => /^https?:\/\//i.test(part));
@@ -367,8 +380,15 @@ function parseReview(value: unknown): GitHubReview | undefined {
   return {
     ...(author === undefined ? {} : { author }),
     state,
-    ...(stringValue(value.submittedAt) === undefined ? {} : { submittedAt: stringValue(value.submittedAt) as string }),
+    ...(stringValue(value.submittedAt) === undefined && stringValue(value.submitted_at) === undefined
+      ? {}
+      : { submittedAt: (stringValue(value.submittedAt) ?? stringValue(value.submitted_at)) as string }),
   };
+}
+
+function parseReviews(value: unknown): GitHubReview[] {
+  const source = Array.isArray(value) ? value : isObject(value) && Array.isArray(value.reviews) ? value.reviews : [];
+  return source.map(parseReview).filter((item): item is GitHubReview => item !== undefined);
 }
 
 function reviewsSummary(reviews: readonly GitHubReview[], decision?: string): GitHubReviewsSummary {
@@ -394,6 +414,16 @@ function parsePullRequest(value: unknown): GitHubPullRequest | undefined {
   const isDraft = booleanValue(value.isDraft) ?? booleanValue(value.draft);
   const headRefName = stringValue(value.headRefName) ?? stringValue(nested(value.head, "ref"));
   const headRefOid = stringValue(value.headRefOid) ?? stringValue(nested(value.head, "sha"));
+  const headRepositoryNameWithOwner = stringValue(value.headRepositoryNameWithOwner) ??
+    stringValue(nested(value.headRepository, "nameWithOwner")) ??
+    stringValue(nested(value.headRepository, "full_name")) ??
+    stringValue(value.headRepository) ??
+    stringValue(nested(nested(value.head, "repo"), "full_name"));
+  const headRepositoryOwner = stringValue(nested(value.headRepositoryOwner, "login")) ??
+    stringValue(nested(value.headRepositoryOwner, "name")) ??
+    stringValue(value.headRepositoryOwner) ??
+    (headRepositoryNameWithOwner?.split("/")[0]) ??
+    stringValue(nested(nested(value.head, "user"), "login"));
   const baseRefName = stringValue(value.baseRefName) ?? stringValue(nested(value.base, "ref"));
   const baseRefOid = stringValue(value.baseRefOid) ?? stringValue(nested(value.base, "sha"));
   return {
@@ -404,6 +434,8 @@ function parsePullRequest(value: unknown): GitHubPullRequest | undefined {
     ...(isDraft === undefined ? {} : { isDraft }),
     ...(headRefName === undefined ? {} : { headRefName }),
     ...(headRefOid === undefined ? {} : { headRefOid }),
+    ...(headRepositoryOwner === undefined ? {} : { headRepositoryOwner }),
+    ...(headRepositoryNameWithOwner === undefined ? {} : { headRepositoryNameWithOwner }),
     ...(baseRefName === undefined ? {} : { baseRefName }),
     ...(baseRefOid === undefined ? {} : { baseRefOid }),
     checks,
@@ -454,8 +486,8 @@ function labelStatus(issue: GitHubIssue, dependencies: GitHubIssueDependencies):
   if ((issue.state ?? "").toLowerCase() === "closed") return "completed";
   if (dependencies.state === "unknown") return "unknown";
   if (dependencies.blockedBy.length > 0) return "blocked";
-  const labels = (issue.labels ?? []).map((label) => label.toLowerCase().replaceAll("-", "_"));
-  if (labels.some((label) => label.includes("in_progress") || label.includes("doing"))) return "in_progress";
+  const labels = (issue.labels ?? []).map((label) => label.toLowerCase().replaceAll("-", "_").replaceAll(":", "_"));
+  if (labels.some((label) => label.includes("in_progress") || label.includes("agent_running") || label.includes("doing"))) return "in_progress";
   return "ready";
 }
 
@@ -637,7 +669,7 @@ export class GitHubProvider {
         lastChecks = checksAttempt.value;
         const summary = checksSummary(lastChecks);
         const terminal = summary.pending === 0;
-        const passed = terminal && summary.failed === 0;
+        const passed = terminal && summary.state === "success" && summary.passed > 0;
         // A terminal failure is final even for checks_passed: return it to the
         // caller instead of polling until the deadline can only produce a
         // misleading timeout.
@@ -770,7 +802,7 @@ export class GitHubProvider {
       if (freshPullRequest.headRefOid !== localHead) {
         throw createRuntimeError({ code: "GITHUB_PR_HEAD_MISMATCH", message: "Pull request head does not match the reconciled remote HEAD", retryable: true, effect: publishEffectState, details: { pullRequest: freshPullRequest.number, localHead, pullRequestHead: freshPullRequest.headRefOid } });
       }
-      if (freshPullRequest.baseRefName !== undefined && freshPullRequest.baseRefName !== base) {
+      if (freshPullRequest.baseRefName !== base) {
         throw createRuntimeError({ code: "GITHUB_PR_BASE_MISMATCH", message: "Existing pull request targets a different base branch", retryable: false, effect: publishEffectState, details: { expected: base, actual: freshPullRequest.baseRefName } });
       }
       return {
@@ -829,11 +861,14 @@ export class GitHubProvider {
         throw createRuntimeError({ code: "EFFECT_APPROVAL_REQUIRED", message: `GitHub operation ${operation} requires approval`, retryable: false, effect: "none" });
       }
       const result = await work(metrics, operationContext);
+      const artifactRefs = result.artifactRefs ?? metrics.artifactRefs;
+      const truncated = result.truncated ?? metrics.truncated;
       metrics.setReturnedOutputBytes(byteLength(JSON.stringify(result.data) ?? ""));
       const snapshot = metrics.snapshot();
       span?.record(snapshot);
       const event = span?.complete({
         effectState: result.effectState ?? "none",
+        artifactRefs,
         ...(result.summary === undefined ? {} : { summary: result.summary }),
       });
       return runtimeSuccess(result.data, createOperationMeta({
@@ -845,7 +880,8 @@ export class GitHubProvider {
         startedAt: span?.startedAt ?? startedAt,
         completedAt: event?.timestamp ?? this.tracer.now().toISOString(),
         metrics: event === undefined ? snapshot : eventMetrics(event),
-        truncated: result.truncated ?? false,
+        artifactRefs,
+        truncated,
         executor: "direct",
         provider: "github",
       }));
@@ -855,7 +891,7 @@ export class GitHubProvider {
       span?.record(snapshot);
       const event = span === undefined
         ? undefined
-        : error.effect === "unknown" ? span.unknown(error) : span.fail(error);
+        : error.effect === "unknown" ? span.unknown(error, { artifactRefs: metrics.artifactRefs }) : span.fail(error, { artifactRefs: metrics.artifactRefs });
       return runtimeFailure(error, createOperationMeta({
         context: operationContext,
         operation,
@@ -865,6 +901,8 @@ export class GitHubProvider {
         startedAt: span?.startedAt ?? startedAt,
         completedAt: event?.timestamp ?? this.tracer.now().toISOString(),
         metrics: event === undefined ? snapshot : eventMetrics(event),
+        artifactRefs: metrics.artifactRefs,
+        truncated: metrics.truncated,
         executor: "direct",
         provider: "github",
       }));
@@ -1041,8 +1079,9 @@ export class GitHubProvider {
       if (prs !== undefined) {
         const value = parsePullRequests(prs.value)[0];
         if (value !== undefined) {
+          const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes);
           routes.add(prs.route);
-          return { value, route: prs.route };
+          return { value: enriched, route: prs.route };
         }
       }
     }
@@ -1070,8 +1109,9 @@ export class GitHubProvider {
     if (api !== undefined) {
       const value = parsePullRequest(api.value);
       if (value !== undefined) {
+        const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes);
         routes.add(api.route);
-        return { value, route: api.route };
+        return { value: enriched, route: api.route };
       }
     }
     const raw = await this.rawJson(["pr", "view", String(number), "--json", PR_JSON_FIELDS], cwd, context, metrics);
@@ -1083,6 +1123,30 @@ export class GitHubProvider {
       }
     }
     return undefined;
+  }
+
+  private async enrichApiPullRequest(repository: GitHubRepository, pullRequest: GitHubPullRequest, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<GitHubPullRequest> {
+    let checks = pullRequest.checks;
+    let reviews = pullRequest.reviews;
+    const reviewsAttempt = await this.apiJson(`repos/${repositoryPath(repository)}/pulls/${pullRequest.number}/reviews`, [], cwd, context, metrics);
+    if (reviewsAttempt !== undefined) {
+      reviews = parseReviews(reviewsAttempt.value);
+      routes.add(reviewsAttempt.route);
+    }
+    if (pullRequest.headRefOid !== undefined) {
+      const checksAttempt = await this.apiJson(`repos/${repositoryPath(repository)}/commits/${pullRequest.headRefOid}/check-runs`, [], cwd, context, metrics);
+      if (checksAttempt !== undefined) {
+        checks = parseChecks(checksAttempt.value);
+        routes.add(checksAttempt.route);
+      }
+    }
+    return {
+      ...pullRequest,
+      checks,
+      checksSummary: checksSummary(checks),
+      reviews,
+      reviewsSummary: reviewsSummary(reviews, pullRequest.reviewsSummary.decision),
+    };
   }
 
   private async readIssue(repository: GitHubRepository, number: number, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubIssue> | undefined> {
@@ -1147,7 +1211,7 @@ export class GitHubProvider {
     }
     if (repository !== undefined) {
       const pr = await this.apiJson(`repos/${repositoryPath(repository)}/pulls/${number}`, [], cwd, context, metrics);
-      const sha = stringValue(nested(pr?.value, "head")) === undefined ? stringValue(nested(nested(pr?.value, "head"), "sha")) : undefined;
+      const sha = stringValue(nested(nested(pr?.value, "head"), "sha"));
       if (sha !== undefined) {
         const checks = await this.apiJson(`repos/${repositoryPath(repository)}/commits/${sha}/check-runs`, [], cwd, context, metrics);
         if (checks !== undefined) {
@@ -1167,9 +1231,9 @@ export class GitHubProvider {
       metrics,
       timeoutMs === undefined ? {} : { timeoutMs },
     );
-    if ((raw.exitCode ?? 0) === 0) {
+    const checks = parseRawChecks(`${raw.stdout}\n${raw.stderr}`);
+    if ((raw.exitCode ?? 0) === 0 || checks.length > 0 || /some checks were not successful/i.test(`${raw.stdout}\n${raw.stderr}`)) {
       routes.add("raw-gh");
-      const checks = parseRawChecks(raw.stdout);
       return { value: checks, route: "raw-gh" };
     }
     return undefined;
@@ -1182,9 +1246,16 @@ export class GitHubProvider {
   }
 
   private async findPullRequest(repository: GitHubRepository, branch: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, options: PullRequestLookupOptions = {}): Promise<Attempt<GitHubPullRequest> | undefined> {
-    const structured = await this.jsonCommand(["pr", "list", "--head", branch, "--state", "all", "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    const head = `${repository.owner}:${branch}`;
+    // Older gh versions accepted only a bare branch for --head. Prefer the
+    // owner-qualified form so a same-named fork cannot be selected, but keep a
+    // compatibility retry when the installed CLI rejects that filter.
+    let structured = await this.jsonCommand(["pr", "list", "--head", head, "--state", "all", "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+    if (structured === undefined) {
+      structured = await this.jsonCommand(["pr", "list", "--head", branch, "--state", "all", "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    }
     if (structured !== undefined) {
-      const value = selectPullRequest(parsePullRequests(structured.value), branch);
+      const value = selectPullRequest(parsePullRequests(structured.value), branch, repository);
       if (value !== undefined) {
         routes.add("gh-json");
         return { value, route: "gh-json" };
@@ -1193,17 +1264,20 @@ export class GitHubProvider {
       // reconcile, so do not perform lower-priority reads or raw fallbacks.
       if (Array.isArray(structured.value) && options.reconcileAfterEmpty !== true) return undefined;
     }
-    const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls?head=${encodeURIComponent(repository.owner + ":" + branch)}&state=all&per_page=100`, [], cwd, context, metrics);
+    const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls?head=${encodeURIComponent(head)}&state=all&per_page=100`, [], cwd, context, metrics);
     if (api !== undefined) {
-      const value = selectPullRequest(parsePullRequests(api.value), branch);
+      const value = selectPullRequest(parsePullRequests(api.value), branch, repository);
       if (value !== undefined) {
         routes.add(api.route);
         return { value, route: api.route };
       }
     }
-    const raw = await this.rawJson(["pr", "list", "--head", branch, "--state", "all", "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    let raw = await this.rawJson(["pr", "list", "--head", head, "--state", "all", "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+    if (raw === undefined) {
+      raw = await this.rawJson(["pr", "list", "--head", branch, "--state", "all", "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    }
     if (raw !== undefined) {
-      const value = selectPullRequest(parsePullRequests(raw.value), branch);
+      const value = selectPullRequest(parsePullRequests(raw.value), branch, repository);
       if (value !== undefined) {
         routes.add("raw-gh");
         return { value, route: "raw-gh" };
@@ -1229,9 +1303,16 @@ export class GitHubProvider {
   }
 }
 
-function selectPullRequest(values: readonly GitHubPullRequest[], branch: string): GitHubPullRequest | undefined {
-  return values.find((value) => value.headRefName === branch && (value.state ?? "").toLowerCase() !== "closed") ??
-    values.find((value) => value.headRefName === undefined || value.headRefName === branch);
+function selectPullRequest(values: readonly GitHubPullRequest[], branch: string, repository: GitHubRepository): GitHubPullRequest | undefined {
+  const candidates = values.filter((value) => value.headRefName === branch && headBelongsToRepository(value, repository));
+  return candidates.find((value) => (value.state ?? "").toLowerCase() !== "closed") ?? candidates[0];
+}
+
+function headBelongsToRepository(pullRequest: GitHubPullRequest, repository: GitHubRepository): boolean {
+  if (pullRequest.headRepositoryNameWithOwner !== undefined) {
+    return pullRequest.headRepositoryNameWithOwner.toLowerCase() === repository.nameWithOwner.toLowerCase();
+  }
+  return pullRequest.headRepositoryOwner === undefined || pullRequest.headRepositoryOwner.toLowerCase() === repository.owner.toLowerCase();
 }
 
 function parsePullRequestNumber(value: number | string | undefined): number | undefined {

@@ -1,5 +1,6 @@
 import type { OperationContext } from "../core/context.ts";
 import type { EffectState } from "../core/effects.ts";
+import type { ArtifactRef } from "../core/ids.ts";
 import type { RuntimeResult } from "../core/result.ts";
 import type { ExecutableCommand, ShellRunInput } from "../direct/types.ts";
 
@@ -13,6 +14,8 @@ export interface GitHubCommandResult {
   readonly rawOutputBytes?: number;
   readonly returnedOutputBytes?: number;
   readonly artifactBytes?: number;
+  readonly artifactRefs?: readonly ArtifactRef[];
+  readonly truncated?: boolean;
 }
 
 /**
@@ -88,6 +91,8 @@ export interface GitHubPullRequest {
   readonly isDraft?: boolean;
   readonly headRefName?: string;
   readonly headRefOid?: string;
+  readonly headRepositoryOwner?: string;
+  readonly headRepositoryNameWithOwner?: string;
   readonly baseRefName?: string;
   readonly baseRefOid?: string;
   readonly checks: readonly GitHubCheck[];
