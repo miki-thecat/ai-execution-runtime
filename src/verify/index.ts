@@ -6,6 +6,7 @@ import { DirectExecutor } from "../direct/index.ts";
 import type { ExecutableCommand, ProcessResult, ShellRunInput } from "../direct/types.ts";
 import type { Operation } from "../operations/operation.ts";
 import { Tracer } from "../observability/index.ts";
+import { sanitizeDurableText } from "../observability/redaction.ts";
 import type { StateEntity, StateStore } from "../state/store.ts";
 import { configuredVerificationCommands, type ConfiguredVerification, type VerificationCommandConfig } from "../project/config.ts";
 import { ProjectRegistry } from "../project/registry.ts";
@@ -168,6 +169,21 @@ function refsFromChecks(checks: readonly VerificationCheckEvidence[]): ArtifactR
   const refs: ArtifactRef[] = [];
   for (const check of checks) for (const ref of check.artifactRefs) if (!refs.includes(ref)) refs.push(ref);
   return refs;
+}
+
+function durableEvidence(evidence: VerificationEvidence): VerificationEvidence {
+  return {
+    ...evidence,
+    summary: sanitizeDurableText(evidence.summary),
+    checks: evidence.checks.map((check) => ({
+      ...check,
+      name: sanitizeDurableText(check.name),
+      command: "[not persisted]",
+      stdout: "",
+      stderr: "",
+      ...(check.error === undefined ? {} : { error: sanitizeDurableText(check.error) }),
+    })),
+  };
 }
 
 function mergeEffectState(current: EffectState, next: EffectState): EffectState {
@@ -342,6 +358,7 @@ export class VerificationRunner {
 
   private persistEvidence(evidence: VerificationEvidence, context: OperationContext): void {
     this.memory.set(evidence.verificationId, evidence);
+    const persisted = durableEvidence(evidence);
     this.state?.saveEntity({
       kind: "verifications",
       id: evidence.verificationId,
@@ -351,7 +368,7 @@ export class VerificationRunner {
       traceId: context.traceId,
       createdAt: evidence.startedAt,
       updatedAt: evidence.completedAt,
-      data: { verificationId: evidence.verificationId, traceId: context.traceId, summary: evidence.summary, passed: evidence.passed, artifactRefs: evidence.artifactRefs, evidence },
+      data: { verificationId: persisted.verificationId, traceId: context.traceId, summary: persisted.summary, passed: persisted.passed, artifactRefs: persisted.artifactRefs, evidence: persisted },
     });
   }
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -170,6 +171,109 @@ test("persisted ChangeSet evidence supports rollback after manager recreation", 
     const rolledBack = recreated.rollback(patched.data.changeset, context);
     assert.equal(rolledBack.ok, true);
     assert.equal(new TextDecoder().decode(readFileSync(path)), "before\n");
+  } finally {
+    state.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("patch and rollback preserve executable mode while new files default private", () => {
+  const root = fixture();
+  try {
+    const executable = join(root, "tool.sh");
+    writeFileSync(executable, "#!/bin/sh\necho before\n");
+    chmodSync(executable, 0o755);
+    const tracer = new Tracer();
+    const { context } = contextFor(tracer);
+    const files = new FileOperations({ rootDir: root });
+    const read = files.read({ path: "tool.sh" }, context);
+    assert.equal(read.ok, true);
+    if (!read.ok) return;
+    const patched = files.patch({ path: "tool.sh", expectedHash: read.data.contentHash, content: "#!/bin/sh\necho after\n" }, context);
+    assert.equal(patched.ok, true);
+    if (!patched.ok) return;
+    assert.equal(statSync(executable).mode & 0o777, 0o755);
+    const rolledBack = files.rollback(patched.data.changeset, context);
+    assert.equal(rolledBack.ok, true);
+    assert.equal(statSync(executable).mode & 0o777, 0o755);
+    const created = files.patch({ path: "new.txt", content: "private\n" }, context);
+    assert.equal(created.ok, true);
+    assert.equal(statSync(join(root, "new.txt")).mode & 0o777, 0o600);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed unified patches fail closed without becoming replacement content", () => {
+  const root = fixture();
+  try {
+    const path = join(root, "guarded.txt");
+    writeFileSync(path, "before\n");
+    const tracer = new Tracer();
+    const { context } = contextFor(tracer);
+    const files = new FileOperations({ rootDir: root });
+    const read = files.read({ path: "guarded.txt" }, context);
+    assert.equal(read.ok, true);
+    if (!read.ok) return;
+    const result = files.patch({ path: "guarded.txt", expectedHash: read.data.contentHash, patch: "this is not a unified diff" }, context);
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.error.code, "PATCH_INVALID");
+    assert.equal(readFileSync(path, "utf8"), "before\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a dead-owner mutation lock is recovered without admitting a live owner", () => {
+  const root = fixture();
+  try {
+    const tracer = new Tracer();
+    const { context } = contextFor(tracer);
+    const files = new FileOperations({ rootDir: root });
+    const lockPath = join(root, ".aer-mutation.lock");
+    writeFileSync(lockPath, JSON.stringify({ pid: 2_147_483_647, hostname: hostname(), createdAt: new Date().toISOString(), nonce: "dead" }), { mode: 0o600 });
+    const recovered = files.patch({ path: "recovered.txt", content: "ok\n" }, context);
+    assert.equal(recovered.ok, true);
+
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, hostname: hostname(), createdAt: new Date().toISOString(), nonce: "live" }), { mode: 0o600 });
+    const blocked = files.patch({ path: "blocked.txt", content: "no\n" }, context);
+    assert.equal(blocked.ok, false);
+    if (blocked.ok) return;
+    assert.equal(blocked.error.code, "FILE_MUTATION_LOCKED");
+    assert.equal(statSync(lockPath).isFile(), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tampered before-image artifacts fail rollback before mutation and are not duplicated in SQLite", () => {
+  const root = fixture();
+  const state = new SqliteStateStore(":memory:");
+  try {
+    const path = join(root, "fixture.txt");
+    writeFileSync(path, "before\n");
+    const artifacts = new FileArtifactStore(join(root, ".artifacts"));
+    const tracer = new Tracer();
+    const { context } = contextFor(tracer);
+    const first = new FileOperations({ rootDir: root, state, artifacts });
+    const read = first.read({ path: "fixture.txt" }, context);
+    assert.equal(read.ok, true);
+    if (!read.ok) return;
+    const patched = first.patch({ path: "fixture.txt", expectedHash: read.data.contentHash, content: "after\n" }, context);
+    assert.equal(patched.ok, true);
+    if (!patched.ok) return;
+    const file = patched.data.changeset.files[0]!;
+    assert.equal("rollbackBeforeBytes" in (state.getEntity("changeset_files", `${patched.data.changeset.id}:fixture.txt`)?.data ?? {}), false);
+    const digest = file.beforeArtifactRef!.slice("artifact://sha256:".length);
+    writeFileSync(join(artifacts.rootDir, "sha256", digest), "tampered\n", { mode: 0o600 });
+
+    const recreated = new FileOperations({ rootDir: root, state, artifacts });
+    const rollback = recreated.rollback(patched.data.changeset, context);
+    assert.equal(rollback.ok, false);
+    if (rollback.ok) return;
+    assert.equal(rollback.error.code, "ROLLBACK_EVIDENCE_INTEGRITY_FAILED");
+    assert.equal(readFileSync(path, "utf8"), "after\n");
   } finally {
     state.close();
     rmSync(root, { recursive: true, force: true });

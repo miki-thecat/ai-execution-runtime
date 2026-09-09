@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, openSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import { pid } from "node:process";
 import {
@@ -16,6 +16,7 @@ import type { ArtifactRef } from "../core/ids.ts";
 import type { ArtifactStore } from "../artifacts/store.ts";
 import {
   ChangeSetManager,
+  readConfinedFile,
   resolveConfinedPath,
   sha256,
   type ChangeSet,
@@ -154,7 +155,7 @@ function unifiedPatch(source: string, patch: string): string {
   const lines = source.split("\n");
   const patchLines = patch.replace(/\r\n/g, "\n").split("\n");
   const hunkIndex = patchLines.findIndex((line) => line.startsWith("@@"));
-  if (hunkIndex < 0) return patch;
+  if (hunkIndex < 0) throw createRuntimeError({ code: "PATCH_INVALID", message: "Unified patch contains no valid hunk", retryable: false, effect: "none" });
   const header = patchLines[hunkIndex]!;
   const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(header);
   if (match === null) throw createRuntimeError({ code: "PATCH_INVALID", message: "Unified patch hunk header is invalid", retryable: false, effect: "none" });
@@ -212,10 +213,9 @@ export class FileOperations {
     try {
       assertEffectAllowed(operationContext, "read");
       const maxBytes = validLimit(input.maxBytes, this.maxReadBytes, "maxBytes");
-      const path = resolveConfinedPath(this.rootDir, input.path);
-      const stat = statSync(path);
-      if (!stat.isFile()) throw createRuntimeError({ code: "FILE_NOT_REGULAR", message: `Not a regular file: ${input.path}`, retryable: false, effect: "none" });
-      const bytes = readFileSync(path);
+      const opened = readConfinedFile(this.rootDir, input.path);
+      const path = opened.path;
+      const bytes = opened.bytes!;
       const fullText = new TextDecoder().decode(bytes);
       const lines = fullText === "" ? [] : fullText.split("\n");
       if (fullText.endsWith("\n")) lines.pop();
@@ -287,9 +287,9 @@ export class FileOperations {
     try {
       assertEffectAllowed(operationContext, "workspace_write");
       if ((input.content === undefined) === (input.patch === undefined)) throw createRuntimeError({ code: "PATCH_INPUT_INVALID", message: "Provide exactly one of content or patch", retryable: false, effect: "none" });
-      const path = resolveConfinedPath(this.rootDir, input.path, true);
-      const before = existsSync(path) ? readFileSync(path) : undefined;
-      if (existsSync(path) && !lstatSync(path).isFile()) throw createRuntimeError({ code: "FILE_NOT_REGULAR", message: `Not a regular file: ${input.path}`, retryable: false, effect: "none" });
+      const opened = readConfinedFile(this.rootDir, input.path, true);
+      const path = opened.path;
+      const before = opened.bytes;
       const expectedHash = input.expectedHash ?? input.baseHash;
       if (before !== undefined) {
         const actualHash = sha256(before);
@@ -301,20 +301,20 @@ export class FileOperations {
       const replacement = input.content !== undefined ? input.content : unifiedPatch(source, input.patch!);
       const after = typeof replacement === "string" ? new TextEncoder().encode(replacement) : replacement;
       const beforeHash = before === undefined ? undefined : sha256(before);
-      const outputPath = resolveConfinedPath(this.rootDir, input.path, true);
+      const outputPath = path;
       const parent = dirname(outputPath);
       if (!existsSync(parent) || !statSync(parent).isDirectory()) throw createRuntimeError({ code: "FILE_PARENT_MISSING", message: `Parent directory does not exist: ${input.path}`, retryable: false, effect: "none" });
       const afterHash = sha256(after);
-      const changeset = this.changes.apply({ context: operationContext, files: [{ path: relativeFile(this.rootDir, outputPath), ...(before === undefined ? {} : { before }), after }] }, () => {
+      const changeset = this.changes.apply({ context: operationContext, files: [{ path: relativeFile(this.rootDir, outputPath), ...(before === undefined ? {} : { before }), ...(opened.mode === undefined ? {} : { beforeMode: opened.mode }), after }] }, () => {
         // Re-read under the mutation lock immediately before replacement. This
         // check closes the gap between the caller's precondition and the write.
-        const current = existsSync(outputPath) ? readFileSync(outputPath) : undefined;
+        const current = readConfinedFile(this.rootDir, relativeFile(this.rootDir, outputPath), true).bytes;
         const currentHash = current === undefined ? undefined : sha256(current);
         if (currentHash !== beforeHash || (current === undefined) !== (before === undefined)) {
           throw createRuntimeError({ code: "FILE_HASH_MISMATCH", message: `Refusing to overwrite ${input.path}; the file changed while preparing the patch`, retryable: false, effect: "none", details: { path: input.path, expectedHash: beforeHash, actualHash: currentHash } });
         }
-        atomicWrite(this.rootDir, outputPath, after);
-        const written = existsSync(outputPath) ? readFileSync(outputPath) : undefined;
+        atomicWrite(this.rootDir, outputPath, after, opened.mode);
+        const written = readConfinedFile(this.rootDir, relativeFile(this.rootDir, outputPath), true).bytes;
         if (written === undefined || sha256(written) !== afterHash) {
           throw createRuntimeError({ code: "FILE_WRITE_RACE", message: `The file changed while applying ${input.path}`, retryable: false, effect: "unknown", details: { path: input.path, expectedHash: afterHash, actualHash: written === undefined ? undefined : sha256(written) } });
         }
@@ -389,7 +389,7 @@ export class FileOperations {
     const matches: FileSearchMatch[] = [];
     const expression = input.regex ? new RegExp(input.query) : undefined;
     for (const file of files) {
-      const bytes = readFileSync(file);
+      const bytes = readConfinedFile(this.rootDir, relative(this.rootDir, file)).bytes!;
       if (bytes.includes(0)) continue;
       const lines = new TextDecoder().decode(bytes).split("\n");
       for (let index = 0; index < lines.length; index += 1) {
@@ -476,7 +476,7 @@ function walk(directory: string, root: string, files: string[]): void {
   }
 }
 
-function atomicWrite(rootDir: string, path: string, content: Uint8Array): void {
+function atomicWrite(rootDir: string, path: string, content: Uint8Array, mode?: number): void {
   const parent = dirname(path);
   const confinedParent = resolveConfinedPath(rootDir, relative(rootDir, parent) || ".", false);
   if (confinedParent !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
@@ -488,6 +488,7 @@ function atomicWrite(rootDir: string, path: string, content: Uint8Array): void {
   try {
     if (realpathSync(anchoredParent) !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
     writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+    chmodSync(temporary, mode ?? 0o600);
     renameSync(temporary, destination);
   } finally {
     if (existsSync(temporary)) unlinkSync(temporary);

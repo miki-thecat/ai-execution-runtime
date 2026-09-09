@@ -30,6 +30,7 @@ declare module "node:crypto" {
 declare module "node:fs" {
   interface MakeDirectoryOptions {
     readonly recursive?: boolean;
+    readonly mode?: number;
   }
 
   interface WriteFileOptions {
@@ -39,17 +40,22 @@ declare module "node:fs" {
 
   interface FileStats {
     readonly size: number;
+    readonly mode: number;
+    readonly ino: number;
     readonly birthtimeMs: number;
     readonly mtimeMs: number;
   }
 
   export function existsSync(path: string): boolean;
   export function mkdirSync(path: string, options?: MakeDirectoryOptions): void;
+  export function chmodSync(path: string, mode: number): void;
   export function readFileSync(path: string): Uint8Array;
-  export function writeFileSync(path: string, data: string | Uint8Array, options?: WriteFileOptions): void;
+  export function writeFileSync(path: string | number, data: string | Uint8Array, options?: WriteFileOptions): void;
   export function renameSync(oldPath: string, newPath: string): void;
   export function statSync(path: string): FileStats;
-  export function openSync(path: string, flags: string): number;
+  export const constants: { readonly O_RDONLY: number; readonly O_NOFOLLOW: number };
+  export function openSync(path: string, flags: string | number, mode?: number): number;
+  export function fstatSync(fd: number): FileStats;
   export function readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number): number;
   export function closeSync(fd: number): void;
 }

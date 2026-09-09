@@ -1,17 +1,22 @@
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
   lstatSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { pid } from "node:process";
+import { kill, pid, platform } from "node:process";
+import { hostname } from "node:os";
 import type { OperationContext } from "../core/context.ts";
 import {
   createChangesetId,
@@ -26,6 +31,7 @@ import {
 import type { ArtifactStore } from "../artifacts/store.ts";
 import type { StateStore } from "../state/store.ts";
 import type { Tracer } from "../observability/tracer.ts";
+import { sanitizeDurableText } from "../observability/redaction.ts";
 
 export type ChangeSetStatus = "prepared" | "applied" | "rolled_back";
 
@@ -37,6 +43,7 @@ export interface ChangeSetFile {
   readonly afterExists: boolean;
   readonly beforeSize: number;
   readonly afterSize: number;
+  readonly beforeMode?: number;
   readonly addedLines: number;
   readonly removedLines: number;
   readonly beforeArtifactRef?: ArtifactRef;
@@ -77,6 +84,7 @@ export interface ChangeSetFileInput {
   readonly after: Uint8Array;
   readonly beforeExists?: boolean;
   readonly afterExists?: boolean;
+  readonly beforeMode?: number;
 }
 
 export interface ChangeSetManagerOptions {
@@ -157,12 +165,54 @@ function assertInside(root: string, candidate: string): void {
   }
 }
 
-function currentBytes(path: string): Uint8Array | undefined {
-  return existsSync(path) ? readFileSync(path) : undefined;
+export interface ConfinedFileRead {
+  readonly path: string;
+  readonly bytes?: Uint8Array;
+  readonly mode?: number;
 }
 
-function assertCurrent(path: string, expectedHash: string | undefined, expectedExists: boolean): void {
-  const current = currentBytes(path);
+/** Open first, then validate the opened descriptor so symlink swaps cannot redirect bytes. */
+export function readConfinedFile(rootDir: string, filePath: string, allowMissing = false): ConfinedFileRead {
+  const root = realpathSync(resolve(rootDir));
+  const candidate = resolve(root, filePath);
+  assertInside(root, candidate);
+  let file: number;
+  try {
+    file = openSync(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (cause) {
+    const code = cause !== null && typeof cause === "object" && "code" in cause ? String(cause.code) : "";
+    if (allowMissing && code === "ENOENT") return { path: resolveConfinedPath(root, filePath, true) };
+    if (code === "ELOOP") throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path resolves through a symlink", retryable: false, effect: "none" });
+    if (code === "ENOENT") throw createRuntimeError({ code: "FILE_NOT_FOUND", message: `File does not exist: ${filePath}`, retryable: false, effect: "none" });
+    throw cause;
+  }
+  try {
+    const stat = fstatSync(file);
+    if (!stat.isFile()) throw createRuntimeError({ code: "FILE_NOT_REGULAR", message: `Not a regular file: ${filePath}`, retryable: false, effect: "none" });
+    let physical = candidate;
+    if (platform === "linux") physical = realpathSync(`/proc/self/fd/${file}`);
+    else physical = realpathSync(candidate);
+    assertInside(root, physical);
+    const bytes = new Uint8Array(stat.size);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const count = readSync(file, bytes, offset, bytes.byteLength - offset, offset);
+      if (count === 0) throw createRuntimeError({ code: "FILE_READ_RACE", message: "File changed while it was being read", retryable: true, effect: "none" });
+      offset += count;
+    }
+    if (fstatSync(file).size !== stat.size) throw createRuntimeError({ code: "FILE_READ_RACE", message: "File changed while it was being read", retryable: true, effect: "none" });
+    return { path: physical, bytes, mode: stat.mode & 0o7777 };
+  } finally {
+    closeSync(file);
+  }
+}
+
+function currentBytes(rootDir: string, path: string): Uint8Array | undefined {
+  return readConfinedFile(rootDir, relative(rootDir, path), true).bytes;
+}
+
+function assertCurrent(rootDir: string, path: string, expectedHash: string | undefined, expectedExists: boolean): void {
+  const current = currentBytes(rootDir, path);
   const actualHash = current === undefined ? undefined : sha256(current);
   if ((current !== undefined) !== expectedExists || actualHash !== expectedHash) {
     throw createRuntimeError({
@@ -175,8 +225,12 @@ function assertCurrent(path: string, expectedHash: string | undefined, expectedE
   }
 }
 
-function atomicReplace(rootDir: string, path: string, content: Uint8Array, expectedHash: string | undefined, expectedExists: boolean): void {
-  assertCurrent(path, expectedHash, expectedExists);
+function atomicReplace(rootDir: string, path: string, content: Uint8Array, expectedHash: string | undefined, expectedExists: boolean, replacementMode?: number): void {
+  const current = readConfinedFile(rootDir, relative(rootDir, path), true);
+  const actualHash = current.bytes === undefined ? undefined : sha256(current.bytes);
+  if ((current.bytes !== undefined) !== expectedExists || actualHash !== expectedHash) {
+    throw createRuntimeError({ code: "FILE_HASH_MISMATCH", message: "The file changed while applying the guarded change", retryable: false, effect: "none", details: { path, expectedHash, actualHash } });
+  }
   const parent = dirname(path);
   const confinedParent = resolveConfinedPath(rootDir, relative(rootDir, parent) || ".", false);
   if (confinedParent !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
@@ -187,8 +241,9 @@ function atomicReplace(rootDir: string, path: string, content: Uint8Array, expec
   try {
     if (realpathSync(anchoredParent) !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
     writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+    chmodSync(temporary, replacementMode ?? current.mode ?? 0o600);
     renameSync(temporary, destination);
-    const actual = currentBytes(path);
+    const actual = currentBytes(rootDir, path);
     if (actual === undefined || sha256(actual) !== sha256(content)) {
       throw createRuntimeError({ code: "FILE_WRITE_RACE", message: "The file changed while applying the guarded change", retryable: false, effect: "unknown", details: { path } });
     }
@@ -266,6 +321,7 @@ export class ChangeSetManager {
         afterExists,
         beforeSize: beforeExists && file.before !== undefined ? file.before.byteLength : 0,
         afterSize: afterExists ? file.after.byteLength : 0,
+        ...(file.beforeMode === undefined ? {} : { beforeMode: file.beforeMode }),
         addedLines: stats.added,
         removedLines: stats.removed,
         ...(beforeArtifact === undefined ? {} : { beforeArtifactRef: beforeArtifact.ref }),
@@ -325,13 +381,29 @@ export class ChangeSetManager {
   withMutationLock<T>(operation: () => T): T {
     const lockPath = join(this.rootDir, ".aer-mutation.lock");
     let lockFd: number | undefined;
+    const owner = JSON.stringify({ pid, hostname: hostname(), createdAt: this.clock().toISOString(), nonce: Math.random().toString(36).slice(2) });
     try {
-      lockFd = openSync(lockPath, "wx");
+      try {
+        lockFd = openSync(lockPath, "wx", 0o600);
+      } catch (cause) {
+        const code = cause !== null && typeof cause === "object" && "code" in cause ? String(cause.code) : "";
+        if (code !== "EEXIST") throw cause;
+        if (!this.reconcileStaleLock(lockPath)) {
+          throw createRuntimeError({ code: "FILE_MUTATION_LOCKED", message: "Another semantic file mutation owns the project lock", retryable: true, effect: "none" });
+        }
+        try { lockFd = openSync(lockPath, "wx", 0o600); }
+        catch (retryCause) {
+          const retryCode = retryCause !== null && typeof retryCause === "object" && "code" in retryCause ? String(retryCause.code) : "";
+          if (retryCode === "EEXIST") throw createRuntimeError({ code: "FILE_MUTATION_LOCKED", message: "Another semantic file mutation won stale-lock recovery", retryable: true, effect: "none" });
+          throw retryCause;
+        }
+      }
+      writeFileSync(lockFd, owner);
       return operation();
     } finally {
       if (lockFd !== undefined) {
         closeSync(lockFd);
-        if (existsSync(lockPath)) unlinkSync(lockPath);
+        try { if (new TextDecoder().decode(readFileSync(lockPath)) === owner) unlinkSync(lockPath); } catch { /* Never remove a replacement lock. */ }
       }
     }
   }
@@ -345,7 +417,7 @@ export class ChangeSetManager {
         const beforeContent = planned.map(({ file, snapshot }) => ({ file, content: this.contentForRollback(changeset.id, file, snapshot) }));
         const currentStates = planned.map(({ file }) => {
           const path = resolveConfinedPath(this.rootDir, file.path, true);
-          const current = currentBytes(path);
+          const current = currentBytes(this.rootDir, path);
           return { file, path, currentHash: current === undefined ? undefined : sha256(current) };
         });
 
@@ -370,9 +442,9 @@ export class ChangeSetManager {
           if (currentHash === file.beforeHash || (!file.beforeExists && currentHash === undefined)) continue;
           const content = beforeContent.find((entry) => entry.file === file)?.content;
           if (file.beforeExists && content !== undefined) {
-            atomicReplace(this.rootDir, path, content, file.afterHash, true);
+            atomicReplace(this.rootDir, path, content, file.afterHash, true, file.beforeMode);
           } else if (!file.beforeExists) {
-            assertCurrent(path, file.afterHash, true);
+            assertCurrent(this.rootDir, path, file.afterHash, true);
             unlinkSync(path);
             if (existsSync(path)) throw createRuntimeError({ code: "FILE_WRITE_RACE", message: `Could not remove ${file.path} safely`, retryable: false, effect: "unknown" });
           }
@@ -392,14 +464,33 @@ export class ChangeSetManager {
 
   private contentForRollback(changesetId: ChangesetId, file: ChangeSetFile, snapshot: Snapshot | undefined): Uint8Array | undefined {
     if (!file.beforeExists) return undefined;
-    if (snapshot?.before !== undefined) return snapshot.before;
-    if (file.beforeArtifactRef !== undefined && this.artifacts !== undefined) return this.artifacts.read(file.beforeArtifactRef);
+    let content: Uint8Array | undefined;
+    if (snapshot?.before !== undefined) content = snapshot.before;
+    else if (file.beforeArtifactRef !== undefined && this.artifacts !== undefined) {
+      try {
+        const metadata = this.artifacts.metadata(file.beforeArtifactRef);
+        if (metadata === undefined) throw new Error("missing metadata");
+        const chunks: Uint8Array[] = [];
+        let offset = 0;
+        while (offset < metadata.size) {
+          const chunk = this.artifacts.read(file.beforeArtifactRef, { offset, length: Math.min(64 * 1024, metadata.size - offset) });
+          if (chunk.byteLength === 0) break;
+          chunks.push(chunk); offset += chunk.byteLength;
+        }
+        content = new Uint8Array(offset);
+        let cursor = 0;
+        for (const chunk of chunks) { content.set(chunk, cursor); cursor += chunk.byteLength; }
+      } catch {
+        throw createRuntimeError({ code: "ROLLBACK_EVIDENCE_INTEGRITY_FAILED", message: `Rollback evidence failed integrity verification for ${file.path}`, retryable: false, effect: "none" });
+      }
+    }
     const persisted = this.state?.getEntity("changeset_files", `${changesetId}:${file.path}`);
     const value = persisted?.data?.rollbackBeforeBytes;
-    if (Array.isArray(value) && value.every((byte): byte is number => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
-      const before = Uint8Array.from(value);
-      if (file.beforeHash === sha256(before)) return before;
+    if (content === undefined && Array.isArray(value) && value.every((byte): byte is number => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+      content = Uint8Array.from(value);
     }
+    if (content !== undefined && file.beforeHash === sha256(content) && content.byteLength === file.beforeSize) return content;
+    if (content !== undefined) throw createRuntimeError({ code: "ROLLBACK_EVIDENCE_INTEGRITY_FAILED", message: `Rollback evidence does not match the recorded before-image for ${file.path}`, retryable: false, effect: "none" });
     throw createRuntimeError({ code: "ROLLBACK_EVIDENCE_MISSING", message: `Rollback evidence is unavailable for ${file.path}`, retryable: false, effect: "none" });
   }
 
@@ -427,12 +518,12 @@ export class ChangeSetManager {
       traceId: changeset.traceId,
       createdAt: changeset.createdAt,
       updatedAt: changeset.updatedAt,
-      data: { changesetId: changeset.id, summary: changeset.summary, diffSummary: changeset.diffSummary, files: changeset.files },
+      data: { changesetId: changeset.id, summary: sanitizeDurableText(changeset.summary), diffSummary: changeset.diffSummary, files: changeset.files },
     });
     for (const [index, file] of changeset.files.entries()) {
       const previous = this.state.getEntity("changeset_files", `${changeset.id}:${file.path}`);
       const snapshot = snapshots?.[index];
-      const rollbackBeforeBytes = snapshot?.before !== undefined
+      const rollbackBeforeBytes = snapshot?.before !== undefined && file.beforeArtifactRef === undefined
         ? [...snapshot.before]
         : previous?.data?.rollbackBeforeBytes;
       this.state.saveEntity({
@@ -445,6 +536,33 @@ export class ChangeSetManager {
         traceId: changeset.traceId,
         data: { ...file, ...(rollbackBeforeBytes === undefined ? {} : { rollbackBeforeBytes }) },
       });
+    }
+  }
+
+  private reconcileStaleLock(lockPath: string): boolean {
+    try {
+      const before = lstatSync(lockPath);
+      const raw = new TextDecoder().decode(readFileSync(lockPath));
+      let stale = false;
+      try {
+        const parsed = JSON.parse(raw) as { pid?: unknown; hostname?: unknown; createdAt?: unknown };
+        if (parsed.hostname === hostname() && typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0) {
+          try { kill(parsed.pid, 0); } catch (cause) { stale = cause !== null && typeof cause === "object" && "code" in cause && cause.code === "ESRCH"; }
+        } else if (typeof parsed.createdAt === "string") {
+          stale = Date.now() - Date.parse(parsed.createdAt) > 30_000;
+        }
+      } catch {
+        // A crash between exclusive creation and owner-record persistence can
+        // leave an empty lock. Only age, never malformed content alone, makes it stale.
+        stale = Date.now() - before.mtimeMs > 30_000;
+      }
+      if (!stale) return false;
+      const after = lstatSync(lockPath);
+      if (before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) return false;
+      unlinkSync(lockPath);
+      return true;
+    } catch {
+      return false;
     }
   }
 

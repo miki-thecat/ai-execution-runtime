@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { RuntimeEvent } from "../observability/events.ts";
@@ -14,6 +14,11 @@ import type {
   TraceId,
 } from "../core/ids.ts";
 import { STATE_MIGRATIONS, CURRENT_STATE_SCHEMA_VERSION } from "./migrations.ts";
+import { createRuntimeError } from "../core/result.ts";
+import { isSensitivity, Redactor, sanitizeDurableText, strongestSensitivity } from "../observability/redaction.ts";
+
+export const DEFAULT_STATE_BUSY_TIMEOUT_MS = 1_000;
+const durableRedactor = new Redactor();
 
 export type StateEntityType =
   | "projects"
@@ -114,6 +119,8 @@ export interface SqliteStateStoreOptions {
   readonly dbPath?: string;
   /** Defaults to ~/.aer. The directory is created when a file database opens. */
   readonly dataRoot?: string;
+  /** A small pre-daemon contention window. Persistent contention becomes STATE_STORE_BUSY. */
+  readonly busyTimeoutMs?: number;
 }
 
 const ENTITY_TABLES: Readonly<Record<StateEntityType, { readonly idColumn: string }>> = {
@@ -268,10 +275,16 @@ export class SqliteStateStore implements StateStore {
     const normalized: SqliteStateStoreOptions = typeof options === "string" ? { dbPath: options } : options;
     const dataRoot = normalized.dataRoot ?? join(homedir(), ".aer");
     this.dbPath = normalized.dbPath ?? join(dataRoot, "aer.db");
-    if (this.dbPath !== ":memory:" && !existsSync(dirname(this.dbPath))) mkdirSync(dirname(this.dbPath), { recursive: true });
-    this.database = new DatabaseSync(this.dbPath);
+    const busyTimeoutMs = normalized.busyTimeoutMs ?? DEFAULT_STATE_BUSY_TIMEOUT_MS;
+    if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0 || busyTimeoutMs > 30_000) throw new RangeError("busyTimeoutMs must be an integer between 0 and 30000");
+    if (this.dbPath !== ":memory:" && !existsSync(dirname(this.dbPath))) mkdirSync(dirname(this.dbPath), { recursive: true, mode: 0o700 });
+    if (this.dbPath !== ":memory:" && normalized.dbPath === undefined) chmodSync(dirname(this.dbPath), 0o700);
+    this.database = new DatabaseSync(this.dbPath, { timeout: busyTimeoutMs });
+    if (this.dbPath !== ":memory:") chmodSync(this.dbPath, 0o600);
+    this.database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs};`);
     this.database.exec("PRAGMA foreign_keys = ON;");
     this.migrate();
+    if (this.dbPath !== ":memory:") chmodSync(this.dbPath, 0o600);
   }
 
   append(event: RuntimeEvent): void {
@@ -280,34 +293,39 @@ export class SqliteStateStore implements StateStore {
 
   appendEvent(event: RuntimeEvent): void {
     this.assertOpen();
-    this.database.exec("BEGIN IMMEDIATE;");
+    const durableEvent: RuntimeEvent = {
+      ...event,
+      ...(event.summary === undefined ? {} : { summary: sanitizeDurableText(event.summary) }),
+      ...(event.metadata === undefined ? {} : { metadata: durableRedactor.sanitizeMetadata(event.metadata) }),
+    };
     try {
+      this.database.exec("BEGIN IMMEDIATE;");
       this.database.prepare(EVENT_INSERT_SQL).run(
-        event.eventId, event.schemaVersion, event.traceId, event.runId,
-        nullable(event.taskId), event.spanId, nullable(event.parentSpanId), event.timestamp,
-        event.type, event.actor, nullable(event.projectId), nullable(event.deviceId),
-        nullable(event.operation), nullable(event.operationId), nullable(event.executor), nullable(event.provider),
-        nullable(event.status), nullable(event.summary), event.durationMs, event.internalCalls,
-        event.retries, event.pollCountInternal, event.pollCountModel, event.inputBytes,
-        event.rawOutputBytes, event.returnedOutputBytes, event.artifactBytes, event.filesRead,
-        event.filesChanged, nullable(event.exitCode), nullable(event.signal), nullable(event.tokenInput),
-        nullable(event.tokenOutput), nullable(event.tokenCached), event.compressionRatio,
-        nullable(event.effectClass), nullable(event.effectState), nullable(event.idempotencyKey),
-        nullable(event.changesetId), nullable(event.verificationId), json(event.artifactRefs),
-        nullable(event.errorCode), event.metadata === undefined ? null : json(event.metadata),
-        event.payload === undefined ? null : json(event.payload),
+        durableEvent.eventId, durableEvent.schemaVersion, durableEvent.traceId, durableEvent.runId,
+        nullable(durableEvent.taskId), durableEvent.spanId, nullable(durableEvent.parentSpanId), durableEvent.timestamp,
+        durableEvent.type, durableEvent.actor, nullable(durableEvent.projectId), nullable(durableEvent.deviceId),
+        nullable(durableEvent.operation), nullable(durableEvent.operationId), nullable(durableEvent.executor), nullable(durableEvent.provider),
+        nullable(durableEvent.status), nullable(durableEvent.summary), durableEvent.durationMs, durableEvent.internalCalls,
+        durableEvent.retries, durableEvent.pollCountInternal, durableEvent.pollCountModel, durableEvent.inputBytes,
+        durableEvent.rawOutputBytes, durableEvent.returnedOutputBytes, durableEvent.artifactBytes, durableEvent.filesRead,
+        durableEvent.filesChanged, nullable(durableEvent.exitCode), nullable(durableEvent.signal), nullable(durableEvent.tokenInput),
+        nullable(durableEvent.tokenOutput), nullable(durableEvent.tokenCached), durableEvent.compressionRatio,
+        nullable(durableEvent.effectClass), nullable(durableEvent.effectState), nullable(durableEvent.idempotencyKey),
+        nullable(durableEvent.changesetId), nullable(durableEvent.verificationId), json(durableEvent.artifactRefs),
+        nullable(durableEvent.errorCode), durableEvent.metadata === undefined ? null : json(durableEvent.metadata),
+        durableEvent.payload === undefined ? null : json(durableEvent.payload),
       );
-      this.materializeEvent(event);
+      this.materializeEvent(durableEvent);
       this.database.exec("COMMIT;");
     } catch (error) {
-      this.database.exec("ROLLBACK;");
-      throw error;
+      try { this.database.exec("ROLLBACK;"); } catch { /* BEGIN may not have acquired the writer lock. */ }
+      throw this.translateError(error);
     }
   }
 
   getEvent(eventId: EventId): RuntimeEvent | undefined {
     this.assertOpen();
-    const row = this.database.prepare("SELECT * FROM events WHERE event_id = ?").get(eventId);
+    const row = this.call(() => this.database.prepare("SELECT * FROM events WHERE event_id = ?").get(eventId));
     return row === undefined ? undefined : eventFromRow(row);
   }
 
@@ -321,16 +339,16 @@ export class SqliteStateStore implements StateStore {
     if (options.type !== undefined) { clauses.push("type = ?"); parameters.push(options.type); }
     const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
     const order = options.order === "desc" ? "DESC" : "ASC";
-    const rows = this.database.prepare(`SELECT * FROM events${where} ORDER BY timestamp ${order}, rowid ${order} LIMIT ?`).all(
+    const rows = this.call(() => this.database.prepare(`SELECT * FROM events${where} ORDER BY timestamp ${order}, rowid ${order} LIMIT ?`).all(
       ...parameters,
       limitValue(options.limit, 1_000),
-    );
+    ));
     return rows.map(eventFromRow);
   }
 
   getRun(runId: RunId): RunState | undefined {
     this.assertOpen();
-    const row = this.database.prepare("SELECT * FROM runs WHERE run_id = ?").get(runId);
+    const row = this.call(() => this.database.prepare("SELECT * FROM runs WHERE run_id = ?").get(runId));
     if (row === undefined) return undefined;
     const actor = optionalString(row, "actor");
     const projectId = optionalString(row, "project_id");
@@ -349,7 +367,7 @@ export class SqliteStateStore implements StateStore {
 
   getTask(taskId: TaskId): TaskState | undefined {
     this.assertOpen();
-    const row = this.database.prepare("SELECT * FROM tasks WHERE task_id = ?").get(taskId);
+    const row = this.call(() => this.database.prepare("SELECT * FROM tasks WHERE task_id = ?").get(taskId));
     if (row === undefined) return undefined;
     const projectId = optionalString(row, "project_id");
     return {
@@ -383,6 +401,8 @@ export class SqliteStateStore implements StateStore {
       ...(entity.kind === "runs" ? ["trace_id", "started_at", "completed_at"] : []),
     ];
     const status = entity.status ?? ((entity.kind === "runs" || entity.kind === "tasks") ? "queued" : undefined);
+    const terminal = status === "completed" || status === "failed" || status === "cancelled" || status === "unknown";
+    const completedAt = terminal ? (typeof entity.data?.completedAt === "string" ? entity.data.completedAt : updatedAt) : null;
     const values: unknown[] = [
       entity.id,
       ...(table.idColumn === "project_id" ? [] : [nullable(entity.projectId)]),
@@ -390,7 +410,7 @@ export class SqliteStateStore implements StateStore {
       ...(table.idColumn === "task_id" ? [] : [nullable(entity.taskId)]),
       ...(entity.kind === "changeset_files" ? [changesetId] : []),
       nullable(status), createdAt, updatedAt, json(entity.data),
-      ...(entity.kind === "runs" ? [traceId, createdAt, null] : []),
+      ...(entity.kind === "runs" ? [traceId, createdAt, completedAt] : []),
     ];
     const updates = [
       ...(table.idColumn === "project_id" ? [] : ["project_id=excluded.project_id"]),
@@ -398,16 +418,16 @@ export class SqliteStateStore implements StateStore {
       ...(table.idColumn === "task_id" ? [] : ["task_id=excluded.task_id"]),
       ...(entity.kind === "changeset_files" ? ["changeset_id=excluded.changeset_id"] : []),
       "status=excluded.status", "updated_at=excluded.updated_at", "data_json=excluded.data_json",
-      ...(entity.kind === "runs" ? ["trace_id=excluded.trace_id", "started_at=excluded.started_at", "completed_at=excluded.completed_at"] : []),
+      ...(entity.kind === "runs" ? ["trace_id=excluded.trace_id", "started_at=runs.started_at", "completed_at=COALESCE(runs.completed_at, excluded.completed_at)"] : []),
     ];
     const sql = `INSERT INTO ${entity.kind} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")}) ON CONFLICT(${table.idColumn}) DO UPDATE SET ${updates.join(", ")}`;
-    this.database.prepare(sql).run(...values);
+    try { this.database.prepare(sql).run(...values); } catch (error) { throw this.translateError(error); }
   }
 
   getEntity(kind: StateEntityType, id: string): StateEntity | undefined {
     this.assertOpen();
     const table = ENTITY_TABLES[kind];
-    const row = this.database.prepare(`SELECT * FROM ${kind} WHERE ${table.idColumn} = ?`).get(id);
+    const row = this.call(() => this.database.prepare(`SELECT * FROM ${kind} WHERE ${table.idColumn} = ?`).get(id));
     return row === undefined ? undefined : this.entityFromRow(kind, row);
   }
 
@@ -421,21 +441,36 @@ export class SqliteStateStore implements StateStore {
     }
     const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
     const order = query.order === "desc" ? "DESC" : "ASC";
-    return this.database.prepare(`SELECT * FROM ${kind}${where} ORDER BY updated_at ${order}, ${table.idColumn} ${order} LIMIT ?`).all(...parameters, limitValue(query.limit, 1_000)).map((row) => this.entityFromRow(kind, row));
+    return this.call(() => this.database.prepare(`SELECT * FROM ${kind}${where} ORDER BY updated_at ${order}, ${table.idColumn} ${order} LIMIT ?`).all(...parameters, limitValue(query.limit, 1_000))).map((row) => this.entityFromRow(kind, row));
   }
 
   registerArtifact(metadata: StoredArtifactMetadata): void {
     this.assertOpen();
-    this.database.prepare(`
-      INSERT INTO artifacts (artifact_ref, digest, size, media_type, origin, sensitivity, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(artifact_ref) DO UPDATE SET updated_at=excluded.updated_at
-    `).run(metadata.ref, metadata.digest, metadata.size, metadata.mediaType, metadata.origin, metadata.sensitivity, metadata.createdAt, metadata.updatedAt);
+    if (!isSensitivity(metadata.sensitivity)) throw createRuntimeError({ code: "ARTIFACT_INTEGRITY_FAILED", message: "Artifact sensitivity is invalid", retryable: false, effect: "none" });
+    try {
+      this.database.exec("BEGIN IMMEDIATE;");
+      const row = this.database.prepare("SELECT digest, size, sensitivity FROM artifacts WHERE artifact_ref = ?").get(metadata.ref);
+      if (row !== undefined && (stringValue(row, "digest") !== metadata.digest || numberValue(row, "size") !== metadata.size)) {
+        throw createRuntimeError({ code: "ARTIFACT_INTEGRITY_FAILED", message: "Persisted artifact metadata conflicts with its content address", retryable: false, effect: "none" });
+      }
+      const existingSensitivity = row === undefined ? undefined : stringValue(row, "sensitivity");
+      if (existingSensitivity !== undefined && !isSensitivity(existingSensitivity)) throw createRuntimeError({ code: "ARTIFACT_INTEGRITY_FAILED", message: "Persisted artifact sensitivity is invalid", retryable: false, effect: "none" });
+      const sensitivity = existingSensitivity === undefined ? metadata.sensitivity : strongestSensitivity(existingSensitivity, metadata.sensitivity);
+      this.database.prepare(`
+        INSERT INTO artifacts (artifact_ref, digest, size, media_type, origin, sensitivity, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(artifact_ref) DO UPDATE SET sensitivity=excluded.sensitivity, updated_at=excluded.updated_at
+      `).run(metadata.ref, metadata.digest, metadata.size, metadata.mediaType, metadata.origin, sensitivity, metadata.createdAt, metadata.updatedAt);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      try { this.database.exec("ROLLBACK;"); } catch { /* BEGIN may not have acquired the writer lock. */ }
+      throw this.translateError(error);
+    }
   }
 
   getArtifact(ref: ArtifactRef): StoredArtifactMetadata | undefined {
     this.assertOpen();
-    const row = this.database.prepare("SELECT * FROM artifacts WHERE artifact_ref = ?").get(ref);
+    const row = this.call(() => this.database.prepare("SELECT * FROM artifacts WHERE artifact_ref = ?").get(ref));
     if (row === undefined) return undefined;
     return {
       ref: stringValue(row, "artifact_ref") as ArtifactRef,
@@ -460,11 +495,13 @@ export class SqliteStateStore implements StateStore {
     try {
       const row = this.database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get();
       if (row !== undefined && row.version !== null) current = Number(row.version);
-    } catch {
+    } catch (error) {
+      const translated = this.translateError(error);
+      if (translated !== error) throw translated;
       current = 0;
     }
-    this.database.exec("BEGIN IMMEDIATE;");
     try {
+      this.database.exec("BEGIN IMMEDIATE;");
       for (const migration of STATE_MIGRATIONS) {
         if (migration.version <= current) continue;
         this.database.exec(migration.sql);
@@ -472,8 +509,8 @@ export class SqliteStateStore implements StateStore {
       }
       this.database.exec("COMMIT;");
     } catch (error) {
-      this.database.exec("ROLLBACK;");
-      throw error;
+      try { this.database.exec("ROLLBACK;"); } catch { /* BEGIN may have failed due to contention. */ }
+      throw this.translateError(error);
     }
   }
 
@@ -492,7 +529,7 @@ export class SqliteStateStore implements StateStore {
       this.database.prepare(`
         INSERT INTO runs (run_id, trace_id, project_id, status, actor, created_at, started_at, completed_at, updated_at, data_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')
-        ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, project_id=excluded.project_id, actor=excluded.actor, completed_at=excluded.completed_at, updated_at=excluded.updated_at
+        ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, project_id=excluded.project_id, actor=excluded.actor, completed_at=COALESCE(runs.completed_at, excluded.completed_at), updated_at=excluded.updated_at
       `).run(event.runId, event.traceId, nullable(projectId), status, event.actor, startedAt, startedAt, status === "completed" || status === "failed" || status === "cancelled" || status === "unknown" ? event.timestamp : null, event.timestamp);
     }
     if (event.taskId !== undefined && (event.type.startsWith("task.") || event.type === "run.started")) {
@@ -532,6 +569,18 @@ export class SqliteStateStore implements StateStore {
 
   private assertOpen(): void {
     if (this.closed) throw new Error("StateStore is closed");
+  }
+
+  private translateError(error: unknown): unknown {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/SQLITE_(?:BUSY|LOCKED)|database (?:is )?locked/i.test(message)) {
+      return createRuntimeError({ code: "STATE_STORE_BUSY", message: "The local state store remained locked beyond its bounded busy timeout", retryable: true, effect: "none" });
+    }
+    return error;
+  }
+
+  private call<T>(operation: () => T): T {
+    try { return operation(); } catch (error) { throw this.translateError(error); }
   }
 }
 

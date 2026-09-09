@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -120,6 +121,90 @@ test("artifacts use stable SHA-256 references and bounded reads", () => {
     assert.equal(store.metadata(first.ref)?.mediaType, "text/plain");
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("local state and artifacts are private and artifact sensitivity only escalates", () => {
+  const directory = temporaryDirectory();
+  const dataRoot = join(directory, "private-data");
+  const state = new SqliteStateStore({ dataRoot });
+  try {
+    const artifacts = new FileArtifactStore({ dataRoot, state });
+    const first = artifacts.put("same", { sensitivity: "internal" });
+    const escalated = artifacts.put("same", { sensitivity: "secret" });
+    const reverseFirst = artifacts.put("other", { sensitivity: "secret" });
+    const reverseSecond = artifacts.put("other", { sensitivity: "public" });
+    assert.equal(escalated.sensitivity, "secret");
+    assert.equal(artifacts.metadata(first.ref)?.sensitivity, "secret");
+    assert.equal(state.getArtifact(first.ref)?.sensitivity, "secret");
+    assert.equal(reverseFirst.sensitivity, "secret");
+    assert.equal(reverseSecond.sensitivity, "secret");
+    assert.equal(statSync(dataRoot).mode & 0o777, 0o700);
+    assert.equal(statSync(join(dataRoot, "aer.db")).mode & 0o777, 0o600);
+    assert.equal(statSync(join(artifacts.rootDir, "sha256", first.digest)).mode & 0o777, 0o600);
+  } finally {
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("artifact reads and reuse fail closed when content or identity metadata is tampered", () => {
+  const directory = temporaryDirectory();
+  try {
+    const artifacts = new FileArtifactStore(directory);
+    const artifact = artifacts.put("trusted evidence");
+    const blob = join(directory, "sha256", artifact.digest);
+    writeFileSync(blob, "tampered bytes", { mode: 0o600 });
+    assert.throws(() => artifacts.read(artifact.ref), (error: unknown) => (error as { code?: string }).code === "ARTIFACT_INTEGRITY_FAILED");
+    assert.throws(() => artifacts.put("trusted evidence"), (error: unknown) => (error as { code?: string }).code === "ARTIFACT_INTEGRITY_FAILED");
+
+    writeFileSync(blob, "trusted evidence", { mode: 0o600 });
+    const metadataPath = join(directory, "sha256", `${artifact.digest}.json`);
+    const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as Record<string, unknown>;
+    writeFileSync(metadataPath, JSON.stringify({ ...metadata, size: 1 }), { mode: 0o600 });
+    assert.throws(() => artifacts.read(artifact.ref), (error: unknown) => (error as { code?: string }).code === "ARTIFACT_INTEGRITY_FAILED");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("terminal saveEntity timestamps are coherent and lock contention is bounded", () => {
+  const directory = temporaryDirectory();
+  const dbPath = join(directory, "aer.db");
+  const state = new SqliteStateStore({ dbPath, busyTimeoutMs: 25 });
+  const runId = "run_terminal_save" as import("../src/core/index.ts").RunId;
+  try {
+    state.saveEntity({ kind: "runs", id: runId, runId, status: "completed", traceId: createTraceId(), updatedAt: "2026-01-01T00:00:01.000Z" });
+    assert.equal(state.getRun(runId)?.completedAt, "2026-01-01T00:00:01.000Z");
+    state.saveEntity({ kind: "runs", id: runId, runId, status: "completed", traceId: createTraceId(), updatedAt: "2026-01-01T00:00:02.000Z", data: {} });
+    assert.equal(state.getRun(runId)?.completedAt, "2026-01-01T00:00:01.000Z");
+
+    const blocker = new DatabaseSync(dbPath);
+    try {
+      blocker.exec("BEGIN EXCLUSIVE;");
+      assert.throws(() => state.saveEntity({ kind: "tasks", id: "task_contended", status: "queued" }), (error: unknown) => (error as { code?: string }).code === "STATE_STORE_BUSY");
+      blocker.exec("ROLLBACK;");
+    } finally {
+      blocker.close();
+    }
+  } finally {
+    state.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("durable event summaries redact known secret assignments", () => {
+  const state = new SqliteStateStore(":memory:");
+  try {
+    const tracer = new Tracer({ sink: state });
+    const run = tracer.startRun({ actor: "test" });
+    const span = run.operation({ operation: "provider.fail", effectClass: "read" });
+    span.fail(createRuntimeError({ code: "PROVIDER_FAILED", message: "provider failed", retryable: false, effect: "none" }), { summary: "stderr token=secret-sentinel" });
+    const persisted = state.listEvents({ runId: run.runId });
+    assert.equal(JSON.stringify(persisted).includes("secret-sentinel"), false);
+    assert.equal(persisted.at(-1)?.summary, "stderr token=[REDACTED]");
+  } finally {
+    state.close();
   }
 });
 

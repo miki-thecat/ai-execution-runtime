@@ -1,5 +1,30 @@
-export const SENSITIVITIES = ["public", "internal", "personal", "secret"] as const;
+export const SENSITIVITIES = ["public", "internal", "personal", "sensitive", "secret"] as const;
 export type Sensitivity = (typeof SENSITIVITIES)[number];
+
+export const MAX_DURABLE_TEXT_BYTES = 1_024;
+
+const SENSITIVITY_RANK = new Map<Sensitivity, number>(SENSITIVITIES.map((value, index) => [value, index]));
+
+export function strongestSensitivity(left: Sensitivity, right: Sensitivity): Sensitivity {
+  return (SENSITIVITY_RANK.get(left) ?? -1) >= (SENSITIVITY_RANK.get(right) ?? -1) ? left : right;
+}
+
+export function isSensitivity(value: string): value is Sensitivity {
+  return SENSITIVITY_RANK.has(value as Sensitivity);
+}
+
+/** Defense-in-depth for short durable labels; provider output must still stay out of summaries. */
+export function sanitizeDurableText(value: string, maxBytes = MAX_DURABLE_TEXT_BYTES): string {
+  let sanitized = value
+    .replace(/\b(bearer)\s+[a-z0-9._~+/=-]+/gi, "$1 [REDACTED]")
+    .replace(/\b(authorization|cookie|password|passwd|secret|token|api[_-]?key|private[_-]?key)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1=[REDACTED]");
+  const encoded = new TextEncoder().encode(sanitized);
+  if (encoded.byteLength <= maxBytes) return sanitized;
+  let end = maxBytes;
+  while (end > 0 && (encoded[end]! & 0xc0) === 0x80) end -= 1;
+  sanitized = new TextDecoder().decode(encoded.slice(0, end));
+  return `${sanitized}…`;
+}
 
 export interface RedactionPolicy {
   readonly captureContent: boolean;
@@ -23,6 +48,8 @@ export const DEFAULT_REDACTION_POLICY: RedactionPolicy = Object.freeze({
     "private_key",
     "prompt",
     "completion",
+    "command",
+    "executable",
     "content",
     "stdout",
     "stderr",
@@ -125,7 +152,7 @@ export class Redactor {
         }
         return result;
       }
-      return value;
+      return typeof value === "string" ? sanitizeDurableText(value) : value;
     };
 
     return Object.freeze(sanitize(metadata) as Record<string, unknown>);

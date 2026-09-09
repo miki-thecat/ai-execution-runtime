@@ -1,13 +1,17 @@
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync,
+  readFileSync, readSync, renameSync, unlinkSync, writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createArtifactRef, type ArtifactRef } from "../core/ids.ts";
+import { createRuntimeError } from "../core/result.ts";
+import { isSensitivity, strongestSensitivity, type Sensitivity } from "../observability/redaction.ts";
 import type { StateStore, StoredArtifactMetadata } from "../state/store.ts";
 
 export const MAX_ARTIFACT_READ_BYTES = 64 * 1024;
-
-export type ArtifactSensitivity = "public" | "internal" | "personal" | "sensitive" | "secret";
+export type ArtifactSensitivity = Sensitivity;
 
 export interface ArtifactMetadata {
   readonly ref: ArtifactRef;
@@ -58,14 +62,18 @@ function digestFor(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function integrityFailure(message: string, details: Readonly<Record<string, unknown>> = {}) {
+  return createRuntimeError({ code: "ARTIFACT_INTEGRITY_FAILED", message, retryable: false, effect: "none", details });
+}
+
 function validateDigest(digest: string): string {
-  if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error("Invalid SHA-256 artifact digest");
+  if (!/^[a-f0-9]{64}$/.test(digest)) throw integrityFailure("Invalid SHA-256 artifact digest");
   return digest;
 }
 
 function digestFromRef(ref: ArtifactRef): string {
   const prefix = "artifact://sha256:";
-  if (!ref.startsWith(prefix)) throw new Error("Invalid artifact reference");
+  if (!ref.startsWith(prefix)) throw integrityFailure("Invalid artifact reference", { ref });
   return validateDigest(ref.slice(prefix.length));
 }
 
@@ -76,15 +84,40 @@ function maxReadLength(length: number | undefined): number {
 }
 
 function readJson(path: string): ArtifactMetadata {
-  const parsed: unknown = JSON.parse(new TextDecoder().decode(readFileSync(path)));
-  if (parsed === null || typeof parsed !== "object") throw new Error("Invalid artifact metadata");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(readFileSync(path)));
+  } catch {
+    throw integrityFailure("Artifact metadata is unreadable");
+  }
+  if (parsed === null || typeof parsed !== "object") throw integrityFailure("Invalid artifact metadata");
   const value = parsed as Record<string, unknown>;
   if (typeof value.ref !== "string" || typeof value.digest !== "string" || typeof value.size !== "number" ||
       typeof value.mediaType !== "string" || typeof value.origin !== "string" || typeof value.sensitivity !== "string" ||
-      typeof value.createdAt !== "string" || typeof value.updatedAt !== "string") {
-    throw new Error("Invalid artifact metadata");
+      typeof value.createdAt !== "string" || typeof value.updatedAt !== "string" || !isSensitivity(value.sensitivity)) {
+    throw integrityFailure("Invalid artifact metadata");
   }
   return value as unknown as ArtifactMetadata;
+}
+
+function validateMetadata(metadata: StoredArtifactMetadata, ref: ArtifactRef, digest: string): ArtifactMetadata {
+  if (metadata.ref !== ref || metadata.digest !== digest || !Number.isSafeInteger(metadata.size) || metadata.size < 0 ||
+      !isSensitivity(metadata.sensitivity)) {
+    throw integrityFailure("Artifact metadata does not match its content address", { ref });
+  }
+  return metadata as ArtifactMetadata;
+}
+
+function writePrivateAtomic(path: string, content: string | Uint8Array, root: string): void {
+  const temporary = join(root, `.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  try {
+    writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, path);
+    chmodSync(path, 0o600);
+  } finally {
+    if (existsSync(temporary)) unlinkSync(temporary);
+  }
 }
 
 /** Local, content-addressed artifact storage for the Full Alpha data root. */
@@ -96,7 +129,10 @@ export class FileArtifactStore implements ArtifactStore {
     const normalized: FileArtifactStoreOptions = typeof options === "string" ? { rootDir: options } : options;
     this.rootDir = normalized.rootDir ?? join(normalized.dataRoot ?? join(homedir(), ".aer"), "artifacts");
     this.state = normalized.state;
-    mkdirSync(join(this.rootDir, "sha256"), { recursive: true });
+    mkdirSync(this.rootDir, { recursive: true, mode: 0o700 });
+    mkdirSync(join(this.rootDir, "sha256"), { recursive: true, mode: 0o700 });
+    chmodSync(this.rootDir, 0o700);
+    chmodSync(join(this.rootDir, "sha256"), 0o700);
   }
 
   put(content: Uint8Array | string, options: ArtifactPutOptions = {}): ArtifactMetadata {
@@ -105,30 +141,36 @@ export class FileArtifactStore implements ArtifactStore {
     const ref = createArtifactRef(digest);
     const contentPath = this.contentPath(digest);
     const metadataPath = this.metadataPath(digest);
-    if (!existsSync(contentPath)) {
-      const temporaryPath = join(this.rootDir, `.tmp-${digest}-${Date.now()}`);
-      writeFileSync(temporaryPath, bytes, { flag: "wx" });
-      renameSync(temporaryPath, contentPath);
+    const diskMetadata = existsSync(metadataPath) ? validateMetadata(readJson(metadataPath), ref, digest) : undefined;
+    const stateValue = this.state?.getArtifact(ref);
+    const stateMetadata = stateValue === undefined ? undefined : validateMetadata(stateValue, ref, digest);
+    if (diskMetadata !== undefined && stateMetadata !== undefined && diskMetadata.size !== stateMetadata.size) {
+      throw integrityFailure("Persisted artifact metadata is inconsistent", { ref });
     }
-    if (existsSync(metadataPath)) {
-      const existing = readJson(metadataPath);
-      this.state?.registerArtifact(existing);
-      return existing;
-    }
+
+    if (existsSync(contentPath)) this.readVerified(ref, digest, diskMetadata ?? stateMetadata, 0, 0, bytes.byteLength);
+    else writePrivateAtomic(contentPath, bytes, this.rootDir);
+
     const timestamp = (options.now ?? new Date()).toISOString();
-    const metadata: ArtifactMetadata = {
-      ref,
-      digest,
-      size: bytes.byteLength,
-      mediaType: options.mediaType ?? "application/octet-stream",
-      origin: options.origin ?? "runtime",
-      sensitivity: options.sensitivity ?? "internal",
-      createdAt: timestamp,
-      updatedAt: timestamp,
+    const previous = diskMetadata === undefined ? stateMetadata : stateMetadata === undefined ? diskMetadata : {
+      ...diskMetadata,
+      sensitivity: strongestSensitivity(diskMetadata.sensitivity, stateMetadata.sensitivity),
+      updatedAt: diskMetadata.updatedAt >= stateMetadata.updatedAt ? diskMetadata.updatedAt : stateMetadata.updatedAt,
     };
-    const temporaryMetadataPath = join(this.rootDir, `.tmp-${digest}-${Date.now()}.json`);
-    writeFileSync(temporaryMetadataPath, JSON.stringify(metadata), { flag: "wx" });
-    renameSync(temporaryMetadataPath, metadataPath);
+    const requestedSensitivity = options.sensitivity ?? "internal";
+    const sensitivity = previous === undefined ? requestedSensitivity : strongestSensitivity(previous.sensitivity, requestedSensitivity);
+    const metadata: ArtifactMetadata = {
+      ref, digest, size: bytes.byteLength,
+      mediaType: previous?.mediaType ?? options.mediaType ?? "application/octet-stream",
+      origin: previous?.origin ?? options.origin ?? "runtime",
+      sensitivity,
+      createdAt: previous?.createdAt ?? timestamp,
+      updatedAt: previous === undefined || sensitivity !== previous.sensitivity ? timestamp : previous.updatedAt,
+    };
+    validateMetadata(metadata, ref, digest);
+    if (diskMetadata === undefined || JSON.stringify(diskMetadata) !== JSON.stringify(metadata)) writePrivateAtomic(metadataPath, JSON.stringify(metadata), this.rootDir);
+    else chmodSync(metadataPath, 0o600);
+    chmodSync(contentPath, 0o600);
     this.state?.registerArtifact(metadata);
     return metadata;
   }
@@ -136,50 +178,67 @@ export class FileArtifactStore implements ArtifactStore {
   metadata(ref: ArtifactRef): ArtifactMetadata | undefined {
     const digest = digestFromRef(ref);
     const path = this.metadataPath(digest);
-    if (this.state !== undefined) {
-      const persisted = this.state.getArtifact(ref);
-      if (persisted !== undefined) return persisted as ArtifactMetadata;
-    }
-    return existsSync(path) ? readJson(path) : undefined;
+    const disk = existsSync(path) ? validateMetadata(readJson(path), ref, digest) : undefined;
+    const persistedValue = this.state?.getArtifact(ref);
+    const persisted = persistedValue === undefined ? undefined : validateMetadata(persistedValue, ref, digest);
+    if (disk !== undefined && persisted !== undefined && disk.size !== persisted.size) throw integrityFailure("Persisted artifact metadata is inconsistent", { ref });
+    if (disk === undefined) return persisted;
+    if (persisted === undefined) return disk;
+    return { ...disk, sensitivity: strongestSensitivity(disk.sensitivity, persisted.sensitivity) };
   }
 
   read(ref: ArtifactRef, options: ArtifactReadOptions = {}): Uint8Array {
     const digest = digestFromRef(ref);
-    const path = this.contentPath(digest);
-    if (!existsSync(path)) throw new Error(`Artifact not found: ${ref}`);
     const offset = options.offset ?? 0;
     if (!Number.isSafeInteger(offset) || offset < 0) throw new RangeError("offset must be a non-negative integer");
     const length = maxReadLength(options.length ?? options.maxBytes);
-    const size = statSync(path).size;
-    if (offset >= size || length === 0) return new Uint8Array();
-    const result = new Uint8Array(Math.min(length, size - offset));
-    const file = openSync(path, "r");
+    const metadata = this.metadata(ref);
+    if (metadata === undefined) throw integrityFailure("Artifact metadata is missing", { ref });
+    return this.readVerified(ref, digest, metadata, offset, length);
+  }
+
+  has(ref: ArtifactRef): boolean {
+    try { this.read(ref, { length: 0 }); return true; } catch { return false; }
+  }
+
+  private readVerified(ref: ArtifactRef, digest: string, metadata: ArtifactMetadata | undefined, offset: number, length: number, expectedSize?: number): Uint8Array {
+    const path = this.contentPath(digest);
+    let file: number;
     try {
-      let read = 0;
-      while (read < result.byteLength) {
-        const count = readSync(file, result, read, result.byteLength - read, offset + read);
-        if (count === 0) break;
-        read += count;
+      file = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (cause) {
+      throw integrityFailure(existsSync(path) ? "Artifact blob cannot be opened safely" : "Artifact blob is missing", { ref, cause: cause instanceof Error ? cause.message : String(cause) });
+    }
+    try {
+      const initial = fstatSync(file);
+      if (!initial.isFile()) throw integrityFailure("Artifact blob is not a regular file", { ref });
+      if (expectedSize !== undefined && initial.size !== expectedSize) throw integrityFailure("Existing artifact blob has the wrong size", { ref, expectedSize, actualSize: initial.size });
+      if (metadata !== undefined && initial.size !== metadata.size) throw integrityFailure("Artifact size does not match metadata", { ref, expectedSize: metadata.size, actualSize: initial.size });
+      const resultLength = offset >= initial.size ? 0 : Math.min(length, initial.size - offset);
+      const result = new Uint8Array(resultLength);
+      const hash = createHash("sha256");
+      const buffer = new Uint8Array(MAX_ARTIFACT_READ_BYTES);
+      let position = 0;
+      while (position < initial.size) {
+        const count = readSync(file, buffer, 0, Math.min(buffer.byteLength, initial.size - position), position);
+        if (count === 0) throw integrityFailure("Artifact blob ended before its recorded size", { ref });
+        const chunk = buffer.subarray(0, count);
+        hash.update(chunk);
+        const overlapStart = Math.max(position, offset);
+        const overlapEnd = Math.min(position + count, offset + resultLength);
+        if (overlapEnd > overlapStart) result.set(chunk.subarray(overlapStart - position, overlapEnd - position), overlapStart - offset);
+        position += count;
       }
-      return read === result.byteLength ? result : result.slice(0, read);
+      const final = fstatSync(file);
+      if (final.size !== initial.size || hash.digest("hex") !== digest) throw integrityFailure("Artifact blob digest does not match its content address", { ref });
+      return result;
     } finally {
       closeSync(file);
     }
   }
 
-  has(ref: ArtifactRef): boolean {
-    return existsSync(this.contentPath(digestFromRef(ref)));
-  }
-
-  private contentPath(digest: string): string {
-    return join(this.rootDir, "sha256", digest);
-  }
-
-  private metadataPath(digest: string): string {
-    return join(this.rootDir, "sha256", `${digest}.json`);
-  }
+  private contentPath(digest: string): string { return join(this.rootDir, "sha256", digest); }
+  private metadataPath(digest: string): string { return join(this.rootDir, "sha256", `${digest}.json`); }
 }
 
-export function artifactMetadataToState(metadata: ArtifactMetadata): StoredArtifactMetadata {
-  return metadata;
-}
+export function artifactMetadataToState(metadata: ArtifactMetadata): StoredArtifactMetadata { return metadata; }

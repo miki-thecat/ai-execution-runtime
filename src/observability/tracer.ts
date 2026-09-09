@@ -21,7 +21,7 @@ import {
   type RuntimeEvent,
   type RuntimeEventInput,
 } from "./events.ts";
-import { Redactor } from "./redaction.ts";
+import { Redactor, sanitizeDurableText } from "./redaction.ts";
 
 export interface TracerOptions {
   readonly sink?: EventSink;
@@ -89,6 +89,7 @@ export class Tracer {
     const event = createRuntimeEvent({
       ...inputWithoutPayload,
       timestamp: input.timestamp ?? this.clock().toISOString(),
+      ...(input.summary === undefined ? {} : { summary: sanitizeDurableText(input.summary) }),
       ...(metadata === undefined ? {} : { metadata }),
       ...(captured?.captured === true ? { payload: captured.value } : {}),
     });
