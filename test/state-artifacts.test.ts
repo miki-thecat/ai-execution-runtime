@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { FileArtifactStore, MAX_ARTIFACT_READ_BYTES } from "../src/artifacts/index.ts";
-import { createProjectId, createTaskId, createTraceId } from "../src/core/index.ts";
+import { createOperationContext, createProjectId, createRuntimeError, createTaskId, createTraceId } from "../src/core/index.ts";
 import { createRuntimeEvent } from "../src/observability/events.ts";
 import { Tracer } from "../src/observability/index.ts";
+import { OperationRegistry } from "../src/operations/index.ts";
 import { SqliteStateStore } from "../src/state/index.ts";
+import { TaskManager } from "../src/tasks/index.ts";
 
 function temporaryDirectory(): string {
   return mkdtempSync(join(tmpdir(), "aer-state-test-"));
@@ -34,6 +36,67 @@ test("SQLite state survives close and reopen with canonical run events", () => {
     reopened.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("an ambiguous top-level operation terminates its durable run as unknown", async () => {
+  const directory = temporaryDirectory();
+  const dbPath = join(directory, "aer.db");
+  try {
+    const first = new SqliteStateStore(dbPath);
+    const tracer = new Tracer({ sink: first });
+    const run = tracer.startRun({ actor: "runtime" });
+    const registry = new OperationRegistry({ tracer }).register({
+      name: "publish.ambiguous",
+      effectClass: "remote_write",
+      execute() {
+        throw createRuntimeError({ code: "PUBLISH_AMBIGUOUS", message: "transport response was lost", retryable: false, effect: "unknown" });
+      },
+    });
+    const result = await registry.execute("publish.ambiguous", undefined, createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "runtime" }));
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    run.unknown(result.error);
+    assert.deepEqual(first.listEvents({ runId: run.runId }).map((event) => event.type), ["run.started", "operation.started", "operation.unknown", "run.unknown"]);
+    assert.equal(first.getRun(run.runId)?.status, "unknown");
+    first.close();
+
+    const reopened = new SqliteStateStore(dbPath);
+    assert.equal(reopened.getRun(run.runId)?.status, "unknown");
+    assert.equal(reopened.listEvents({ type: "run.failed" }).some((event) => event.runId === run.runId), false);
+    reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("task unknown events replay as unknown task and run state, never failure", () => {
+  const first = new SqliteStateStore(":memory:");
+  const tracer = new Tracer({ sink: first });
+  const tasks = new TaskManager({ state: first, tracer });
+  const task = tasks.create({ title: "reconcile ambiguous process" });
+  tasks.start(task.taskId);
+  tasks.markUnknown(task.taskId, { reason: "process ownership was lost" });
+  const evidence = first.listEvents({ runId: task.runId });
+
+  try {
+    assert.equal(evidence.some((event) => event.type === "task.failed"), false);
+    assert.equal(evidence.some((event) => event.type === "run.failed"), false);
+    assert.equal(evidence.some((event) => event.type === "task.unknown" && event.status === "unknown"), true);
+    assert.equal(evidence.some((event) => event.type === "run.unknown" && event.status === "unknown"), true);
+    assert.equal(first.getTask(task.taskId)?.status, "unknown");
+    assert.equal(first.getRun(task.runId)?.status, "unknown");
+
+    const replayed = new SqliteStateStore(":memory:");
+    try {
+      for (const event of evidence) replayed.append(event);
+      assert.equal(replayed.getTask(task.taskId)?.status, "unknown");
+      assert.equal(replayed.getRun(task.runId)?.status, "unknown");
+    } finally {
+      replayed.close();
+    }
+  } finally {
+    first.close();
   }
 });
 

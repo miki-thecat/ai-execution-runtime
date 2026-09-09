@@ -355,13 +355,14 @@ export class ChangeSetManager {
         for (const { file, currentHash } of currentStates) {
           if (currentHash === file.beforeHash || (!file.beforeExists && currentHash === undefined)) continue;
           if (currentHash !== file.afterHash) {
-            return runtimeFailure(createRuntimeError({
+            const error = createRuntimeError({
               code: "ROLLBACK_PRECONDITION_FAILED",
               message: `Cannot safely roll back ${file.path}; the file changed after the ChangeSet was applied`,
               retryable: false,
               effect: "none",
               details: { path: file.path, expectedHash: file.afterHash, actualHash: currentHash },
-            }), this.rollbackMeta(context, "failed", 0));
+            });
+            return runtimeFailure(error, this.rollbackMeta(context, "failed", 0, error.effect));
           }
         }
 
@@ -385,7 +386,7 @@ export class ChangeSetManager {
       const error = cause && typeof cause === "object" && "code" in cause
         ? cause as ReturnType<typeof createRuntimeError>
         : createRuntimeError({ code: "ROLLBACK_FAILED", message: cause instanceof Error ? cause.message : "Rollback failed", retryable: false, effect: "unknown" });
-      return runtimeFailure(error, this.rollbackMeta(context, "failed", 0));
+      return runtimeFailure(error, this.rollbackMeta(context, error.effect === "unknown" ? "unknown" : "failed", 0, error.effect));
     }
   }
 
@@ -402,13 +403,13 @@ export class ChangeSetManager {
     throw createRuntimeError({ code: "ROLLBACK_EVIDENCE_MISSING", message: `Rollback evidence is unavailable for ${file.path}`, retryable: false, effect: "none" });
   }
 
-  private rollbackMeta(context: OperationContext, status: "completed" | "failed", filesChanged: number) {
+  private rollbackMeta(context: OperationContext, status: "completed" | "failed" | "unknown", filesChanged: number, effectState: "none" | "unknown" | "applied" = status === "completed" ? "applied" : "none") {
     return createOperationMeta({
       context,
       operation: "change.rollback",
       status,
-      effectClass: "write",
-      effectState: status === "completed" ? "applied" : "none",
+      effectClass: "workspace_write",
+      effectState,
       metrics: { internalCalls: 1, filesChanged },
       summary: status === "completed" ? "ChangeSet rolled back" : "ChangeSet rollback rejected",
       truncated: false,
@@ -476,7 +477,7 @@ export class ChangeSetManager {
       operation: type === "changeset.rolled_back" ? "change.rollback" : "file.patch",
       changesetId: changeset.id,
       status: "completed",
-      effectClass: "write",
+      effectClass: "workspace_write",
       effectState: type === "changeset.created" ? "none" : "applied",
       measurements: { filesChanged: changeset.files.length, internalCalls: 1 },
       summary: changeset.summary,

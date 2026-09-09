@@ -213,6 +213,7 @@ export class RunTrace {
   }
 
   fail(error: RuntimeError, metadata?: Readonly<Record<string, unknown>>): RuntimeEvent {
+    if (error.effect === "unknown") return this.unknown(error, metadata);
     if (this.endEvent !== undefined) return this.endEvent;
     const endedAt = this.tracer.now();
     this.endEvent = this.tracer.emit({
@@ -226,6 +227,41 @@ export class RunTrace {
       ...(this.identity.deviceId === undefined ? {} : { deviceId: this.identity.deviceId }),
       status: "failed",
       effectState: error.effect,
+      errorCode: error.code,
+      timestamp: endedAt.toISOString(),
+      measurements: { durationMs: Math.max(0, endedAt.getTime() - this.startedAtMs) },
+      ...(metadata === undefined ? {} : { metadata }),
+    });
+    return this.endEvent;
+  }
+
+  cancel(error: RuntimeError, metadata?: Readonly<Record<string, unknown>>): RuntimeEvent {
+    return this.finish("run.cancelled", "cancelled", error, metadata);
+  }
+
+  unknown(error: RuntimeError, metadata?: Readonly<Record<string, unknown>>): RuntimeEvent {
+    return this.finish("run.unknown", "unknown", error, metadata);
+  }
+
+  private finish(
+    type: "run.cancelled" | "run.unknown",
+    status: "cancelled" | "unknown",
+    error: RuntimeError,
+    metadata?: Readonly<Record<string, unknown>>,
+  ): RuntimeEvent {
+    if (this.endEvent !== undefined) return this.endEvent;
+    const endedAt = this.tracer.now();
+    this.endEvent = this.tracer.emit({
+      traceId: this.identity.traceId,
+      runId: this.identity.runId,
+      spanId: this.spanId,
+      type,
+      actor: this.identity.actor,
+      ...(this.identity.taskId === undefined ? {} : { taskId: this.identity.taskId }),
+      ...(this.identity.projectId === undefined ? {} : { projectId: this.identity.projectId }),
+      ...(this.identity.deviceId === undefined ? {} : { deviceId: this.identity.deviceId }),
+      status,
+      effectState: status === "unknown" ? "unknown" : error.effect,
       errorCode: error.code,
       timestamp: endedAt.toISOString(),
       measurements: { durationMs: Math.max(0, endedAt.getTime() - this.startedAtMs) },
@@ -285,7 +321,7 @@ export class OperationSpan {
   }
 
   unknown(error: RuntimeError, options: EndOptions = {}): RuntimeEvent {
-    return this.finish("operation.failed", "unknown", {
+    return this.finish("operation.unknown", "unknown", {
       ...options,
       effectState: options.effectState ?? error.effect,
       ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
@@ -293,7 +329,7 @@ export class OperationSpan {
   }
 
   private finish(
-    type: "operation.completed" | "operation.failed" | "operation.cancelled",
+    type: "operation.completed" | "operation.failed" | "operation.cancelled" | "operation.unknown",
     status: "completed" | "failed" | "cancelled" | "unknown",
     options: EndOptions,
     errorCode?: string,

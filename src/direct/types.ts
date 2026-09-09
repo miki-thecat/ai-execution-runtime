@@ -1,4 +1,5 @@
 import type { ArtifactRef, RunId, SpanId, TraceId } from "../core/ids.ts";
+import type { EffectClass, EffectState } from "../core/effects.ts";
 
 export type ProcessId = string & { readonly __brand: "ProcessId" };
 
@@ -36,11 +37,18 @@ export interface DirectExecutionOptions {
   readonly reconcileOnStart?: boolean;
 }
 
+/** Semantic providers may narrow the conservative raw-execution default. */
+export interface DirectRunOptions {
+  readonly instrument?: boolean;
+  readonly effectClass?: EffectClass;
+}
+
 export type ProcessTerminalStatus = "completed" | "failed" | "cancelled" | "unknown";
 
 export interface ProcessResult {
   readonly processId: ProcessId;
   readonly status: ProcessTerminalStatus;
+  readonly effectState: EffectState;
   readonly exitCode?: number;
   readonly signal?: string;
   readonly stdout: string;

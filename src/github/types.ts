@@ -1,5 +1,6 @@
 import type { OperationContext } from "../core/context.ts";
 import type { EffectState } from "../core/effects.ts";
+import type { EffectClass } from "../core/effects.ts";
 import type { ArtifactRef } from "../core/ids.ts";
 import type { RuntimeResult } from "../core/result.ts";
 import type { ExecutableCommand, ShellRunInput } from "../direct/types.ts";
@@ -27,8 +28,8 @@ export interface GitHubCommandResult {
  * existing shell.run escape hatch rather than a second shell implementation.
  */
 export interface GitHubCommandRunner {
-  runExecutable(command: ExecutableCommand, context: OperationContext): Promise<GitHubCommandResult>;
-  runShell(input: ShellRunInput, context: OperationContext): Promise<GitHubCommandResult>;
+  runExecutable(command: ExecutableCommand, context: OperationContext, effectClass: EffectClass): Promise<GitHubCommandResult>;
+  runShell(input: ShellRunInput, context: OperationContext, effectClass: EffectClass): Promise<GitHubCommandResult>;
 }
 
 export interface GitHubCapabilityInput {

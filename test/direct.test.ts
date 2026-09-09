@@ -133,6 +133,36 @@ test("environment values are usable by the child but absent from telemetry", asy
   assert.equal(JSON.stringify(sink.events).includes("AER_TEST_SECRET"), true);
 });
 
+test("raw direct execution keeps a destructive default while trusted reads use least privilege", async () => {
+  const sink = new InMemoryEventSink();
+  const tracer = new Tracer({ sink });
+  const run = tracer.startRun({ actor: "model" });
+  const readOnly = createOperationContext({
+    traceId: run.traceId,
+    runId: run.runId,
+    spanId: run.spanId,
+    actor: "model",
+    effectPolicy: { allowedClasses: ["read"] },
+  });
+  const executor = new DirectExecutor({ tracer });
+
+  const raw = await executor.runShell({ command: "printf blocked" }, readOnly);
+  assert.equal(raw.ok, false);
+  if (raw.ok) return;
+  assert.equal(raw.error.code, "EFFECT_NOT_ALLOWED");
+  assert.equal(raw.meta.effectClass, "destructive");
+  assert.equal(sink.events.some((event) => event.type === "process.started"), false);
+
+  const inspect = await executor.runExecutable({ executable: "git", args: ["--version"] }, readOnly, { effectClass: "read" });
+  assert.equal(inspect.ok, true);
+  if (!inspect.ok) return;
+  assert.equal(inspect.meta.effectClass, "read");
+  assert.equal(inspect.meta.effectState, "applied");
+  const processEvents = sink.events.filter((event) => event.type.startsWith("process."));
+  assert.deepEqual(processEvents.map((event) => event.effectClass), ["read", "read"]);
+  assert.equal(processEvents.at(-1)?.effectState, "applied");
+});
+
 test("restart reconciliation marks active processes unknown instead of reattaching", () => {
   const state = new SqliteStateStore(":memory:");
   const sink = new InMemoryEventSink();

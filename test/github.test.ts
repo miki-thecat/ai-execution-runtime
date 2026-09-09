@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createOperationContext, createRunId, createTraceId } from "../src/core/index.ts";
+import { createOperationContext, createRunId, createTraceId, type EffectClass } from "../src/core/index.ts";
 import { InMemoryEventSink, Tracer } from "../src/observability/index.ts";
 import { GitHubProvider, type GitHubCommandResult, type GitHubCommandRunner } from "../src/github/index.ts";
 
@@ -10,6 +10,7 @@ class FixtureRunner implements GitHubCommandRunner {
   readonly executableCalls: string[][] = [];
   readonly shellCalls: string[] = [];
   readonly shellInputs: Array<{ readonly command: string; readonly timeoutMs?: number }> = [];
+  readonly effectClasses: EffectClass[] = [];
   private readonly fixtures = new Map<string, Fixture | Fixture[]>();
   private readonly shellFixtures = new Map<string, Fixture | Fixture[]>();
 
@@ -23,13 +24,15 @@ class FixtureRunner implements GitHubCommandRunner {
     return this;
   }
 
-  async runExecutable(command: { readonly executable: string; readonly args?: readonly string[] }): Promise<GitHubCommandResult> {
+  async runExecutable(command: { readonly executable: string; readonly args?: readonly string[] }, _context?: unknown, effectClass?: EffectClass): Promise<GitHubCommandResult> {
+    if (effectClass !== undefined) this.effectClasses.push(effectClass);
     const args = [command.executable, ...(command.args ?? [])];
     this.executableCalls.push(args);
     return this.consume(args);
   }
 
-  async runShell(input: { readonly command: string; readonly timeoutMs?: number }): Promise<GitHubCommandResult> {
+  async runShell(input: { readonly command: string; readonly timeoutMs?: number }, _context?: unknown, effectClass?: EffectClass): Promise<GitHubCommandResult> {
+    if (effectClass !== undefined) this.effectClasses.push(effectClass);
     this.shellCalls.push(input.command);
     this.shellInputs.push(input.timeoutMs === undefined ? { command: input.command } : { command: input.command, timeoutMs: input.timeoutMs });
     const fixture = this.shellFixtures.get(input.command);
@@ -59,9 +62,9 @@ function json(value: unknown, extra: Partial<GitHubCommandResult> = {}): GitHubC
   return { stdout, stderr: "", exitCode: 0, rawOutputBytes: stdout.length * 2, returnedOutputBytes: stdout.length, ...extra };
 }
 
-function context(tracer: Tracer) {
+function context(tracer: Tracer, allowedClasses?: readonly EffectClass[]) {
   const run = tracer.startRun({ actor: "model" });
-  return { run, context: createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "model" }) };
+  return { run, context: createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "model", ...(allowedClasses === undefined ? {} : { effectPolicy: { allowedClasses } }) }) };
 }
 
 const repo = {
@@ -123,7 +126,7 @@ test("github.snapshot compresses repository, PR, checks, reviews, and native dep
   const sink = new InMemoryEventSink();
   const tracer = new Tracer({ sink });
   const provider = new GitHubProvider({ runner, tracer });
-  const { run, context: operationContext } = context(tracer);
+  const { run, context: operationContext } = context(tracer, ["network"]);
 
   const result = await provider.snapshot({ issueNumber: 7, includeWork: true, issueNumbers: [7] }, operationContext);
   run.complete();
@@ -139,6 +142,8 @@ test("github.snapshot compresses repository, PR, checks, reviews, and native dep
   assert.ok(result.meta.metrics.rawOutputBytes > result.meta.metrics.returnedOutputBytes);
   assert.ok(result.meta.metrics.compressionRatio > 1);
   assert.equal(sink.events.some((event) => event.operation === "github.snapshot" && event.type === "operation.completed"), true);
+  assert.ok(runner.effectClasses.length > 0);
+  assert.equal(runner.effectClasses.every((effectClass) => effectClass === "network"), true);
 });
 
 test("github.wait polls internally and exposes zero model polls", async () => {
@@ -150,7 +155,7 @@ test("github.wait polls internally and exposes zero model polls", async () => {
     ]);
   const tracer = new Tracer();
   const provider = new GitHubProvider({ runner, tracer, sleep: async () => undefined });
-  const { run, context: operationContext } = context(tracer);
+  const { run, context: operationContext } = context(tracer, ["network"]);
 
   const result = await provider.wait({ pullRequest: 7, intervalMs: 0, maxPolls: 3 }, operationContext);
   run.complete();
@@ -163,6 +168,8 @@ test("github.wait polls internally and exposes zero model polls", async () => {
   assert.equal(result.data.pollCountModel, 0);
   assert.equal(result.meta.metrics.pollCountInternal, 2);
   assert.equal(result.meta.metrics.pollCountModel, 0);
+  assert.ok(runner.effectClasses.length > 0);
+  assert.equal(runner.effectClasses.every((effectClass) => effectClass === "network"), true);
 });
 
 test("github.publish reuses an already reconciled PR without pushing or creating", async () => {
@@ -183,6 +190,24 @@ test("github.publish reuses an already reconciled PR without pushing or creating
   assert.equal(result.data.pushed, false);
   assert.equal(result.data.reconciled, true);
   assert.equal(runner.executableCalls.some((call) => call[0] === "git" && call[1] === "push"), false);
+  assert.equal(runner.shellCalls.length, 0);
+  assert.ok(runner.effectClasses.length > 0);
+  assert.equal(runner.effectClasses.every((effectClass) => effectClass === "remote_write"), true);
+});
+
+test("github publish requires remote_write rather than network authority", async () => {
+  const runner = new FixtureRunner();
+  const tracer = new Tracer();
+  const provider = new GitHubProvider({ runner, tracer });
+  const { context: networkOnly } = context(tracer, ["network"]);
+
+  const result = await provider.publish({ title: "must be denied before commands" }, networkOnly);
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, "EFFECT_NOT_ALLOWED");
+  assert.equal(result.meta.effectClass, "remote_write");
+  assert.equal(runner.executableCalls.length, 0);
   assert.equal(runner.shellCalls.length, 0);
 });
 

@@ -1,6 +1,6 @@
 import { FileArtifactStore } from "../artifacts/store.ts";
 import { createOperationContext, isDeadlineExceeded, type OperationContext } from "../core/context.ts";
-import { isEffectAllowed, requiresApproval } from "../core/effects.ts";
+import { isEffectAllowed, requiresApproval, type EffectClass } from "../core/effects.ts";
 import {
   createOperationMeta,
   createRuntimeError,
@@ -13,6 +13,7 @@ import { Tracer } from "../observability/tracer.ts";
 import { DirectProcessManager } from "./process.ts";
 import type {
   DirectExecutionOptions,
+  DirectRunOptions,
   ExecutableCommand,
   ExecutableRunResult,
   ProcessHandle,
@@ -40,12 +41,13 @@ function failureMeta(
   metrics: ProcessResult | undefined,
   artifactRefs: readonly import("../core/ids.ts").ArtifactRef[] = [],
   commandInputBytes = 0,
+  effectClass: EffectClass = DIRECT_EFFECT_CLASS,
 ) {
   return createOperationMeta({
     context,
     operation,
     status,
-    effectClass: DIRECT_EFFECT_CLASS,
+    effectClass,
     effectState: error.effect,
     startedAt,
     completedAt,
@@ -80,8 +82,9 @@ export class DirectExecutor {
     });
   }
 
-  startExecutable(command: ExecutableCommand, context: OperationContext): ProcessHandle {
-    this.assertAllowed(context);
+  startExecutable(command: ExecutableCommand, context: OperationContext, options: Pick<DirectRunOptions, "effectClass"> = {}): ProcessHandle {
+    const effectClass = options.effectClass ?? DIRECT_EFFECT_CLASS;
+    this.assertAllowed(context, effectClass);
     if (context.signal.aborted || isDeadlineExceeded(context)) {
       throw createRuntimeError({
         code: "PROCESS_CANCELLED_BEFORE_START",
@@ -94,33 +97,35 @@ export class DirectExecutor {
       command,
       operation: "process.run",
       context,
+      effectClass,
     });
   }
 
   async runExecutable(
     command: ExecutableCommand,
     context: OperationContext,
-    options: { readonly instrument?: boolean } = {},
+    options: DirectRunOptions = {},
   ): Promise<RuntimeResult<ExecutableRunResult>> {
     return this.runInternal(
       "process.run",
       context,
       { ...command, args: [...(command.args ?? [])] },
-      (runContext) => this.processes.start({ command, operation: "process.run", context: runContext }),
+      (runContext, effectClass) => this.processes.start({ command, operation: "process.run", context: runContext, effectClass }),
       (result) => ({ ...result, executable: command.executable, args: [...(command.args ?? [])] }),
       options.instrument !== false,
       inputBytes({ executable: command.executable, args: command.args ?? [], cwd: command.cwd, env: command.env }),
+      options.effectClass ?? DIRECT_EFFECT_CLASS,
     );
   }
 
   /** Alias for internal providers that model the primitive as process.run. */
-  runCommand(command: ExecutableCommand, context: OperationContext): Promise<RuntimeResult<ExecutableRunResult>> {
-    return this.runExecutable(command, context);
+  runCommand(command: ExecutableCommand, context: OperationContext, options: DirectRunOptions = {}): Promise<RuntimeResult<ExecutableRunResult>> {
+    return this.runExecutable(command, context, options);
   }
 
   /** Runtime-owned process lifecycle helpers; callers do not need to poll child processes. */
-  start(command: ExecutableCommand, context: OperationContext): ProcessHandle {
-    return this.startExecutable(command, context);
+  start(command: ExecutableCommand, context: OperationContext, options: Pick<DirectRunOptions, "effectClass"> = {}): ProcessHandle {
+    return this.startExecutable(command, context, options);
   }
 
   wait(handle: ProcessHandle): Promise<ProcessResult> {
@@ -134,7 +139,7 @@ export class DirectExecutor {
   async runShell(
     input: ShellRunInput,
     context: OperationContext,
-    options: { readonly instrument?: boolean } = {},
+    options: DirectRunOptions = {},
   ): Promise<RuntimeResult<ShellRunResult>> {
     const command: ExecutableCommand = {
       executable: input.command,
@@ -148,10 +153,11 @@ export class DirectExecutor {
       "shell.run",
       context,
       command,
-      (runContext) => this.processes.start({ command, shell: true, operation: "shell.run", context: runContext }),
+      (runContext, effectClass) => this.processes.start({ command, shell: true, operation: "shell.run", context: runContext, effectClass }),
       (result) => ({ ...result, command: input.command }),
       options.instrument !== false,
       inputBytes({ command: input.command, cwd: input.cwd, env: input.env }),
+      options.effectClass ?? DIRECT_EFFECT_CLASS,
     );
   }
 
@@ -163,10 +169,11 @@ export class DirectExecutor {
     operation: string,
     context: OperationContext,
     command: ExecutableCommand,
-    start: (context: OperationContext) => ProcessHandle,
+    start: (context: OperationContext, effectClass: EffectClass) => ProcessHandle,
     map: (result: ProcessResult) => T,
     instrument: boolean,
     commandInputBytes: number,
+    effectClass: EffectClass,
   ): Promise<RuntimeResult<T>> {
     const startedAt = this.tracer.now().toISOString();
     const span = instrument ? this.tracer.startOperation({
@@ -174,7 +181,7 @@ export class DirectExecutor {
       runId: context.runId,
       actor: context.actor,
       operation,
-      effectClass: DIRECT_EFFECT_CLASS,
+      effectClass,
       ...(context.spanId === undefined ? {} : { parentSpanId: context.spanId }),
       ...(context.taskId === undefined ? {} : { taskId: context.taskId }),
       ...(context.projectId === undefined ? {} : { projectId: context.projectId }),
@@ -190,8 +197,8 @@ export class DirectExecutor {
       ...(context.spanId === undefined ? {} : { parentSpanId: context.spanId }),
     });
     try {
-      this.assertAllowed(operationContext);
-      const handle = start(operationContext);
+      this.assertAllowed(operationContext, effectClass);
+      const handle = start(operationContext, effectClass);
       const processResult = await handle.wait();
       const result = map(processResult);
       const metrics = {
@@ -224,6 +231,29 @@ export class DirectExecutor {
           processResult,
           processResult.artifactRefs,
           commandInputBytes,
+          effectClass,
+        ));
+      }
+      if (processResult.status === "unknown") {
+        const error = createRuntimeError({
+          code: "PROCESS_EFFECT_UNKNOWN",
+          message: processResult.error ?? "Direct process ended with an ambiguous effect",
+          retryable: false,
+          effect: "unknown",
+          details: { processId: processResult.processId },
+        });
+        const event = span?.unknown(error, { artifactRefs: processResult.artifactRefs });
+        return runtimeFailure(error, failureMeta(
+          operationContext,
+          operation,
+          "unknown",
+          span?.startedAt ?? startedAt,
+          event?.timestamp ?? completedAt,
+          error,
+          processResult,
+          processResult.artifactRefs,
+          commandInputBytes,
+          effectClass,
         ));
       }
       if (processResult.status === "failed") {
@@ -245,14 +275,16 @@ export class DirectExecutor {
           processResult,
           processResult.artifactRefs,
           commandInputBytes,
+          effectClass,
         ));
       }
-      const event = span?.complete({ artifactRefs: processResult.artifactRefs, effectState: "none" });
+      const event = span?.complete({ artifactRefs: processResult.artifactRefs, effectState: processResult.effectState });
       return runtimeSuccess(result, createOperationMeta({
         context: operationContext,
         operation,
         status: "completed",
-        effectClass: DIRECT_EFFECT_CLASS,
+        effectClass,
+        effectState: processResult.effectState,
         startedAt: span?.startedAt ?? startedAt,
         completedAt: event?.timestamp ?? completedAt,
         metrics: { ...metrics, durationMs: processResult.durationMs },
@@ -270,34 +302,36 @@ export class DirectExecutor {
             retryable: false,
             effect: "none",
           });
-      const event = span?.fail(error);
+      const unknown = error.effect === "unknown";
+      const event = unknown ? span?.unknown(error) : span?.fail(error);
       return runtimeFailure(error, failureMeta(
         operationContext,
         operation,
-        "failed",
+        unknown ? "unknown" : "failed",
         span?.startedAt ?? startedAt,
         event?.timestamp ?? this.tracer.now().toISOString(),
         error,
         undefined,
         [],
         commandInputBytes,
+        effectClass,
       ));
     }
   }
 
-  private assertAllowed(context: OperationContext): void {
-    if (!isEffectAllowed(context.effectPolicy, DIRECT_EFFECT_CLASS)) {
+  private assertAllowed(context: OperationContext, effectClass: EffectClass): void {
+    if (!isEffectAllowed(context.effectPolicy, effectClass)) {
       throw createRuntimeError({
         code: "EFFECT_NOT_ALLOWED",
-        message: "The execution policy does not allow direct shell/process execution",
+        message: `The execution policy does not allow ${effectClass} direct shell/process execution`,
         retryable: false,
         effect: "none",
       });
     }
-    if (requiresApproval(context.effectPolicy, DIRECT_EFFECT_CLASS)) {
+    if (requiresApproval(context.effectPolicy, effectClass)) {
       throw createRuntimeError({
         code: "EFFECT_APPROVAL_REQUIRED",
-        message: "Direct shell/process execution requires approval",
+        message: `${effectClass} direct shell/process execution requires approval`,
         retryable: false,
         effect: "none",
       });

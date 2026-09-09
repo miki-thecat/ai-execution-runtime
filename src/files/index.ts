@@ -145,7 +145,7 @@ function safeError(cause: unknown, fallbackCode: string, fallbackEffect: "none" 
   return createRuntimeError({ code: fallbackCode, message: cause instanceof Error ? cause.message : "File operation failed", retryable: false, effect: fallbackEffect });
 }
 
-function assertEffectAllowed(context: OperationContext, effectClass: "read" | "write"): void {
+function assertEffectAllowed(context: OperationContext, effectClass: "read" | "workspace_write"): void {
   if (!isEffectAllowed(context.effectPolicy, effectClass)) throw createRuntimeError({ code: "EFFECT_NOT_ALLOWED", message: `File ${effectClass} is not allowed by the effect policy`, retryable: false, effect: "none" });
   if (requiresApproval(context.effectPolicy, effectClass)) throw createRuntimeError({ code: "EFFECT_APPROVAL_REQUIRED", message: `File ${effectClass} requires approval`, retryable: false, effect: "none" });
 }
@@ -281,11 +281,11 @@ export class FileOperations {
   }
 
   patch(input: FilePatchInput, context: OperationContext, options: InternalOptions = {}): RuntimeResult<FilePatchResult> {
-    const instrumentation = this.start("file.patch", "write", context, options.instrument !== false);
+    const instrumentation = this.start("file.patch", "workspace_write", context, options.instrument !== false);
     const operationContext = instrumentation.context;
     let writeApplied = false;
     try {
-      assertEffectAllowed(operationContext, "write");
+      assertEffectAllowed(operationContext, "workspace_write");
       if ((input.content === undefined) === (input.patch === undefined)) throw createRuntimeError({ code: "PATCH_INPUT_INVALID", message: "Provide exactly one of content or patch", retryable: false, effect: "none" });
       const path = resolveConfinedPath(this.rootDir, input.path, true);
       const before = existsSync(path) ? readFileSync(path) : undefined;
@@ -322,28 +322,29 @@ export class FileOperations {
       });
       const data: FilePatchResult = { path: relativeFile(this.rootDir, outputPath), ...(before === undefined ? {} : { beforeHash: sha256(before) }), afterHash, changeset, changeSet: changeset };
       const refs = changeset.files.flatMap((file) => [file.beforeArtifactRef, file.afterArtifactRef].filter((ref): ref is ArtifactRef => ref !== undefined));
-      return runtimeSuccess(data, this.finish(instrumentation, operationContext, "file.patch", "write", { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes: byteLength(after), returnedOutputBytes: byteLength(JSON.stringify(data)), artifactBytes: refs.length === 0 ? 0 : (before?.byteLength ?? 0) + after.byteLength, filesChanged: 1 }, refs, "completed", changeset.summary, "applied"));
+      return runtimeSuccess(data, this.finish(instrumentation, operationContext, "file.patch", "workspace_write", { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes: byteLength(after), returnedOutputBytes: byteLength(JSON.stringify(data)), artifactBytes: refs.length === 0 ? 0 : (before?.byteLength ?? 0) + after.byteLength, filesChanged: 1 }, refs, "completed", changeset.summary, "applied"));
     } catch (cause: unknown) {
-      return this.failure(instrumentation, operationContext, "file.patch", "write", safeError(cause, "FILE_PATCH_FAILED", writeApplied ? "unknown" : "none"), inputBytes(input));
+      return this.failure(instrumentation, operationContext, "file.patch", "workspace_write", safeError(cause, "FILE_PATCH_FAILED", writeApplied ? "unknown" : "none"), inputBytes(input));
     }
   }
 
   write(input: FilePatchInput, context: OperationContext): RuntimeResult<FilePatchResult> { return this.patch(input, context); }
 
   rollback(changeset: ChangeSet, context: OperationContext, options: InternalOptions = {}): RuntimeResult<ChangeSet> {
-    const instrumentation = this.start("change.rollback", "write", context, options.instrument !== false);
+    const instrumentation = this.start("change.rollback", "workspace_write", context, options.instrument !== false);
     const operationContext = instrumentation.context;
-    const result = isEffectAllowed(operationContext.effectPolicy, "write") && !requiresApproval(operationContext.effectPolicy, "write")
+    const result = isEffectAllowed(operationContext.effectPolicy, "workspace_write") && !requiresApproval(operationContext.effectPolicy, "workspace_write")
       ? this.changes.rollback({ changeset, context: operationContext })
-      : runtimeFailure(createRuntimeError({ code: requiresApproval(operationContext.effectPolicy, "write") ? "EFFECT_APPROVAL_REQUIRED" : "EFFECT_NOT_ALLOWED", message: "File rollback is not allowed by the effect policy", retryable: false, effect: "none" }), this.finishMeta(operationContext, "change.rollback", "write", "failed", { internalCalls: 1 }, instrumentation, undefined, "none", "File rollback is not allowed by the effect policy"));
+      : runtimeFailure(createRuntimeError({ code: requiresApproval(operationContext.effectPolicy, "workspace_write") ? "EFFECT_APPROVAL_REQUIRED" : "EFFECT_NOT_ALLOWED", message: "File rollback is not allowed by the effect policy", retryable: false, effect: "none" }), this.finishMeta(operationContext, "change.rollback", "workspace_write", "failed", { internalCalls: 1 }, instrumentation, undefined, "none", "File rollback is not allowed by the effect policy"));
     if (result.ok) {
       const event = instrumentation.span?.complete({ effectState: "applied", summary: result.data.summary });
-      const meta = this.finishMeta(operationContext, "change.rollback", "write", "completed", { internalCalls: 1, filesChanged: changeset.files.length }, instrumentation, event?.timestamp, "applied", result.data.summary);
+      const meta = this.finishMeta(operationContext, "change.rollback", "workspace_write", "completed", { internalCalls: 1, filesChanged: changeset.files.length }, instrumentation, event?.timestamp, "applied", result.data.summary);
       return runtimeSuccess(result.data, meta);
     }
     const error = result.error;
-    const event = instrumentation.span?.fail(error);
-    return runtimeFailure(error, this.finishMeta(operationContext, "change.rollback", "write", "failed", { internalCalls: 1 }, instrumentation, event?.timestamp, error.effect, "ChangeSet rollback rejected"));
+    const unknown = result.meta.status === "unknown" || error.effect === "unknown";
+    const event = unknown ? instrumentation.span?.unknown(error) : instrumentation.span?.fail(error);
+    return runtimeFailure(error, this.finishMeta(operationContext, "change.rollback", "workspace_write", unknown ? "unknown" : "failed", { internalCalls: 1 }, instrumentation, event?.timestamp, error.effect, "ChangeSet rollback rejected"));
   }
 
   private searchWithRg(input: FileSearchInput, searchRoot: string, maxResults: number): SearchComputation | undefined {
@@ -412,25 +413,26 @@ export class FileOperations {
     return [artifact.ref];
   }
 
-  private start(operation: string, effectClass: "read" | "write", context: OperationContext, enabled: boolean): Instrumentation {
+  private start(operation: string, effectClass: "read" | "workspace_write", context: OperationContext, enabled: boolean): Instrumentation {
     if (!enabled || this.tracer === undefined) return { startedAt: new Date().toISOString(), context };
     const parentSpanId = context.spanId ?? context.parentSpanId;
     const span = this.tracer.startOperation({ traceId: context.traceId, runId: context.runId, actor: context.actor, operation, effectClass, ...(parentSpanId === undefined ? {} : { parentSpanId }), ...(context.taskId === undefined ? {} : { taskId: context.taskId }), ...(context.projectId === undefined ? {} : { projectId: context.projectId }), ...(context.deviceId === undefined ? {} : { deviceId: context.deviceId }), ...(context.idempotencyKey === undefined ? {} : { idempotencyKey: context.idempotencyKey }), executor: "direct", provider: "node:fs" });
     return { span, startedAt: span.startedAt, context: { ...context, spanId: span.spanId, ...(parentSpanId === undefined ? {} : { parentSpanId }) } };
   }
 
-  private finish(instrumentation: Instrumentation, context: OperationContext, operation: string, effectClass: "read" | "write", metrics: Record<string, number>, refs: readonly ArtifactRef[], status: "completed" | "failed", summary: string, effectState: "none" | "applied" = "none", truncated = false) {
+  private finish(instrumentation: Instrumentation, context: OperationContext, operation: string, effectClass: "read" | "workspace_write", metrics: Record<string, number>, refs: readonly ArtifactRef[], status: "completed" | "failed", summary: string, effectState: "none" | "applied" = "none", truncated = false) {
     const event = instrumentation.span === undefined ? undefined : (() => { instrumentation.span.record(metrics); return instrumentation.span.complete({ artifactRefs: refs, effectState, summary }); })();
     return this.finishMeta(context, operation, effectClass, status, metrics, instrumentation, event?.timestamp, effectState, summary, refs, event?.durationMs, truncated);
   }
 
-  private finishMeta(context: OperationContext, operation: string, effectClass: "read" | "write", status: "completed" | "failed", metrics: Record<string, number>, instrumentation: Instrumentation, completedAt: string | undefined, effectState: "none" | "unknown" | "applied", summary: string, refs: readonly ArtifactRef[] = [], eventDuration?: number, truncated = false) {
+  private finishMeta(context: OperationContext, operation: string, effectClass: "read" | "workspace_write", status: "completed" | "failed" | "unknown", metrics: Record<string, number>, instrumentation: Instrumentation, completedAt: string | undefined, effectState: "none" | "unknown" | "applied", summary: string, refs: readonly ArtifactRef[] = [], eventDuration?: number, truncated = false) {
     return createOperationMeta({ context: { ...context, ...(instrumentation.span === undefined ? {} : { spanId: instrumentation.span.spanId }) }, operation, status, effectClass, effectState, startedAt: instrumentation.startedAt, completedAt: completedAt ?? new Date().toISOString(), metrics: { ...metrics, ...(eventDuration === undefined ? {} : { durationMs: eventDuration }) }, artifactRefs: refs, summary, truncated, executor: "direct", provider: "node:fs" });
   }
 
-  private failure(instrumentation: Instrumentation, context: OperationContext, operation: string, effectClass: "read" | "write", error: RuntimeError, inputSize: number): RuntimeResult<never> {
-    const event = instrumentation.span?.fail(error, { summary: error.message });
-    return runtimeFailure(error, this.finishMeta(context, operation, effectClass, "failed", { internalCalls: 1, inputBytes: inputSize }, instrumentation, event?.timestamp, error.effect, error.message));
+  private failure(instrumentation: Instrumentation, context: OperationContext, operation: string, effectClass: "read" | "workspace_write", error: RuntimeError, inputSize: number): RuntimeResult<never> {
+    const unknown = error.effect === "unknown";
+    const event = unknown ? instrumentation.span?.unknown(error, { summary: error.message }) : instrumentation.span?.fail(error, { summary: error.message });
+    return runtimeFailure(error, this.finishMeta(context, operation, effectClass, unknown ? "unknown" : "failed", { internalCalls: 1, inputBytes: inputSize }, instrumentation, event?.timestamp, error.effect, error.message));
   }
 }
 
@@ -504,11 +506,11 @@ export function createFileSearchOperation(service: FileOperations): Operation<Fi
 }
 
 export function createFilePatchOperation(service: FileOperations): Operation<FilePatchInput, FilePatchResult> {
-  return { name: "file.patch", effectClass: "write", executor: "direct", provider: "node:fs", execute: (input, context) => service.patch(input, context, { instrument: false }) };
+  return { name: "file.patch", effectClass: "workspace_write", executor: "direct", provider: "node:fs", execute: (input, context) => service.patch(input, context, { instrument: false }) };
 }
 
 export function createRollbackOperation(service: FileOperations): Operation<{ readonly changeset: ChangeSet }, ChangeSet> {
-  return { name: "change.rollback", effectClass: "write", executor: "direct", provider: "node:fs", execute: (input, context) => service.rollback(input.changeset, context, { instrument: false }) };
+  return { name: "change.rollback", effectClass: "workspace_write", executor: "direct", provider: "node:fs", execute: (input, context) => service.rollback(input.changeset, context, { instrument: false }) };
 }
 
 export function createFileOperationsList(service: FileOperations): readonly Operation<unknown, unknown>[] {

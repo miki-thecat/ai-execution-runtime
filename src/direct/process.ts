@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createOperationId, createSpanId, type ArtifactRef } from "../core/ids.ts";
 import { createRuntimeError, type OperationContext, type RuntimeError } from "../core/index.ts";
+import type { EffectClass } from "../core/effects.ts";
 import { FileArtifactStore, type ArtifactStore } from "../artifacts/store.ts";
 import type { StateStore } from "../state/store.ts";
 import { Tracer } from "../observability/tracer.ts";
@@ -20,6 +21,7 @@ export interface ProcessStartOptions {
   readonly shell?: boolean | string;
   readonly operation: string;
   readonly context: OperationContext;
+  readonly effectClass?: EffectClass;
   readonly maxOutputBytes?: number;
 }
 
@@ -37,6 +39,7 @@ interface ProcessRecord {
   readonly taskId?: string;
   readonly spanId: string;
   readonly operationId: string;
+  readonly effectClass: EffectClass;
   readonly reattachable: false;
 }
 
@@ -191,6 +194,7 @@ export class DirectProcessManager {
   }
 
   start(options: ProcessStartOptions): ProcessHandle {
+    const effectClass = options.effectClass ?? "destructive";
     const maxOutputBytes = validByteLimit(options.maxOutputBytes ?? options.command.maxOutputBytes, this.defaultMaxOutputBytes);
     const timeoutMs = validTimeout(options.command.timeoutMs);
     const args = [...(options.command.args ?? [])];
@@ -212,6 +216,7 @@ export class DirectProcessManager {
       ...(options.context.taskId === undefined ? {} : { taskId: options.context.taskId }),
       spanId,
       operationId,
+      effectClass,
       reattachable: false,
     };
     const spawnOptions: SpawnOptions = {
@@ -257,7 +262,7 @@ export class DirectProcessManager {
       status: "running",
       executor: "direct",
       provider: "node:child_process",
-      effectClass: "destructive",
+      effectClass,
       effectState: "none",
       metadata: { ...metadataFor(options.command, args, env), pid: child.pid, processId: id },
     });
@@ -297,11 +302,13 @@ export class DirectProcessManager {
         stderr.cleanup();
       }
       const endedAt = this.tracer.now();
-      const status = cancelled ? "cancelled" : error === undefined ? "completed" : "failed";
+      const status = cancelled ? "cancelled" : error === undefined ? "completed" : "unknown";
+      const effectState = status === "completed" ? "applied" : "unknown";
       const returnedOutputBytes = Math.min(stdoutBytes, maxOutputBytes) + Math.min(stderrBytes, maxOutputBytes);
       const result: ProcessResult = {
         processId: id,
         status,
+        effectState,
         ...(code === null ? {} : { exitCode: code }),
         ...(signal === null ? {} : { signal }),
         stdout: new TextDecoder().decode(stdout.boundedBytes()),
@@ -327,14 +334,14 @@ export class DirectProcessManager {
         artifactRefs: refs,
         rawOutputBytes: result.rawOutputBytes,
         returnedOutputBytes,
-        effectState: cancelled ? "unknown" : "none",
+        effectState,
       });
       this.tracer.emit({
         traceId: options.context.traceId,
         runId: options.context.runId,
         spanId,
         ...(options.context.spanId === undefined ? {} : { parentSpanId: options.context.spanId }),
-        type: cancelled ? "process.cancelled" : "process.completed",
+        type: cancelled ? "process.cancelled" : status === "unknown" ? "process.unknown" : "process.completed",
         actor: options.context.actor,
         ...(options.context.taskId === undefined ? {} : { taskId: options.context.taskId }),
         ...(options.context.projectId === undefined ? {} : { projectId: options.context.projectId }),
@@ -355,8 +362,8 @@ export class DirectProcessManager {
           ...(signal === null ? {} : { signal }),
         },
         artifactRefs: refs,
-        effectClass: "destructive",
-        effectState: cancelled ? "unknown" : "none",
+        effectClass,
+        effectState,
         metadata: { processId: id, timedOut, cancelled },
       });
       this.handles.delete(id);
@@ -444,6 +451,7 @@ export class DirectProcessManager {
         executor: "direct",
         provider: "node:child_process",
         effectState: "unknown",
+        effectClass: data.effectClass ?? "destructive",
         summary: "Process was orphaned during runtime restart; reattachment is unsafe",
         metadata: { processId: id, orphaned: true },
       });

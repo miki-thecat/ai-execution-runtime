@@ -30,8 +30,8 @@ import type { RuntimeEvent } from "../observability/events.ts";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
 const MEANINGFUL_EVENTS = new Set([
-  "run.started", "run.completed", "run.failed",
-  "task.created", "task.started", "task.blocked", "task.completed", "task.failed", "task.cancelled",
+  "run.started", "run.completed", "run.failed", "run.cancelled", "run.unknown",
+  "task.created", "task.started", "task.blocked", "task.completed", "task.failed", "task.cancelled", "task.unknown",
   "process.completed", "process.cancelled", "process.unknown",
   "changeset.created", "changeset.applied", "changeset.rolled_back",
   "verification.started", "verification.completed",
@@ -246,9 +246,10 @@ export class ProjectRuntime {
       return runtimeSuccess(result, this.meta(spanContext, "project.inspect", "completed", span.startedAt, event.timestamp, git.available ? "Project inspected" : "Project inspected without Git", event.artifactRefs, event.effectState ?? "none", event));
     } catch (cause) {
       const error = errorFor(cause, "PROJECT_INSPECT_FAILED");
-      const event = span.fail(error);
+      const unknown = error.effect === "unknown";
+      const event = unknown ? span.unknown(error) : span.fail(error);
       this.persistEvent(event);
-      return runtimeFailure(error, this.meta(spanContext, "project.inspect", "failed", span.startedAt, event.timestamp, error.message, [], error.effect, event));
+      return runtimeFailure(error, this.meta(spanContext, "project.inspect", unknown ? "unknown" : "failed", span.startedAt, event.timestamp, error.message, [], error.effect, event));
     }
   }
 
@@ -283,9 +284,10 @@ export class ProjectRuntime {
       return runtimeSuccess(result, this.meta(spanContext, "project.resume", "completed", span.startedAt, event.timestamp, "Project resume pack created", event.artifactRefs, event.effectState ?? "none", event));
     } catch (cause) {
       const error = errorFor(cause, "PROJECT_RESUME_FAILED");
-      const event = span.fail(error);
+      const unknown = error.effect === "unknown";
+      const event = unknown ? span.unknown(error) : span.fail(error);
       this.persistEvent(event);
-      return runtimeFailure(error, this.meta(spanContext, "project.resume", "failed", span.startedAt, event.timestamp, error.message, [], error.effect, event));
+      return runtimeFailure(error, this.meta(spanContext, "project.resume", unknown ? "unknown" : "failed", span.startedAt, event.timestamp, error.message, [], error.effect, event));
     }
   }
 
@@ -414,7 +416,7 @@ export class ProjectRuntime {
     };
   }
 
-  private meta(context: OperationContext, operation: string, status: "completed" | "failed", startedAt: string, completedAt: string, summary: string, refs: readonly ArtifactRef[], effectState: EffectState = "none", event?: RuntimeEvent) {
+  private meta(context: OperationContext, operation: string, status: "completed" | "failed" | "unknown", startedAt: string, completedAt: string, summary: string, refs: readonly ArtifactRef[], effectState: EffectState = "none", event?: RuntimeEvent) {
     return createOperationMeta({
       context,
       operation,

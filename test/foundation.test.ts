@@ -5,7 +5,10 @@ import {
   createOperationMeta,
   createRuntimeError,
   createTraceId,
+  EFFECT_CLASSES,
+  effectDecision,
   InMemoryEventSink,
+  POLICY_DECISIONS,
   Redactor,
   Tracer,
   runtimeFailure,
@@ -112,9 +115,38 @@ test("registry preserves cancelled and unknown operation states", async () => {
 
     assert.equal(result.ok, false);
     assert.equal(result.meta.status, status);
-    assert.equal(sink.events[2]?.type, status === "cancelled" ? "operation.cancelled" : "operation.failed");
+    assert.equal(sink.events[2]?.type, status === "cancelled" ? "operation.cancelled" : "operation.unknown");
     assert.equal(sink.events[2]?.status, status);
   }
+});
+
+test("canonical effects and policy decisions are distinct contracts", () => {
+  assert.deepEqual(EFFECT_CLASSES, ["read", "workspace_write", "network", "remote_write", "destructive", "privileged"]);
+  assert.deepEqual(POLICY_DECISIONS, ["allow", "deny", "approval_required"]);
+  assert.equal(effectDecision({ allowedClasses: ["read"] }, "read"), "allow");
+  assert.equal(effectDecision({ allowedClasses: ["read"] }, "workspace_write"), "deny");
+  assert.equal(effectDecision({ allowedClasses: ["remote_write"], approvalRequiredClasses: ["remote_write"] }, "remote_write"), "approval_required");
+});
+
+test("registry exceptions with ambiguous effects terminate as unknown", async () => {
+  const sink = new InMemoryEventSink();
+  const tracer = new Tracer({ sink });
+  const run = tracer.startRun();
+  const registry = new OperationRegistry({ tracer }).register({
+    name: "fake.ambiguous",
+    effectClass: "remote_write",
+    execute() {
+      throw createRuntimeError({ code: "REMOTE_RESPONSE_AMBIGUOUS", message: "publish response was lost", retryable: false, effect: "unknown" });
+    },
+  });
+
+  const result = await registry.execute("fake.ambiguous", undefined, contextFor(run));
+
+  assert.equal(result.ok, false);
+  assert.equal(result.meta.status, "unknown");
+  assert.equal(result.meta.effectState, "unknown");
+  assert.equal(sink.events.at(-1)?.type, "operation.unknown");
+  assert.equal(sink.events.at(-1)?.status, "unknown");
 });
 
 test("content capture is disabled by default while measurements remain available", () => {
