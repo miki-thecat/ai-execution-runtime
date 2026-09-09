@@ -11,6 +11,9 @@ export interface GitHubCommandResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode?: number;
+  /** Optional transport metadata exposed by richer command runners. */
+  readonly httpStatus?: number;
+  readonly headers?: Readonly<Record<string, string>>;
   readonly rawOutputBytes?: number;
   readonly returnedOutputBytes?: number;
   readonly artifactBytes?: number;
@@ -68,6 +71,8 @@ export interface GitHubChecksSummary {
   readonly passed: number;
   readonly failed: number;
   readonly pending: number;
+  /** False means the provider could not prove that all check sources were read. */
+  readonly complete?: boolean;
 }
 
 export interface GitHubReview {
@@ -81,6 +86,8 @@ export interface GitHubReviewsSummary {
   readonly approved: number;
   readonly changesRequested: number;
   readonly pending: number;
+  /** False means the provider could not prove that the review state is current. */
+  readonly complete?: boolean;
 }
 
 export interface GitHubPullRequest {
@@ -208,6 +215,8 @@ export interface GitHubProviderOptions {
   readonly direct?: import("../direct/executor.ts").DirectExecutor;
   readonly tracer?: import("../observability/tracer.ts").Tracer;
   readonly runner?: GitHubCommandRunner;
+  /** Injectable wall-clock source for deterministic wait/rate-limit tests. */
+  readonly clock?: () => number | Date;
   readonly sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly maxOutputBytes?: number;
 }

@@ -44,7 +44,16 @@ import type {
 const GH_OUTPUT_LIMIT = 256 * 1024;
 const DEFAULT_WAIT_INTERVAL_MS = 2_000;
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
-const DEFAULT_WAIT_MAX_POLLS = 120;
+const MAX_PAGINATION_PAGES = 100;
+const MAX_RATE_LIMIT_RETRIES = 2;
+const BASE_RATE_LIMIT_BACKOFF_MS = 1_000;
+/**
+ * A server supplied reset hint can be arbitrarily far in the future. Keep a
+ * provider operation bounded even when its caller did not supply a deadline;
+ * hints beyond this bound terminate with a first-class rate-limit error rather
+ * than retrying before GitHub says it is safe.
+ */
+const MAX_RATE_LIMIT_DELAY_MS = 30_000;
 const PR_JSON_FIELDS = [
   "number", "title", "state", "url", "isDraft", "headRefName", "headRefOid",
   "baseRefName", "baseRefOid", "statusCheckRollup", "reviewDecision", "reviews",
@@ -66,6 +75,45 @@ interface ProviderWorkResult<T> {
 interface Attempt<T> {
   readonly value: T;
   readonly route: GitHubProviderRoute;
+  readonly complete?: boolean;
+}
+
+interface RemoteRepositoryResolution {
+  readonly attempt?: Attempt<GitHubRepository>;
+  /** True when the selected remote returned a URL, even if it was malformed. */
+  readonly identityKnown: boolean;
+}
+
+type CheckSource = "check-run" | "status" | "unknown";
+
+interface CheckCandidate {
+  readonly check: GitHubCheck;
+  readonly source: CheckSource;
+  readonly timestamp?: number;
+  readonly ordinal: number;
+}
+
+interface RateLimitInfo {
+  readonly status?: number;
+  readonly retryAfterMs?: number;
+  readonly resetAtMs?: number;
+  readonly secondary: boolean;
+  /** A reset hint is retryable for a secondary limit only when primary quota is exhausted. */
+  readonly primaryExhausted: boolean;
+}
+
+function boundPaginatedAttempt(attempt: Attempt<unknown>, collectionKey: string): Attempt<unknown> {
+  const value = attempt.value;
+  if (!Array.isArray(value)) return attempt;
+  const isPageArray = value.every((page) => Array.isArray(page));
+  const isObjectPageArray = value.length > 0 && value.every((page) => isObject(page) && Array.isArray(page[collectionKey]));
+  if (!isPageArray && !isObjectPageArray) return attempt;
+  if (value.length <= MAX_PAGINATION_PAGES) return attempt;
+  return {
+    ...attempt,
+    value: value.slice(0, MAX_PAGINATION_PAGES),
+    complete: false,
+  };
 }
 
 interface CreatePullRequestResult {
@@ -87,6 +135,9 @@ interface PullRequestLookupOptions {
    * repository instead of the selected remote repository.
    */
   readonly ghRepository?: GitHubRepository;
+  /** Compatibility for old gh fixtures/versions; only allowed after a
+   * current-repository check proves it is not a known different repository. */
+  readonly allowUnscopedCompatibility?: boolean;
 }
 
 class ProviderMetrics {
@@ -160,11 +211,13 @@ class DirectGitHubCommandRunner implements GitHubCommandRunner {
   }
 }
 
-function processResult(result: { readonly stdout: string; readonly stderr: string; readonly exitCode?: number; readonly rawOutputBytes: number; readonly returnedOutputBytes: number; readonly artifactBytes: number; readonly artifactRefs: readonly ArtifactRef[]; readonly truncated: boolean }): GitHubCommandResult {
+function processResult(result: { readonly stdout: string; readonly stderr: string; readonly exitCode?: number; readonly httpStatus?: number; readonly headers?: Readonly<Record<string, string>>; readonly rawOutputBytes: number; readonly returnedOutputBytes: number; readonly artifactBytes: number; readonly artifactRefs: readonly ArtifactRef[]; readonly truncated: boolean }): GitHubCommandResult {
   return {
     stdout: result.stdout,
     stderr: result.stderr,
     ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
+    ...(result.httpStatus === undefined ? {} : { httpStatus: result.httpStatus }),
+    ...(result.headers === undefined ? {} : { headers: result.headers }),
     rawOutputBytes: result.rawOutputBytes,
     returnedOutputBytes: result.returnedOutputBytes,
     artifactBytes: result.artifactBytes,
@@ -224,6 +277,87 @@ function parseJson(stdout: string): unknown | undefined {
   }
 }
 
+function numericHeader(headers: Readonly<Record<string, string>> | undefined, name: string): string | undefined {
+  if (headers === undefined) return undefined;
+  const expected = name.toLowerCase();
+  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === expected);
+  return entry?.[1];
+}
+
+function nonNegativeNumber(value: string | undefined): number | undefined {
+  if (value === undefined || !/^\d+(?:\.\d+)?$/.test(value.trim())) return undefined;
+  const result = Number(value.trim());
+  return Number.isFinite(result) && result >= 0 ? result : undefined;
+}
+
+function retryAfterMilliseconds(value: string | undefined, nowMs = Date.now()): number | undefined {
+  const seconds = nonNegativeNumber(value);
+  if (seconds !== undefined) return Math.max(1, Math.round(seconds * 1_000));
+  if (value === undefined) return undefined;
+  const date = Date.parse(value.trim());
+  return Number.isFinite(date) ? Math.max(1, date - nowMs) : undefined;
+}
+
+function rateLimitInfo(result: GitHubCommandResult, nowMs = Date.now()): RateLimitInfo | undefined {
+  const output = `${result.stdout}\n${result.stderr}`;
+  const statusText = result.httpStatus === undefined
+    ? /\bHTTP(?:\/\d(?:\.\d)?)?\s*[:/]?\s*(\d{3})\b/i.exec(output)?.[1]
+    : String(result.httpStatus);
+  const status = statusText === undefined ? undefined : Number(statusText);
+  const retryAfterText = numericHeader(result.headers, "retry-after") ??
+    /(?:^|\n)\s*retry-after\s*:\s*([^\r\n]+)/i.exec(output)?.[1] ??
+    /retry-after\s*[=:]\s*([0-9]+(?:\.[0-9]+)?)/i.exec(output)?.[1];
+  const retryAfterMs = retryAfterMilliseconds(retryAfterText, nowMs);
+  const resetText = numericHeader(result.headers, "x-ratelimit-reset") ??
+    /(?:^|\n)\s*x-ratelimit-reset\s*:\s*([^\r\n]+)/i.exec(output)?.[1] ??
+    /x-ratelimit-reset\s*[=:]\s*([0-9]+)/i.exec(output)?.[1];
+  const resetSeconds = nonNegativeNumber(resetText);
+  const resetAtMs = resetSeconds === undefined ? undefined : resetSeconds * 1_000;
+  const remainingText = numericHeader(result.headers, "x-ratelimit-remaining") ??
+    /(?:^|\n)\s*x-ratelimit-remaining\s*:\s*([^\r\n]+)/i.exec(output)?.[1];
+  const remaining = nonNegativeNumber(remainingText);
+  const secondaryMessage = /secondary rate limit|abuse detection/i.test(output);
+  const rateMessage = /api rate limit exceeded|rate limit exceeded|rate[- ]limited/i.test(output);
+  // A successful response may legitimately consume the last request in the
+  // current budget. Do not turn a valid 200 with x-ratelimit-remaining: 0
+  // into a retry/error, especially when its JSON body is the useful result.
+  const successful = (result.exitCode ?? 0) === 0 &&
+    (status === undefined || (status >= 200 && status < 300));
+  if (successful) return undefined;
+
+  // Only 403/429 responses are status-level GitHub rate-limit signals. The
+  // body and headers are useful corroboration, but generic phrases such as
+  // "please wait" or "too many requests" also occur in ordinary failures and
+  // must not turn a transient 503/403 into GITHUB_RATE_LIMITED.
+  const rateLimitStatus = status === 403 || status === 429;
+  // A primary-limit response is commonly identified by its message and
+  // reset header, but some transports do not preserve x-ratelimit-remaining.
+  // Treat an explicit primary-limit message with an unknown remaining value
+  // as exhausted so its reset hint remains usable.
+  const primaryLimitMessage = rateMessage && !secondaryMessage;
+  const primaryExhausted = rateLimitStatus &&
+    (remaining === 0 || (remaining === undefined && primaryLimitMessage));
+  const responseRateMessage = (status === undefined || rateLimitStatus) && (secondaryMessage || rateMessage);
+  const ordinaryForbiddenMessage = /forbidden|unauthorized|permission denied|bad credentials|resource not accessible|insufficient permission/i.test(output);
+  // GitHub uses 403 for secondary limits, including responses without a
+  // Retry-After hint. A reset value is usable for a secondary limit only when
+  // primary quota is exhausted; a short reset alongside nonzero/unknown
+  // primary remaining must not turn the response into an ordinary failure or
+  // permit an immediate shell fallback.
+  const hintlessSecondaryStatus = status === 403 && !primaryExhausted &&
+    !secondaryMessage && !rateMessage && !ordinaryForbiddenMessage;
+  const looksLimited = status === 429 || responseRateMessage || primaryExhausted || hintlessSecondaryStatus ||
+    (status === 403 && retryAfterMs !== undefined);
+  if (!looksLimited) return undefined;
+  const secondary = status === 429 || secondaryMessage ||
+    (status === 403 && rateMessage && !primaryExhausted) || hintlessSecondaryStatus;
+  let info: RateLimitInfo = { secondary, primaryExhausted };
+  if (typeof status === "number" && Number.isSafeInteger(status)) info = { ...info, status };
+  if (retryAfterMs !== undefined) info = { ...info, retryAfterMs };
+  if (resetAtMs !== undefined) info = { ...info, resetAtMs };
+  return info;
+}
+
 function errorFor(cause: unknown, code: string, effect: EffectState = "none"): RuntimeError {
   if (isRuntimeError(cause)) return cause;
   return createRuntimeError({
@@ -244,6 +378,55 @@ function errorWithEffect(cause: unknown, code: string, effect: EffectState): Run
     effect,
     ...(error.details === undefined ? {} : { details: error.details }),
   });
+}
+
+function isRateLimitError(value: unknown): value is RuntimeError {
+  return isRuntimeError(value) && value.code === "GITHUB_RATE_LIMITED";
+}
+
+function rateLimitError(info: RateLimitInfo, attempts: number, effect: EffectState = "none"): RuntimeError {
+  return createRuntimeError({
+    code: "GITHUB_RATE_LIMITED",
+    message: info.secondary
+      ? "GitHub secondary rate limit remained active after bounded retries"
+      : "GitHub rate limit remained active after bounded retries",
+    retryable: true,
+    effect,
+    details: {
+      ...(info.status === undefined ? {} : { status: info.status }),
+      ...(info.retryAfterMs === undefined ? {} : { retryAfterMs: info.retryAfterMs }),
+      ...(info.resetAtMs === undefined ? {} : { resetAtMs: info.resetAtMs }),
+      attempts,
+      secondary: info.secondary,
+    },
+  });
+}
+
+function rateLimitDelay(info: RateLimitInfo, retryNumber: number, nowMs: number): number | undefined {
+  const exponential = BASE_RATE_LIMIT_BACKOFF_MS * (2 ** retryNumber);
+  // GitHub's secondary-limit guidance requires at least one minute when no
+  // Retry-After is supplied, unless the primary limit is exhausted and its
+  // reset time is available. This provider caps one sleep at 30 seconds, so
+  // there is no safe retry in the former case. In particular, do not treat a
+  // reset hint from a secondary response with nonzero/unknown remaining as a
+  // reason to retry after the ordinary 1s/2s backoff.
+  if (info.secondary && info.retryAfterMs === undefined &&
+    !(info.primaryExhausted && info.resetAtMs !== undefined)) return undefined;
+  const resetDelay = info.resetAtMs === undefined ? 0 : Math.max(0, info.resetAtMs - nowMs);
+  // For a secondary limit, Retry-After is the server's retry boundary. A
+  // primary reset header may be present as unrelated quota metadata; it must
+  // not override a valid short Retry-After and force an unnecessary terminal
+  // result under this provider's bounded sleep policy.
+  const requestedDelay = info.secondary
+    ? info.retryAfterMs !== undefined
+      ? Math.max(exponential, info.retryAfterMs)
+      : Math.max(exponential, resetDelay)
+    : Math.max(exponential, info.retryAfterMs ?? 0, resetDelay);
+  // Do not retry while an unreasonably long server hint is active. Returning
+  // undefined lets the caller surface a bounded terminal rate-limit result
+  // without either sleeping indefinitely or issuing an early duplicate call.
+  if (requestedDelay > MAX_RATE_LIMIT_DELAY_MS) return undefined;
+  return Math.max(1, requestedDelay);
 }
 
 function repositoryPath(repository: GitHubRepository): string {
@@ -291,24 +474,35 @@ function authenticatedHostState(value: unknown): boolean {
   return state === "" || ["authenticated", "authorized", "active", "success", "logged_in", "logged-in"].includes(state);
 }
 
-function parseCheck(value: unknown): GitHubCheck | undefined {
+function parseCheckCandidate(value: unknown, source: CheckSource, ordinal: number): CheckCandidate | undefined {
   if (!isObject(value)) return undefined;
   const name = stringValue(value.name) ?? stringValue(value.context) ?? "check";
   const status = normalizeStatus(value.status ?? value.state ?? value.bucket);
   const rawConclusion = stringValue(value.conclusion) ?? stringValue(value.bucket);
   const conclusion = rawConclusion === undefined ? undefined : normalizeStatus(rawConclusion);
   const url = stringValue(value.detailsUrl) ?? stringValue(value.url) ?? stringValue(value.target_url);
-  return {
+  const timestampValue = stringValue(value.completed_at) ?? stringValue(value.completedAt) ??
+    stringValue(value.updated_at) ?? stringValue(value.updatedAt) ?? stringValue(value.started_at) ??
+    stringValue(value.created_at) ?? stringValue(value.createdAt);
+  const timestamp = timestampValue === undefined ? undefined : Date.parse(timestampValue);
+  const check: GitHubCheck = {
     name,
     status: status === "" ? "unknown" : status,
     ...(conclusion === undefined ? {} : { conclusion }),
     ...(url === undefined ? {} : { url }),
   };
+  return Number.isFinite(timestamp)
+    ? { check, source, timestamp: timestamp as number, ordinal }
+    : { check, source, ordinal };
+}
+
+function parseCheck(value: unknown): GitHubCheck | undefined {
+  return parseCheckCandidate(value, "unknown", 0)?.check;
 }
 
 function isPendingCheck(check: GitHubCheck): boolean {
-  return ["queued", "in_progress", "in-progress", "pending", "requested", "waiting", "running", "unknown"].includes(check.status) ||
-    ["queued", "in_progress", "in-progress", "pending", "requested", "waiting", "running"].includes(check.conclusion ?? "");
+  return ["queued", "in_progress", "in-progress", "pending", "requested", "waiting", "running", "expected", "unknown"].includes(check.status) ||
+    ["queued", "in_progress", "in-progress", "pending", "requested", "waiting", "running", "expected"].includes(check.conclusion ?? "");
 }
 
 function isFailedCheck(check: GitHubCheck): boolean {
@@ -321,7 +515,7 @@ function isFailedCheck(check: GitHubCheck): boolean {
   ].includes(check.conclusion ?? "");
 }
 
-function checksSummary(checks: readonly GitHubCheck[]): GitHubChecksSummary {
+function checksSummary(checks: readonly GitHubCheck[], complete = true): GitHubChecksSummary {
   const pending = checks.filter(isPendingCheck).length;
   const failed = checks.filter(isFailedCheck).length;
   const passed = checks.filter(isSuccessfulCheck).length;
@@ -331,6 +525,7 @@ function checksSummary(checks: readonly GitHubCheck[]): GitHubChecksSummary {
     passed,
     failed,
     pending,
+    ...(complete ? {} : { complete: false }),
   };
 }
 
@@ -339,22 +534,102 @@ function isSuccessfulCheck(check: GitHubCheck): boolean {
     ["pass", "passed", "success"].includes(check.conclusion ?? "");
 }
 
+function collectionEntries(value: unknown, key: string): unknown[] {
+  if (Array.isArray(value)) {
+    if (value.every((page) => Array.isArray(page))) return value.flatMap((page) => page);
+    const pages = value.filter((page): page is JsonObject => isObject(page) && Array.isArray(page[key]));
+    if (pages.length === value.length && pages.length > 0) return pages.flatMap((page) => page[key] as unknown[]);
+    return value;
+  }
+  return isObject(value) && Array.isArray(value[key]) ? value[key] : [];
+}
+
+function collectionHasKey(value: unknown, key: string): boolean {
+  if (isObject(value)) return Array.isArray(value[key]);
+  return Array.isArray(value) && value.some((page) => isObject(page) && Array.isArray(page[key]));
+}
+
+function collectionEntriesForKeys(value: unknown, keys: readonly string[]): unknown[] {
+  for (const key of keys) {
+    if (collectionHasKey(value, key)) return collectionEntries(value, key);
+  }
+  return Array.isArray(value) ? (value.every((page) => Array.isArray(page)) ? value.flatMap((page) => page) : value) : [];
+}
+
+function checkRank(check: GitHubCheck): number {
+  if (isPendingCheck(check)) return 3;
+  if (isFailedCheck(check)) return 2;
+  if (isSuccessfulCheck(check)) return 0;
+  return 1;
+}
+
+function newerCandidate(current: CheckCandidate, candidate: CheckCandidate): CheckCandidate {
+  // An API list can contain reruns of a check or historical status contexts.
+  // Prefer the latest timestamp; the collection order is the deterministic
+  // fallback used by GitHub when a fixture/API response has no timestamp.
+  if (current.timestamp !== undefined && candidate.timestamp !== undefined && current.timestamp !== candidate.timestamp) {
+    return candidate.timestamp > current.timestamp ? candidate : current;
+  }
+  // GitHub's REST status list is reverse chronological. When timestamps are
+  // absent on either row or equal, the first row is therefore the current row;
+  // selecting a later ordinal can resurrect an older state from the same
+  // context.
+  return candidate.ordinal < current.ordinal ? candidate : current;
+}
+
+function mergeCheckCandidates(candidates: readonly CheckCandidate[]): GitHubCheck[] {
+  const byName = new Map<string, CheckCandidate>();
+  for (const candidate of candidates) {
+    const key = candidate.check.name.trim().toLowerCase();
+    const current = byName.get(key);
+    if (current === undefined) {
+      byName.set(key, candidate);
+      continue;
+    }
+    if (current.source === candidate.source) {
+      byName.set(key, newerCandidate(current, candidate));
+      continue;
+    }
+    // A legacy status and a check run with the same context are one semantic
+    // context. Keep the worse state so a pending/failing legacy status cannot
+    // be hidden by a successful check run. Equal states use the check-run
+    // representation for stable output.
+    const currentRank = checkRank(current.check);
+    const candidateRank = checkRank(candidate.check);
+    if (candidateRank > currentRank || (candidateRank === currentRank && candidate.source === "check-run")) {
+      byName.set(key, candidate);
+    }
+  }
+  return [...byName.values()].map((candidate) => candidate.check);
+}
+
 function parseChecks(value: unknown): GitHubCheck[] {
-  const source = Array.isArray(value)
-    ? value
-    : isObject(value) && Array.isArray(value.checks)
-      ? value.checks
-      : isObject(value) && Array.isArray(value.statusCheckRollup)
-        ? value.statusCheckRollup
-        : isObject(value) && Array.isArray(value.check_runs)
-          ? value.check_runs
-          : [];
-  return source.map(parseCheck).filter((item): item is GitHubCheck => item !== undefined);
+  const source = collectionEntriesForKeys(value, ["checks", "statusCheckRollup", "check_runs"]);
+  return mergeCheckCandidates(source.map((item, ordinal) => parseCheckCandidate(item, "unknown", ordinal)).filter((item): item is CheckCandidate => item !== undefined));
+}
+
+function parseCheckRuns(value: unknown): GitHubCheck[] {
+  const source = collectionEntries(value, "check_runs");
+  return mergeCheckCandidates(source.map((item, ordinal) => parseCheckCandidate(item, "check-run", ordinal)).filter((item): item is CheckCandidate => item !== undefined));
+}
+
+function parseStatuses(value: unknown): GitHubCheck[] {
+  const source = collectionEntries(value, "statuses");
+  return mergeCheckCandidates(source.map((item, ordinal) => parseCheckCandidate(item, "status", ordinal)).filter((item): item is CheckCandidate => item !== undefined));
+}
+
+function mergeCheckValues(checkRuns: readonly GitHubCheck[], statuses: readonly GitHubCheck[], fallback: readonly GitHubCheck[] = []): GitHubCheck[] {
+  const candidates: CheckCandidate[] = [
+    ...fallback.map((check, ordinal) => ({ check, source: "unknown" as const, ordinal })),
+    ...checkRuns.map((check, ordinal) => ({ check, source: "check-run" as const, ordinal: ordinal + fallback.length })),
+    ...statuses.map((check, ordinal) => ({ check, source: "status" as const, ordinal: ordinal + fallback.length + checkRuns.length })),
+  ];
+  return mergeCheckCandidates(candidates);
 }
 
 const RAW_CHECK_STATUSES = new Set([
   "pass", "passed", "success", "fail", "failed", "failure", "error", "errored", "cancel", "cancelled", "canceled",
-  "pending", "queued", "requested", "waiting", "running", "in_progress", "in-progress", "stale", "timed_out", "timed-out",
+  "pending", "queued", "requested", "waiting", "running", "expected", "in_progress", "in-progress", "stale", "timed_out", "timed-out",
   "action_required", "action-required", "startup_failure", "startup-failure", "skipping", "skipped", "neutral",
 ]);
 
@@ -381,7 +656,7 @@ function parseRawChecks(stdout: string): GitHubCheck[] {
 
 function parseReview(value: unknown): GitHubReview | undefined {
   if (!isObject(value)) return undefined;
-  const state = stringValue(value.state) ?? "PENDING";
+  const state = booleanValue(value.dismissed) === true ? "DISMISSED" : stringValue(value.state) ?? "PENDING";
   const author = stringValue(nested(value.author, "login")) ?? stringValue(nested(value.user, "login"));
   return {
     ...(author === undefined ? {} : { author }),
@@ -393,27 +668,61 @@ function parseReview(value: unknown): GitHubReview | undefined {
 }
 
 function parseReviews(value: unknown): GitHubReview[] {
-  const source = Array.isArray(value) ? value : isObject(value) && Array.isArray(value.reviews) ? value.reviews : [];
+  const source = collectionEntries(value, "reviews");
   return source.map(parseReview).filter((item): item is GitHubReview => item !== undefined);
 }
 
-function reviewsSummary(reviews: readonly GitHubReview[], decision?: string): GitHubReviewsSummary {
+function reviewIsNewer(current: { readonly review: GitHubReview; readonly ordinal: number }, candidate: { readonly review: GitHubReview; readonly ordinal: number }): boolean {
+  const currentTime = current.review.submittedAt === undefined ? undefined : Date.parse(current.review.submittedAt);
+  const candidateTime = candidate.review.submittedAt === undefined ? undefined : Date.parse(candidate.review.submittedAt);
+  if (Number.isFinite(currentTime) && Number.isFinite(candidateTime) && currentTime !== candidateTime) {
+    return (candidateTime as number) > (currentTime as number);
+  }
+  // REST normally returns review history chronologically. If either timestamp
+  // is absent or malformed, it cannot establish temporal order; use that
+  // stable API order instead of allowing an older approval to survive a
+  // later changes-requested/pending row.
+  return candidate.ordinal >= current.ordinal;
+}
+
+function effectiveReviews(reviews: readonly GitHubReview[]): { readonly reviews: readonly GitHubReview[]; readonly complete: boolean } {
+  const byAuthor = new Map<string, { readonly review: GitHubReview; readonly ordinal: number }>();
+  let complete = true;
+  reviews.forEach((review, ordinal) => {
+    const submittedAt = review.submittedAt === undefined ? undefined : Date.parse(review.submittedAt);
+    if (!Number.isFinite(submittedAt)) complete = false;
+    const author = review.author?.trim().toLowerCase();
+    if (author === undefined || author === "") {
+      // Without an identity, historical rows cannot safely be collapsed into
+      // one current reviewer state. Do not count such rows as approval.
+      complete = false;
+      return;
+    }
+    const current = byAuthor.get(author);
+    const candidate = { review, ordinal };
+    if (current === undefined || reviewIsNewer(current, candidate)) byAuthor.set(author, candidate);
+  });
+  return { reviews: [...byAuthor.values()].map((item) => item.review), complete };
+}
+
+function reviewsSummary(reviews: readonly GitHubReview[], decision?: string, complete = true): GitHubReviewsSummary {
+  const effective = effectiveReviews(reviews);
+  const currentReviews = effective.reviews;
   return {
     ...(decision === undefined ? {} : { decision }),
-    approved: reviews.filter((review) => ["approved", "approve"].includes(review.state.toLowerCase())).length,
-    changesRequested: reviews.filter((review) => ["changes_requested", "changes-requested"].includes(review.state.toLowerCase())).length,
-    pending: reviews.filter((review) => ["pending", "commented"].includes(review.state.toLowerCase())).length,
+    approved: currentReviews.filter((review) => ["approved", "approve"].includes(review.state.toLowerCase())).length,
+    changesRequested: currentReviews.filter((review) => ["changes_requested", "changes-requested"].includes(review.state.toLowerCase())).length,
+    pending: currentReviews.filter((review) => ["pending", "commented"].includes(review.state.toLowerCase())).length,
+    ...(!complete || !effective.complete ? { complete: false } : {}),
   };
 }
 
-function parsePullRequest(value: unknown): GitHubPullRequest | undefined {
+function parsePullRequest(value: unknown, complete = true): GitHubPullRequest | undefined {
   if (!isObject(value)) return undefined;
   const number = numberValue(value.number);
   if (number === undefined) return undefined;
   const checks = parseChecks(value.statusCheckRollup ?? value.checks ?? value.check_runs);
-  const reviews = Array.isArray(value.reviews)
-    ? value.reviews.map(parseReview).filter((item): item is GitHubReview => item !== undefined)
-    : [];
+  const reviews = parseReviews(value.reviews);
   const title = stringValue(value.title);
   const state = stringValue(value.state);
   const url = stringValue(value.url) ?? stringValue(value.html_url);
@@ -445,9 +754,9 @@ function parsePullRequest(value: unknown): GitHubPullRequest | undefined {
     ...(baseRefName === undefined ? {} : { baseRefName }),
     ...(baseRefOid === undefined ? {} : { baseRefOid }),
     checks,
-    checksSummary: checksSummary(checks),
+    checksSummary: checksSummary(checks, complete),
     reviews,
-    reviewsSummary: reviewsSummary(reviews, stringValue(value.reviewDecision)),
+    reviewsSummary: reviewsSummary(reviews, stringValue(value.reviewDecision), complete),
   };
 }
 
@@ -474,9 +783,9 @@ function parseIssue(value: unknown): GitHubIssue | undefined {
   };
 }
 
-function parsePullRequests(value: unknown): GitHubPullRequest[] {
+function parsePullRequests(value: unknown, complete = true): GitHubPullRequest[] {
   if (!Array.isArray(value)) return [];
-  return value.map(parsePullRequest).filter((item): item is GitHubPullRequest => item !== undefined);
+  return value.map((item) => parsePullRequest(item, complete)).filter((item): item is GitHubPullRequest => item !== undefined);
 }
 
 interface ParsedDependencies {
@@ -543,10 +852,11 @@ function ghRepositoryArgs(repository: GitHubRepository | undefined): readonly st
   return repository === undefined ? [] : ["--repo", repository.nameWithOwner];
 }
 
-function pullRequestLookupOptions(ghRepository: GitHubRepository | undefined, reconcileAfterEmpty = false): PullRequestLookupOptions {
+function pullRequestLookupOptions(ghRepository: GitHubRepository | undefined, reconcileAfterEmpty = false, allowUnscopedCompatibility = false): PullRequestLookupOptions {
   return {
     ...(reconcileAfterEmpty ? { reconcileAfterEmpty: true } : {}),
     ...(ghRepository === undefined ? {} : { ghRepository }),
+    ...(allowUnscopedCompatibility ? { allowUnscopedCompatibility: true } : {}),
   };
 }
 
@@ -575,6 +885,7 @@ export class GitHubProvider {
   readonly direct: DirectExecutor;
   readonly tracer: Tracer;
   readonly runner: GitHubCommandRunner;
+  private readonly clock: () => number;
   private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   private readonly maxOutputBytes: number;
 
@@ -584,6 +895,13 @@ export class GitHubProvider {
     // single canonical trace sink.
     this.direct = options.direct ?? new DirectExecutor(options.tracer === undefined ? {} : { tracer: options.tracer });
     this.tracer = this.direct.tracer;
+    const configuredClock = options.clock;
+    this.clock = configuredClock === undefined
+      ? () => Date.now()
+      : () => {
+        const value = configuredClock();
+        return value instanceof Date ? value.getTime() : value;
+      };
     this.maxOutputBytes = options.maxOutputBytes ?? GH_OUTPUT_LIMIT;
     this.runner = options.runner ?? new DirectGitHubCommandRunner(this.direct, this.maxOutputBytes);
     this.sleep = options.sleep ?? ((milliseconds, signal) => new Promise<void>((resolve, reject) => {
@@ -597,6 +915,10 @@ export class GitHubProvider {
         reject(new Error("GitHub wait was cancelled"));
       }, { once: true });
     }));
+  }
+
+  private nowMs(): number {
+    return this.clock();
   }
 
   async capabilities(input: GitHubCapabilityInput = {}, context: OperationContext = defaultContext(), options: { readonly instrument?: boolean } = {}): Promise<GitHubOperationResult<GitHubCapabilities>> {
@@ -678,8 +1000,11 @@ export class GitHubProvider {
       const routes = new Set<GitHubProviderRoute>();
       const intervalMs = nonNegativeInteger(input.intervalMs, DEFAULT_WAIT_INTERVAL_MS);
       const timeoutMs = nonNegativeInteger(input.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS);
-      const maxPolls = positiveInteger(input.maxPolls, DEFAULT_WAIT_MAX_POLLS);
-      const deadline = Math.min(Date.now() + timeoutMs, contextDeadline(operationContext));
+      // The deadline is the default wait budget. A poll cap is only a caller
+      // supplied guard; the old implicit 120-poll cap ended a default wait at
+      // roughly four minutes despite advertising a ten-minute timeout.
+      const maxPolls = input.maxPolls === undefined ? Number.POSITIVE_INFINITY : positiveInteger(input.maxPolls, 1);
+      const deadline = Math.min(this.nowMs() + timeoutMs, contextDeadline(operationContext));
       // DirectExecutor applies the context deadline to every child process.
       // This is important for the raw shell escape hatch, whose command must
       // never be allowed to outlive this semantic wait operation.
@@ -700,17 +1025,22 @@ export class GitHubProvider {
       }
 
       let lastChecks: readonly GitHubCheck[] = [];
+      let lastChecksComplete = true;
       for (let poll = 0; poll < maxPolls; poll += 1) {
         if (waitContext.signal.aborted) throw createRuntimeError({ code: "GITHUB_WAIT_CANCELLED", message: "GitHub wait was cancelled", retryable: false, effect: "none" });
-        if (Date.now() >= deadline) break;
+        if (this.nowMs() >= deadline) break;
         metrics.pollCountInternal += 1;
         const checksAttempt = await this.readChecks(pullRequestNumber, repository, input.cwd, waitContext, metrics, routes, deadline);
         if (checksAttempt === undefined) {
           throw createRuntimeError({ code: "GITHUB_CHECKS_UNAVAILABLE", message: "Pull request checks could not be read", retryable: true, effect: "none" });
         }
         lastChecks = checksAttempt.value;
-        const summary = checksSummary(lastChecks);
-        const terminal = summary.pending === 0;
+        lastChecksComplete = checksAttempt.complete !== false;
+        const summary = checksSummary(lastChecks, lastChecksComplete);
+        // A complete read with no pending contexts is terminal. An incomplete
+        // REST rollup remains UNKNOWN and must not be reported as a terminal
+        // pass/fail decision merely because the sources we did read are done.
+        const terminal = lastChecksComplete && summary.pending === 0;
         const passed = terminal && summary.state === "success" && summary.passed > 0;
         // A terminal failure is final even for checks_passed: return it to the
         // caller instead of polling until the deadline can only produce a
@@ -730,12 +1060,12 @@ export class GitHubProvider {
             summary: "GitHub checks reached a terminal state",
           };
         }
-        const remainingMs = deadline - Date.now();
+        const remainingMs = deadline - this.nowMs();
         if (poll + 1 < maxPolls && intervalMs > 0 && remainingMs > 0) {
           await this.sleep(Math.min(intervalMs, remainingMs), waitContext.signal);
         }
       }
-      const summary = checksSummary(lastChecks);
+      const summary = checksSummary(lastChecks, lastChecksComplete);
       throw createRuntimeError({
         code: "GITHUB_WAIT_TIMEOUT",
         message: "GitHub checks did not reach the requested state before the wait deadline",
@@ -762,13 +1092,22 @@ export class GitHubProvider {
     return this.runOperation("github.publish", "remote", context, async (metrics, operationContext) => {
       const cwd = input.cwd;
       const routes = new Set<GitHubProviderRoute>();
-      const repositoryAttempt = await this.readRepositoryAttempt(cwd, operationContext, metrics, routes, input.remote);
+      const remote = input.remote ?? "origin";
+      const repositoryAttempt = await this.readRepositoryAttempt(
+        cwd,
+        operationContext,
+        metrics,
+        routes,
+        remote,
+      );
       const repository = repositoryAttempt?.value;
       if (repository === undefined) {
         throw createRuntimeError({ code: "GITHUB_REPOSITORY_NOT_FOUND", message: "Current GitHub repository was not found", retryable: false, effect: "none" });
       }
-      const remote = input.remote ?? "origin";
-      const ghRepository = input.remote === undefined ? undefined : repository;
+      // The same repository identified by the selected push remote scopes
+      // every PR read/create. An unscoped gh command can otherwise silently
+      // describe a different checkout repository.
+      const ghRepository = repository;
       const branch = input.branch ?? await this.gitText(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd, operationContext, metrics);
       const localHead = await this.gitText(["rev-parse", "HEAD"], cwd, operationContext, metrics);
       if (branch === undefined || localHead === undefined) {
@@ -820,24 +1159,39 @@ export class GitHubProvider {
         reconciled = true;
       }
 
-      let pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository)))?.value;
+      const allowUnscopedCompatibility = false;
+      let pullRequest: GitHubPullRequest | undefined;
       let created = false;
       let pullRequestEffectState: EffectState = "none";
-      if (pullRequest === undefined) {
-        try {
-          const createResult = await this.createPullRequest(repository, branch, base, input.title, input.body ?? "", cwd, operationContext, metrics, routes, ghRepository);
-          created = createResult.created;
-          pullRequest = createResult.pullRequest;
-          pullRequestEffectState = createResult.effectState ?? "none";
-          if (!created) reconciled = true;
-        } catch (cause) {
-          // Never issue a blind second create after an ambiguous response.
-          pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, true)))?.value;
-          if (pullRequest === undefined) throw errorFor(cause, "GITHUB_PR_CREATE_UNKNOWN", "unknown");
-          pullRequestEffectState = "unknown";
-          reconciled = true;
+      try {
+        pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, false, allowUnscopedCompatibility)))?.value;
+        if (pullRequest === undefined) {
+          try {
+            const createResult = await this.createPullRequest(repository, branch, base, input.title, input.body ?? "", cwd, operationContext, metrics, routes, ghRepository);
+            created = createResult.created;
+            pullRequest = createResult.pullRequest;
+            pullRequestEffectState = createResult.effectState ?? "none";
+            if (!created) reconciled = true;
+          } catch (cause) {
+            // A rate-limited effect must not immediately trigger a reconciliation
+            // read while GitHub has asked the client to stop making requests.
+            if (isRateLimitError(cause)) throw cause;
+            // Never issue a blind second create after an ambiguous response.
+            pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, true, allowUnscopedCompatibility)))?.value;
+            if (pullRequest === undefined) throw errorFor(cause, "GITHUB_PR_CREATE_UNKNOWN", "unknown");
+            pullRequestEffectState = "unknown";
+            reconciled = true;
+          }
+          pullRequest ??= (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, false, allowUnscopedCompatibility)))?.value;
         }
-        pullRequest ??= (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository)))?.value;
+      } catch (cause) {
+        // A branch push is already an applied remote effect. Preserve that
+        // state if a later PR read/create is rate-limited; retry safety must
+        // not report the whole publish as effect-free.
+        if (isRateLimitError(cause)) {
+          throw errorWithEffect(cause, "GITHUB_RATE_LIMITED", pushed || created ? "applied" : "none");
+        }
+        throw cause;
       }
       if (pullRequest === undefined) {
         throw createRuntimeError({ code: "GITHUB_PR_NOT_FOUND_AFTER_PUBLISH", message: "Pull request could not be read after publish", retryable: true, effect: pullRequestEffectState === "unknown" ? "unknown" : created || pushed ? "applied" : "none" });
@@ -847,7 +1201,15 @@ export class GitHubProvider {
         : pushed || created
           ? "applied"
           : "none";
-      const freshPullRequest = (await this.readPullRequest(repository, pullRequest.number, cwd, operationContext, metrics, routes, ghRepository))?.value;
+      let freshPullRequest: GitHubPullRequest | undefined;
+      try {
+        freshPullRequest = (await this.readPullRequest(repository, pullRequest.number, cwd, operationContext, metrics, routes, ghRepository, allowUnscopedCompatibility))?.value;
+      } catch (cause) {
+        if (isRateLimitError(cause)) {
+          throw errorWithEffect(cause, "GITHUB_RATE_LIMITED", publishEffectState);
+        }
+        throw cause;
+      }
       if (freshPullRequest === undefined) {
         throw createRuntimeError({ code: "GITHUB_PR_FRESH_READ_FAILED", message: "Pull request could not be freshly reconciled after publish", retryable: true, effect: publishEffectState, details: { pullRequest: pullRequest.number } });
       }
@@ -968,12 +1330,59 @@ export class GitHubProvider {
     return result;
   }
 
+  private async executeRead(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, retryable = true): Promise<GitHubCommandResult> {
+    let retryNumber = 0;
+    while (true) {
+      let result: GitHubCommandResult;
+      try {
+        result = await this.execute(args, cwd, context, metrics);
+      } catch (cause) {
+        if (isRateLimitError(cause)) throw cause;
+        throw cause;
+      }
+      const limited = rateLimitInfo(result, this.nowMs());
+      if (limited === undefined) return result;
+      if (!retryable || retryNumber >= MAX_RATE_LIMIT_RETRIES) throw rateLimitError(limited, retryNumber + 1);
+      await this.waitForRateLimit(limited, retryNumber, context, metrics);
+      retryNumber += 1;
+    }
+  }
+
   private async shell(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, options: { readonly timeoutMs?: number } = {}): Promise<GitHubCommandResult> {
     const command = rawCommand(args);
     metrics.call({ shell: command, cwd });
     const result = await this.runner.runShell({ command, ...(cwd === undefined ? {} : { cwd }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), maxOutputBytes: this.maxOutputBytes }, context);
     metrics.observe(result);
     return result;
+  }
+
+  private async shellRead(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, options: { readonly timeoutMs?: number } = {}): Promise<GitHubCommandResult> {
+    let retryNumber = 0;
+    while (true) {
+      const result = await this.shell(args, cwd, context, metrics, options);
+      const limited = rateLimitInfo(result, this.nowMs());
+      if (limited === undefined) return result;
+      if (retryNumber >= MAX_RATE_LIMIT_RETRIES) throw rateLimitError(limited, retryNumber + 1);
+      await this.waitForRateLimit(limited, retryNumber, context, metrics);
+      retryNumber += 1;
+    }
+  }
+
+  private async waitForRateLimit(info: RateLimitInfo, retryNumber: number, context: OperationContext, metrics: ProviderMetrics): Promise<void> {
+    const delay = rateLimitDelay(info, retryNumber, this.nowMs());
+    if (delay === undefined) throw rateLimitError(info, retryNumber + 1);
+    const remaining = contextDeadline(context) - this.nowMs();
+    if (Number.isFinite(remaining) && remaining <= 0) throw rateLimitError(info, retryNumber + 1);
+    metrics.retries += 1;
+    try {
+      await this.sleep(Number.isFinite(remaining) ? Math.min(delay, Math.max(1, remaining)) : delay, context.signal);
+    } catch (cause) {
+      if (context.signal.aborted) throw cause;
+      throw rateLimitError(info, retryNumber + 1);
+    }
+    if (Number.isFinite(contextDeadline(context)) && this.nowMs() >= contextDeadline(context)) {
+      throw rateLimitError(info, retryNumber + 1);
+    }
   }
 
   private async gitCommand(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<GitHubCommandResult> {
@@ -998,16 +1407,17 @@ export class GitHubProvider {
 
   private async tryVersion(cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<string | undefined> {
     try {
-      const result = await this.execute(["--version"], cwd, context, metrics);
+      const result = await this.executeRead(["--version"], cwd, context, metrics, false);
       return (result.exitCode ?? 0) === 0 ? parseVersion(result.stdout) ?? result.stdout.trim() : undefined;
-    } catch {
+    } catch (cause) {
+      if (isRateLimitError(cause)) throw cause;
       return undefined;
     }
   }
 
   private async tryAuth(cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<{ authenticated: boolean; account?: string }> {
     try {
-      const result = await this.execute(["auth", "status", "--json", "hosts"], cwd, context, metrics);
+      const result = await this.executeRead(["auth", "status", "--json", "hosts"], cwd, context, metrics, false);
       if ((result.exitCode ?? 0) === 0) {
         const parsed = parseJson(result.stdout);
         const hosts = nested(parsed, "hosts");
@@ -1021,7 +1431,8 @@ export class GitHubProvider {
           return { authenticated: true, ...(account === undefined ? {} : { account }) };
         }
       }
-    } catch {
+    } catch (cause) {
+      if (isRateLimitError(cause)) throw cause;
       // Fall through to the authenticated API identity check.
     }
     const api = await this.apiJson("user", [], cwd, context, metrics);
@@ -1039,7 +1450,13 @@ export class GitHubProvider {
     // An explicitly selected publish remote is authoritative. `gh repo view`
     // without --repo describes the checkout's default repository and could
     // therefore point PR reconciliation at a different remote.
-    if (remote !== undefined) return this.readRepositoryFromRemote(remote, cwd, context, metrics, routes);
+    if (remote !== undefined) {
+      const selected = await this.readRepositoryFromRemote(remote, cwd, context, metrics, routes);
+      // A selected publish remote is authoritative. If it cannot be resolved,
+      // leave the repository unavailable instead of combining an unscoped
+      // checkout repository with an effect against another remote.
+      return selected.attempt;
+    }
     const structured = await this.jsonCommand(["repo", "view", "--json", REPO_JSON_FIELDS], cwd, context, metrics);
     if (structured !== undefined) {
       const repository = parseRepository(structured.value);
@@ -1048,13 +1465,22 @@ export class GitHubProvider {
         return { value: repository, route: "gh-json" };
       }
     }
-    return this.readRepositoryFromRemote("origin", cwd, context, metrics, routes);
+    return (await this.readRepositoryFromRemote("origin", cwd, context, metrics, routes)).attempt;
   }
 
-  private async readRepositoryFromRemote(remote: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubRepository> | undefined> {
-    const remoteResult = await this.gitText(["remote", "get-url", remote], cwd, context, metrics);
-    const fromRemote = remoteResult === undefined ? undefined : parseRepositoryFromRemote(remoteResult);
-    if (fromRemote === undefined) return undefined;
+  private async readRepositoryFromRemote(remote: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<RemoteRepositoryResolution> {
+    // `git push <remote>` honors remote.<name>.pushurl. Resolve that URL first
+    // so PR lookup/create is bound to the repository that the effect targets,
+    // not merely to the fetch URL returned by `git remote get-url <remote>`.
+    const pushUrl = await this.remoteUrl(remote, true, cwd, context, metrics);
+    // A failed push-URL lookup is not evidence that the fetch URL is also the
+    // effect target. In particular, a configured pushurl can differ from the
+    // fetch URL; falling back here would scope PR reads/creates to the wrong
+    // repository. Keep publish fail-closed until the selected push endpoint is
+    // known.
+    if (!pushUrl.succeeded) return { identityKnown: false };
+    const fromRemote = parseRepositoryFromRemote(pushUrl.stdout);
+    if (fromRemote === undefined) return { identityKnown: true };
     const api = await this.apiJson(`repos/${repositoryPath(fromRemote)}`, [], cwd, context, metrics);
     if (api !== undefined) {
       // REST uses html_url/default_branch/full_name, while gh --json uses
@@ -1066,21 +1492,31 @@ export class GitHubProvider {
         ...(stringValue(nested(api.value, "default_branch")) === undefined ? {} : { defaultBranch: stringValue(nested(api.value, "default_branch")) as string }),
       };
       routes.add(api.route);
-      return { value: repository, route: api.route };
+      return { attempt: { value: repository, route: api.route }, identityKnown: true };
     }
     // The git remote identifies the repository, but a failed API read must
     // not advertise gh-api as an available provider route.
-    return { value: fromRemote, route: "unavailable" };
+    return { attempt: { value: fromRemote, route: "unavailable" }, identityKnown: true };
+  }
+
+  private async remoteUrl(remote: string, push: boolean, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<{ readonly succeeded: boolean; readonly stdout: string }> {
+    try {
+      const result = await this.gitCommand(["remote", "get-url", ...(push ? ["--push"] : []), remote], cwd, context, metrics);
+      return { succeeded: true, stdout: result.stdout };
+    } catch {
+      return { succeeded: false, stdout: "" };
+    }
   }
 
   private async jsonCommand(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<Attempt<unknown> | undefined> {
     try {
-      const result = await this.execute(args, cwd, context, metrics);
+      const result = await this.executeRead(args, cwd, context, metrics);
       if ((result.exitCode ?? 0) === 0) {
         const value = parseJson(result.stdout);
-        if (value !== undefined) return { value, route: "gh-json" };
+        if (value !== undefined) return { value, route: "gh-json", complete: result.truncated !== true };
       }
-    } catch {
+    } catch (cause) {
+      if (isRateLimitError(cause)) throw cause;
       // The API and raw shell routes are the documented fallbacks.
     }
     return undefined;
@@ -1089,22 +1525,26 @@ export class GitHubProvider {
   private async apiJson(endpoint: string, args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, allowRawFallback = true): Promise<Attempt<unknown> | undefined> {
     const commandArgs = ["api", endpoint, ...args];
     try {
-      const result = await this.execute(commandArgs, cwd, context, metrics);
+      // Effectful API calls do not receive read retries. In particular, a
+      // rate-limited create must not be replayed by this read helper.
+      const result = await this.executeRead(commandArgs, cwd, context, metrics, allowRawFallback);
       if ((result.exitCode ?? 0) === 0) {
         const value = parseJson(result.stdout);
-        if (value !== undefined) return { value, route: "gh-api" };
+        if (value !== undefined) return { value, route: "gh-api", complete: result.truncated !== true };
       }
-    } catch {
+    } catch (cause) {
+      if (isRateLimitError(cause)) throw cause;
       // Continue to the raw gh shell escape hatch.
     }
     if (!allowRawFallback) return undefined;
     try {
-      const result = await this.shell(commandArgs, cwd, context, metrics);
+      const result = await this.shellRead(commandArgs, cwd, context, metrics);
       if ((result.exitCode ?? 0) === 0) {
         const value = parseJson(result.stdout);
-        if (value !== undefined) return { value, route: "raw-gh" };
+        if (value !== undefined) return { value, route: "raw-gh", complete: result.truncated !== true };
       }
-    } catch {
+    } catch (cause) {
+      if (isRateLimitError(cause)) throw cause;
       // The caller decides whether an unavailable read is best effort.
     }
     return undefined;
@@ -1112,98 +1552,145 @@ export class GitHubProvider {
 
   private async rawJson(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<Attempt<unknown> | undefined> {
     try {
-      const result = await this.shell(args, cwd, context, metrics);
+      const result = await this.shellRead(args, cwd, context, metrics);
       if ((result.exitCode ?? 0) === 0) {
         const value = parseJson(result.stdout);
-        if (value !== undefined) return { value, route: "raw-gh" };
+        if (value !== undefined) return { value, route: "raw-gh", complete: result.truncated !== true };
       }
-    } catch {
+    } catch (cause) {
+      if (isRateLimitError(cause)) throw cause;
       // No further provider route exists.
     }
     return undefined;
   }
 
+  private async paginatedApiJson(endpoint: string, collectionKey: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<Attempt<unknown> | undefined> {
+    const separator = endpoint.includes("?") ? "&" : "?";
+    const paginatedEndpoint = `${endpoint}${separator}per_page=100`;
+    // --slurp makes gh emit one valid JSON array containing all pages. The
+    // plain --paginate retry supports older gh versions, whose output is a
+    // single page for the common one-page case. Both paths are explicitly
+    // paginated; the unpaginated call is retained only as a compatibility
+    // fallback for older CLI/test doubles that reject pagination flags.
+    for (const args of [["--paginate", "--slurp"], ["--paginate"]] as const) {
+      const attempt = await this.apiJson(paginatedEndpoint, args, cwd, context, metrics);
+      if (attempt !== undefined) return boundPaginatedAttempt(attempt, collectionKey);
+    }
+    const legacy = await this.apiJson(endpoint, [], cwd, context, metrics);
+    // This path exists only for old gh command doubles/versions. A default
+    // REST page cannot prove completeness, so expose that limitation to the
+    // semantic summary instead of treating it as a complete collection.
+    return legacy === undefined ? undefined : { ...legacy, complete: false };
+  }
+
   private async readCurrentPullRequest(cwd: string | undefined, repository: GitHubRepository | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubPullRequest> | undefined> {
     const structured = await this.jsonCommand(["pr", "view", "--json", PR_JSON_FIELDS], cwd, context, metrics);
     if (structured !== undefined) {
-      const value = parsePullRequest(structured.value);
+      const value = parsePullRequest(structured.value, structured.complete !== false);
       if (value !== undefined) {
         routes.add("gh-json");
-        return { value, route: "gh-json" };
+        return { value, route: "gh-json", complete: structured.complete !== false };
       }
     }
     if (repository !== undefined) {
       const prs = await this.apiJson(`repos/${repositoryPath(repository)}/pulls?head=${encodeURIComponent(repository.owner + ":" + (await this.gitText(["branch", "--show-current"], cwd, context, metrics) ?? ""))}&state=open&per_page=1`, [], cwd, context, metrics);
       if (prs !== undefined) {
-        const value = parsePullRequests(prs.value)[0];
+        const value = parsePullRequests(prs.value, prs.complete !== false)[0];
         if (value !== undefined) {
-          const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes);
+          const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes, prs.complete !== false);
           routes.add(prs.route);
-          return { value: enriched, route: prs.route };
+          return { value: enriched, route: prs.route, complete: prs.complete !== false };
         }
       }
     }
     const raw = await this.rawJson(["pr", "view", "--json", PR_JSON_FIELDS], cwd, context, metrics);
     if (raw !== undefined) {
-      const value = parsePullRequest(raw.value);
+      const value = parsePullRequest(raw.value, raw.complete !== false);
       if (value !== undefined) {
         routes.add("raw-gh");
-        return { value, route: "raw-gh" };
+        return { value, route: "raw-gh", complete: raw.complete !== false };
       }
     }
     return undefined;
   }
 
-  private async readPullRequest(repository: GitHubRepository, number: number, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, ghRepository?: GitHubRepository): Promise<Attempt<GitHubPullRequest> | undefined> {
-    const structured = await this.jsonCommand(["pr", "view", String(number), ...ghRepositoryArgs(ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+  private async readPullRequest(repository: GitHubRepository, number: number, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, ghRepository?: GitHubRepository, allowUnscopedCompatibility = false): Promise<Attempt<GitHubPullRequest> | undefined> {
+    let structured = await this.jsonCommand(["pr", "view", String(number), ...ghRepositoryArgs(ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    if (structured === undefined && ghRepository !== undefined && allowUnscopedCompatibility && await this.unscopedRepositoryIsSafe(repository, cwd, context, metrics)) {
+      structured = await this.jsonCommand(["pr", "view", String(number), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    }
     if (structured !== undefined) {
-      const value = parsePullRequest(structured.value);
+      const value = parsePullRequest(structured.value, structured.complete !== false);
       if (value !== undefined) {
         routes.add("gh-json");
-        return { value, route: "gh-json" };
+        return { value, route: "gh-json", complete: structured.complete !== false };
       }
     }
     const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls/${number}`, [], cwd, context, metrics);
     if (api !== undefined) {
-      const value = parsePullRequest(api.value);
+      const value = parsePullRequest(api.value, api.complete !== false);
       if (value !== undefined) {
-        const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes);
+        const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes, api.complete !== false);
         routes.add(api.route);
-        return { value: enriched, route: api.route };
+        return { value: enriched, route: api.route, complete: api.complete !== false };
       }
     }
-    const raw = await this.rawJson(["pr", "view", String(number), ...ghRepositoryArgs(ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    let raw = await this.rawJson(["pr", "view", String(number), ...ghRepositoryArgs(ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    if (raw === undefined && ghRepository !== undefined && allowUnscopedCompatibility && await this.unscopedRepositoryIsSafe(repository, cwd, context, metrics)) {
+      raw = await this.rawJson(["pr", "view", String(number), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    }
     if (raw !== undefined) {
-      const value = parsePullRequest(raw.value);
+      const value = parsePullRequest(raw.value, raw.complete !== false);
       if (value !== undefined) {
         routes.add("raw-gh");
-        return { value, route: "raw-gh" };
+        return { value, route: "raw-gh", complete: raw.complete !== false };
       }
     }
     return undefined;
   }
 
-  private async enrichApiPullRequest(repository: GitHubRepository, pullRequest: GitHubPullRequest, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<GitHubPullRequest> {
+  private async unscopedRepositoryIsSafe(repository: GitHubRepository, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<boolean> {
+    const current = await this.jsonCommand(["repo", "view", "--json", REPO_JSON_FIELDS], cwd, context, metrics);
+    // An unavailable or unparseable current-repository read is not proof of
+    // identity. Unscoped compatibility is safe only after an explicit match;
+    // otherwise a fallback PR read could silently target another checkout.
+    if (current === undefined) return false;
+    const currentRepository = parseRepository(current.value);
+    return currentRepository !== undefined && currentRepository.nameWithOwner.toLowerCase() === repository.nameWithOwner.toLowerCase();
+  }
+
+  private async enrichApiPullRequest(repository: GitHubRepository, pullRequest: GitHubPullRequest, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, baseComplete = true): Promise<GitHubPullRequest> {
     let checks = pullRequest.checks;
     let reviews = pullRequest.reviews;
-    const reviewsAttempt = await this.apiJson(`repos/${repositoryPath(repository)}/pulls/${pullRequest.number}/reviews`, [], cwd, context, metrics);
+    const reviewsAttempt = await this.paginatedApiJson(`repos/${repositoryPath(repository)}/pulls/${pullRequest.number}/reviews`, "reviews", cwd, context, metrics);
+    let reviewsComplete = baseComplete && reviewsAttempt !== undefined && reviewsAttempt.complete !== false;
     if (reviewsAttempt !== undefined) {
       reviews = parseReviews(reviewsAttempt.value);
       routes.add(reviewsAttempt.route);
     }
+    let checksComplete = false;
+    let checkRuns: GitHubCheck[] = [];
+    let statuses: GitHubCheck[] = [];
     if (pullRequest.headRefOid !== undefined) {
-      const checksAttempt = await this.apiJson(`repos/${repositoryPath(repository)}/commits/${pullRequest.headRefOid}/check-runs`, [], cwd, context, metrics);
+      const checksAttempt = await this.paginatedApiJson(`repos/${repositoryPath(repository)}/commits/${pullRequest.headRefOid}/check-runs`, "check_runs", cwd, context, metrics);
+      const statusesAttempt = await this.paginatedApiJson(`repos/${repositoryPath(repository)}/commits/${pullRequest.headRefOid}/status`, "statuses", cwd, context, metrics);
       if (checksAttempt !== undefined) {
-        checks = parseChecks(checksAttempt.value);
+        checkRuns = parseCheckRuns(checksAttempt.value);
         routes.add(checksAttempt.route);
       }
+      if (statusesAttempt !== undefined) {
+        statuses = parseStatuses(statusesAttempt.value);
+        routes.add(statusesAttempt.route);
+      }
+      checksComplete = baseComplete && checksAttempt !== undefined && statusesAttempt !== undefined && checksAttempt.complete !== false && statusesAttempt.complete !== false;
+      checks = mergeCheckValues(checkRuns, statuses, pullRequest.checks);
     }
     return {
       ...pullRequest,
       checks,
-      checksSummary: checksSummary(checks),
+      checksSummary: checksSummary(checks, checksComplete),
       reviews,
-      reviewsSummary: reviewsSummary(reviews, pullRequest.reviewsSummary.decision),
+      reviewsSummary: reviewsSummary(reviews, pullRequest.reviewsSummary.decision, reviewsComplete),
     };
   }
 
@@ -1265,24 +1752,34 @@ export class GitHubProvider {
     const structured = await this.jsonCommand(["pr", "checks", String(number), "--json", "name,state,bucket,link"], cwd, context, metrics);
     if (structured !== undefined) {
       routes.add("gh-json");
-      return { value: parseChecks(structured.value), route: "gh-json" };
+      return { value: parseChecks(structured.value), route: "gh-json", complete: structured.complete !== false };
     }
     if (repository !== undefined) {
       const pr = await this.apiJson(`repos/${repositoryPath(repository)}/pulls/${number}`, [], cwd, context, metrics);
       const sha = stringValue(nested(nested(pr?.value, "head"), "sha"));
       if (sha !== undefined) {
-        const checks = await this.apiJson(`repos/${repositoryPath(repository)}/commits/${sha}/check-runs`, [], cwd, context, metrics);
-        if (checks !== undefined) {
-          routes.add(checks.route);
-          return { value: parseChecks(checks.value), route: checks.route };
+        const checkRuns = await this.paginatedApiJson(`repos/${repositoryPath(repository)}/commits/${sha}/check-runs`, "check_runs", cwd, context, metrics);
+        const statuses = await this.paginatedApiJson(`repos/${repositoryPath(repository)}/commits/${sha}/status`, "statuses", cwd, context, metrics);
+        if (checkRuns !== undefined || statuses !== undefined) {
+          const checks = mergeCheckValues(
+            checkRuns === undefined ? [] : parseCheckRuns(checkRuns.value),
+            statuses === undefined ? [] : parseStatuses(statuses.value),
+          );
+          if (checkRuns !== undefined) routes.add(checkRuns.route);
+          if (statuses !== undefined) routes.add(statuses.route);
+          return {
+            value: checks,
+            route: checkRuns?.route ?? statuses?.route ?? "unavailable",
+            complete: pr?.complete !== false && checkRuns !== undefined && statuses !== undefined && checkRuns.complete !== false && statuses.complete !== false,
+          };
         }
       }
     }
-    const timeoutMs = deadline === undefined || !Number.isFinite(deadline) ? undefined : Math.max(1, deadline - Date.now());
+    const timeoutMs = deadline === undefined || !Number.isFinite(deadline) ? undefined : Math.max(1, deadline - this.nowMs());
     // Keep raw gh as an escape hatch, but leave polling to AER. The --watch
     // mode owns an unbounded loop and can therefore exceed the operation's
     // timeout; the per-command timeout is the final safety boundary.
-    const raw = await this.shell(
+    const raw = await this.shellRead(
       ["pr", "checks", String(number)],
       cwd,
       context,
@@ -1292,13 +1789,38 @@ export class GitHubProvider {
     const checks = parseRawChecks(`${raw.stdout}\n${raw.stderr}`);
     if ((raw.exitCode ?? 0) === 0 || checks.length > 0 || /some checks were not successful/i.test(`${raw.stdout}\n${raw.stderr}`)) {
       routes.add("raw-gh");
-      return { value: checks, route: "raw-gh" };
+      return { value: checks, route: "raw-gh", complete: raw.truncated !== true };
     }
     return undefined;
   }
 
   private async remoteHead(remote: string, branch: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<string | undefined> {
-    const result = await this.gitCommand(["ls-remote", "--heads", remote, `refs/heads/${branch}`], cwd, context, metrics);
+    // `git ls-remote <remote>` normally resolves the fetch URL. Publishing
+    // resolves the push URL, so validate the same endpoint that
+    // `git push <remote>` will use. If that lookup fails, do not silently
+    // switch endpoints: a configured pushurl may point at a different
+    // repository than the fetch URL.
+    const pushUrl = await this.remoteUrl(remote, true, cwd, context, metrics);
+    if (!pushUrl.succeeded) {
+      throw createRuntimeError({
+        code: "GITHUB_PUSH_REMOTE_UNAVAILABLE",
+        message: "The selected remote push URL could not be resolved",
+        retryable: true,
+        effect: "none",
+        details: { remote },
+      });
+    }
+    const pushTarget = pushUrl.stdout.trim().split("\n")[0]?.trim();
+    if (pushTarget === undefined || pushTarget === "") {
+      throw createRuntimeError({
+        code: "GITHUB_PUSH_REMOTE_UNAVAILABLE",
+        message: "The selected remote returned an empty push URL",
+        retryable: true,
+        effect: "none",
+        details: { remote },
+      });
+    }
+    const result = await this.gitCommand(["ls-remote", "--heads", pushTarget, `refs/heads/${branch}`], cwd, context, metrics);
     const line = result.stdout.trim().split("\n")[0] ?? "";
     return line.split(/\s+/)[0] || undefined;
   }
@@ -1309,39 +1831,52 @@ export class GitHubProvider {
     // owner-qualified form so a same-named fork cannot be selected, but keep a
     // compatibility retry when the installed CLI rejects that filter.
     let structured = await this.jsonCommand(["pr", "list", "--head", head, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+    const allowUnscoped = structured === undefined && options.ghRepository !== undefined && options.allowUnscopedCompatibility === true && await this.unscopedRepositoryIsSafe(repository, cwd, context, metrics);
+    if (structured === undefined && allowUnscoped) {
+      structured = await this.jsonCommand(["pr", "list", "--head", head, "--state", "all", "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+    }
     if (structured === undefined) {
       // The bare-branch compatibility query can include PRs opened from a
       // same-named fork. Keep the repository identity in the response so the
       // fallback can reject those candidates safely.
       structured = await this.jsonCommand(["pr", "list", "--head", branch, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+      if (structured === undefined && allowUnscoped) {
+        structured = await this.jsonCommand(["pr", "list", "--head", branch, "--state", "all", "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+      }
     }
     if (structured !== undefined) {
-      const value = selectPullRequest(parsePullRequests(structured.value), branch, repository);
+      const value = selectPullRequest(parsePullRequests(structured.value, structured.complete !== false), branch, repository);
       if (value !== undefined) {
         routes.add("gh-json");
-        return { value, route: "gh-json" };
+        return { value, route: "gh-json", complete: structured.complete !== false };
       }
       // A valid structured empty list is authoritative: there is no PR to
       // reconcile, so do not perform lower-priority reads or raw fallbacks.
-      if (Array.isArray(structured.value) && options.reconcileAfterEmpty !== true) return undefined;
+      if (structured.complete !== false && Array.isArray(structured.value) && options.reconcileAfterEmpty !== true) return undefined;
     }
     const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls?head=${encodeURIComponent(head)}&state=all&per_page=100`, [], cwd, context, metrics);
     if (api !== undefined) {
-      const value = selectPullRequest(parsePullRequests(api.value), branch, repository);
+      const value = selectPullRequest(parsePullRequests(api.value, api.complete !== false), branch, repository);
       if (value !== undefined) {
         routes.add(api.route);
-        return { value, route: api.route };
+        return { value, route: api.route, complete: api.complete !== false };
       }
     }
     let raw = await this.rawJson(["pr", "list", "--head", head, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+    if (raw === undefined && allowUnscoped) {
+      raw = await this.rawJson(["pr", "list", "--head", head, "--state", "all", "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+    }
     if (raw === undefined) {
       raw = await this.rawJson(["pr", "list", "--head", branch, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+      if (raw === undefined && allowUnscoped) {
+        raw = await this.rawJson(["pr", "list", "--head", branch, "--state", "all", "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+      }
     }
     if (raw !== undefined) {
-      const value = selectPullRequest(parsePullRequests(raw.value), branch, repository);
+      const value = selectPullRequest(parsePullRequests(raw.value, raw.complete !== false), branch, repository);
       if (value !== undefined) {
         routes.add("raw-gh");
-        return { value, route: "raw-gh" };
+        return { value, route: "raw-gh", complete: raw.complete !== false };
       }
     }
     return undefined;
@@ -1349,7 +1884,7 @@ export class GitHubProvider {
 
   private async createPullRequest(repository: GitHubRepository, branch: string, base: string, title: string, body: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, ghRepository?: GitHubRepository): Promise<CreatePullRequestResult> {
     const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls`, ["--method", "POST", "--raw-field", `title=${title}`, "--raw-field", `head=${branch}`, "--raw-field", `base=${base}`, "--raw-field", `body=${body}`], cwd, context, metrics, false);
-    const createdPullRequest = api === undefined ? undefined : parsePullRequest(api.value);
+    const createdPullRequest = api === undefined ? undefined : parsePullRequest(api.value, api.complete !== false);
     if (createdPullRequest !== undefined) {
       if (api !== undefined) routes.add(api.route);
       return { created: true, pullRequest: createdPullRequest };
