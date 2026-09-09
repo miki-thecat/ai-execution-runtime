@@ -330,7 +330,13 @@ function rateLimitInfo(result: GitHubCommandResult, nowMs = Date.now()): RateLim
   // "please wait" or "too many requests" also occur in ordinary failures and
   // must not turn a transient 503/403 into GITHUB_RATE_LIMITED.
   const rateLimitStatus = status === 403 || status === 429;
-  const primaryExhausted = remaining === 0 && rateLimitStatus;
+  // A primary-limit response is commonly identified by its message and
+  // reset header, but some transports do not preserve x-ratelimit-remaining.
+  // Treat an explicit primary-limit message with an unknown remaining value
+  // as exhausted so its reset hint remains usable.
+  const primaryLimitMessage = rateMessage && !secondaryMessage;
+  const primaryExhausted = rateLimitStatus &&
+    (remaining === 0 || (remaining === undefined && primaryLimitMessage));
   const responseRateMessage = (status === undefined || rateLimitStatus) && (secondaryMessage || rateMessage);
   const ordinaryForbiddenMessage = /forbidden|unauthorized|permission denied|bad credentials|resource not accessible|insufficient permission/i.test(output);
   // GitHub uses 403 for secondary limits, including responses without a
@@ -344,7 +350,7 @@ function rateLimitInfo(result: GitHubCommandResult, nowMs = Date.now()): RateLim
     (status === 403 && retryAfterMs !== undefined);
   if (!looksLimited) return undefined;
   const secondary = status === 429 || secondaryMessage ||
-    (status === 403 && rateMessage && remaining !== 0) || hintlessSecondaryStatus;
+    (status === 403 && rateMessage && !primaryExhausted) || hintlessSecondaryStatus;
   let info: RateLimitInfo = { secondary, primaryExhausted };
   if (typeof status === "number" && Number.isSafeInteger(status)) info = { ...info, status };
   if (retryAfterMs !== undefined) info = { ...info, retryAfterMs };
@@ -407,7 +413,15 @@ function rateLimitDelay(info: RateLimitInfo, retryNumber: number, nowMs: number)
   if (info.secondary && info.retryAfterMs === undefined &&
     !(info.primaryExhausted && info.resetAtMs !== undefined)) return undefined;
   const resetDelay = info.resetAtMs === undefined ? 0 : Math.max(0, info.resetAtMs - nowMs);
-  const requestedDelay = Math.max(exponential, info.retryAfterMs ?? 0, resetDelay);
+  // For a secondary limit, Retry-After is the server's retry boundary. A
+  // primary reset header may be present as unrelated quota metadata; it must
+  // not override a valid short Retry-After and force an unnecessary terminal
+  // result under this provider's bounded sleep policy.
+  const requestedDelay = info.secondary
+    ? info.retryAfterMs !== undefined
+      ? Math.max(exponential, info.retryAfterMs)
+      : Math.max(exponential, resetDelay)
+    : Math.max(exponential, info.retryAfterMs ?? 0, resetDelay);
   // Do not retry while an unreasonably long server hint is active. Returning
   // undefined lets the caller surface a bounded terminal rate-limit result
   // without either sleeping indefinitely or issuing an early duplicate call.
@@ -556,9 +570,11 @@ function newerCandidate(current: CheckCandidate, candidate: CheckCandidate): Che
   if (current.timestamp !== undefined && candidate.timestamp !== undefined && current.timestamp !== candidate.timestamp) {
     return candidate.timestamp > current.timestamp ? candidate : current;
   }
-  if (current.timestamp === undefined && candidate.timestamp !== undefined) return candidate;
-  if (current.timestamp !== undefined && candidate.timestamp === undefined) return current;
-  return candidate.ordinal >= current.ordinal ? candidate : current;
+  // GitHub's REST status list is reverse chronological. When timestamps are
+  // absent on either row or equal, the first row is therefore the current row;
+  // selecting a later ordinal can resurrect an older state from the same
+  // context.
+  return candidate.ordinal < current.ordinal ? candidate : current;
 }
 
 function mergeCheckCandidates(candidates: readonly CheckCandidate[]): GitHubCheck[] {
@@ -701,7 +717,7 @@ function reviewsSummary(reviews: readonly GitHubReview[], decision?: string, com
   };
 }
 
-function parsePullRequest(value: unknown): GitHubPullRequest | undefined {
+function parsePullRequest(value: unknown, complete = true): GitHubPullRequest | undefined {
   if (!isObject(value)) return undefined;
   const number = numberValue(value.number);
   if (number === undefined) return undefined;
@@ -738,9 +754,9 @@ function parsePullRequest(value: unknown): GitHubPullRequest | undefined {
     ...(baseRefName === undefined ? {} : { baseRefName }),
     ...(baseRefOid === undefined ? {} : { baseRefOid }),
     checks,
-    checksSummary: checksSummary(checks),
+    checksSummary: checksSummary(checks, complete),
     reviews,
-    reviewsSummary: reviewsSummary(reviews, stringValue(value.reviewDecision)),
+    reviewsSummary: reviewsSummary(reviews, stringValue(value.reviewDecision), complete),
   };
 }
 
@@ -767,9 +783,9 @@ function parseIssue(value: unknown): GitHubIssue | undefined {
   };
 }
 
-function parsePullRequests(value: unknown): GitHubPullRequest[] {
+function parsePullRequests(value: unknown, complete = true): GitHubPullRequest[] {
   if (!Array.isArray(value)) return [];
-  return value.map(parsePullRequest).filter((item): item is GitHubPullRequest => item !== undefined);
+  return value.map((item) => parsePullRequest(item, complete)).filter((item): item is GitHubPullRequest => item !== undefined);
 }
 
 interface ParsedDependencies {
@@ -1537,7 +1553,7 @@ export class GitHubProvider {
       const result = await this.shellRead(args, cwd, context, metrics);
       if ((result.exitCode ?? 0) === 0) {
         const value = parseJson(result.stdout);
-        if (value !== undefined) return { value, route: "raw-gh" };
+        if (value !== undefined) return { value, route: "raw-gh", complete: result.truncated !== true };
       }
     } catch (cause) {
       if (isRateLimitError(cause)) throw cause;
@@ -1568,29 +1584,29 @@ export class GitHubProvider {
   private async readCurrentPullRequest(cwd: string | undefined, repository: GitHubRepository | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubPullRequest> | undefined> {
     const structured = await this.jsonCommand(["pr", "view", "--json", PR_JSON_FIELDS], cwd, context, metrics);
     if (structured !== undefined) {
-      const value = parsePullRequest(structured.value);
+      const value = parsePullRequest(structured.value, structured.complete !== false);
       if (value !== undefined) {
         routes.add("gh-json");
-        return { value, route: "gh-json" };
+        return { value, route: "gh-json", complete: structured.complete !== false };
       }
     }
     if (repository !== undefined) {
       const prs = await this.apiJson(`repos/${repositoryPath(repository)}/pulls?head=${encodeURIComponent(repository.owner + ":" + (await this.gitText(["branch", "--show-current"], cwd, context, metrics) ?? ""))}&state=open&per_page=1`, [], cwd, context, metrics);
       if (prs !== undefined) {
-        const value = parsePullRequests(prs.value)[0];
+        const value = parsePullRequests(prs.value, prs.complete !== false)[0];
         if (value !== undefined) {
-          const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes);
+          const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes, prs.complete !== false);
           routes.add(prs.route);
-          return { value: enriched, route: prs.route };
+          return { value: enriched, route: prs.route, complete: prs.complete !== false };
         }
       }
     }
     const raw = await this.rawJson(["pr", "view", "--json", PR_JSON_FIELDS], cwd, context, metrics);
     if (raw !== undefined) {
-      const value = parsePullRequest(raw.value);
+      const value = parsePullRequest(raw.value, raw.complete !== false);
       if (value !== undefined) {
         routes.add("raw-gh");
-        return { value, route: "raw-gh" };
+        return { value, route: "raw-gh", complete: raw.complete !== false };
       }
     }
     return undefined;
@@ -1602,19 +1618,19 @@ export class GitHubProvider {
       structured = await this.jsonCommand(["pr", "view", String(number), "--json", PR_JSON_FIELDS], cwd, context, metrics);
     }
     if (structured !== undefined) {
-      const value = parsePullRequest(structured.value);
+      const value = parsePullRequest(structured.value, structured.complete !== false);
       if (value !== undefined) {
         routes.add("gh-json");
-        return { value, route: "gh-json" };
+        return { value, route: "gh-json", complete: structured.complete !== false };
       }
     }
     const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls/${number}`, [], cwd, context, metrics);
     if (api !== undefined) {
-      const value = parsePullRequest(api.value);
+      const value = parsePullRequest(api.value, api.complete !== false);
       if (value !== undefined) {
-        const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes);
+        const enriched = await this.enrichApiPullRequest(repository, value, cwd, context, metrics, routes, api.complete !== false);
         routes.add(api.route);
-        return { value: enriched, route: api.route };
+        return { value: enriched, route: api.route, complete: api.complete !== false };
       }
     }
     let raw = await this.rawJson(["pr", "view", String(number), ...ghRepositoryArgs(ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
@@ -1622,10 +1638,10 @@ export class GitHubProvider {
       raw = await this.rawJson(["pr", "view", String(number), "--json", PR_JSON_FIELDS], cwd, context, metrics);
     }
     if (raw !== undefined) {
-      const value = parsePullRequest(raw.value);
+      const value = parsePullRequest(raw.value, raw.complete !== false);
       if (value !== undefined) {
         routes.add("raw-gh");
-        return { value, route: "raw-gh" };
+        return { value, route: "raw-gh", complete: raw.complete !== false };
       }
     }
     return undefined;
@@ -1641,11 +1657,11 @@ export class GitHubProvider {
     return currentRepository !== undefined && currentRepository.nameWithOwner.toLowerCase() === repository.nameWithOwner.toLowerCase();
   }
 
-  private async enrichApiPullRequest(repository: GitHubRepository, pullRequest: GitHubPullRequest, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<GitHubPullRequest> {
+  private async enrichApiPullRequest(repository: GitHubRepository, pullRequest: GitHubPullRequest, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, baseComplete = true): Promise<GitHubPullRequest> {
     let checks = pullRequest.checks;
     let reviews = pullRequest.reviews;
     const reviewsAttempt = await this.paginatedApiJson(`repos/${repositoryPath(repository)}/pulls/${pullRequest.number}/reviews`, "reviews", cwd, context, metrics);
-    let reviewsComplete = reviewsAttempt !== undefined && reviewsAttempt.complete !== false;
+    let reviewsComplete = baseComplete && reviewsAttempt !== undefined && reviewsAttempt.complete !== false;
     if (reviewsAttempt !== undefined) {
       reviews = parseReviews(reviewsAttempt.value);
       routes.add(reviewsAttempt.route);
@@ -1664,7 +1680,7 @@ export class GitHubProvider {
         statuses = parseStatuses(statusesAttempt.value);
         routes.add(statusesAttempt.route);
       }
-      checksComplete = checksAttempt !== undefined && statusesAttempt !== undefined && checksAttempt.complete !== false && statusesAttempt.complete !== false;
+      checksComplete = baseComplete && checksAttempt !== undefined && statusesAttempt !== undefined && checksAttempt.complete !== false && statusesAttempt.complete !== false;
       checks = mergeCheckValues(checkRuns, statuses, pullRequest.checks);
     }
     return {
@@ -1752,7 +1768,7 @@ export class GitHubProvider {
           return {
             value: checks,
             route: checkRuns?.route ?? statuses?.route ?? "unavailable",
-            complete: checkRuns !== undefined && statuses !== undefined && checkRuns.complete !== false && statuses.complete !== false,
+            complete: pr?.complete !== false && checkRuns !== undefined && statuses !== undefined && checkRuns.complete !== false && statuses.complete !== false,
           };
         }
       }
@@ -1811,21 +1827,21 @@ export class GitHubProvider {
       }
     }
     if (structured !== undefined) {
-      const value = selectPullRequest(parsePullRequests(structured.value), branch, repository);
+      const value = selectPullRequest(parsePullRequests(structured.value, structured.complete !== false), branch, repository);
       if (value !== undefined) {
         routes.add("gh-json");
-        return { value, route: "gh-json" };
+        return { value, route: "gh-json", complete: structured.complete !== false };
       }
       // A valid structured empty list is authoritative: there is no PR to
       // reconcile, so do not perform lower-priority reads or raw fallbacks.
-      if (Array.isArray(structured.value) && options.reconcileAfterEmpty !== true) return undefined;
+      if (structured.complete !== false && Array.isArray(structured.value) && options.reconcileAfterEmpty !== true) return undefined;
     }
     const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls?head=${encodeURIComponent(head)}&state=all&per_page=100`, [], cwd, context, metrics);
     if (api !== undefined) {
-      const value = selectPullRequest(parsePullRequests(api.value), branch, repository);
+      const value = selectPullRequest(parsePullRequests(api.value, api.complete !== false), branch, repository);
       if (value !== undefined) {
         routes.add(api.route);
-        return { value, route: api.route };
+        return { value, route: api.route, complete: api.complete !== false };
       }
     }
     let raw = await this.rawJson(["pr", "list", "--head", head, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
@@ -1839,10 +1855,10 @@ export class GitHubProvider {
       }
     }
     if (raw !== undefined) {
-      const value = selectPullRequest(parsePullRequests(raw.value), branch, repository);
+      const value = selectPullRequest(parsePullRequests(raw.value, raw.complete !== false), branch, repository);
       if (value !== undefined) {
         routes.add("raw-gh");
-        return { value, route: "raw-gh" };
+        return { value, route: "raw-gh", complete: raw.complete !== false };
       }
     }
     return undefined;
@@ -1850,7 +1866,7 @@ export class GitHubProvider {
 
   private async createPullRequest(repository: GitHubRepository, branch: string, base: string, title: string, body: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, ghRepository?: GitHubRepository): Promise<CreatePullRequestResult> {
     const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls`, ["--method", "POST", "--raw-field", `title=${title}`, "--raw-field", `head=${branch}`, "--raw-field", `base=${base}`, "--raw-field", `body=${body}`], cwd, context, metrics, false);
-    const createdPullRequest = api === undefined ? undefined : parsePullRequest(api.value);
+    const createdPullRequest = api === undefined ? undefined : parsePullRequest(api.value, api.complete !== false);
     if (createdPullRequest !== undefined) {
       if (api !== undefined) routes.add(api.route);
       return { created: true, pullRequest: createdPullRequest };
