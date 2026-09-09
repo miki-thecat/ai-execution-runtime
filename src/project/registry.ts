@@ -4,6 +4,8 @@ import { createProjectId, type ProjectId } from "../core/ids.ts";
 import type { StateStore } from "../state/store.ts";
 import { parseProjectConfig, projectConfigPath, readProjectConfig, writeProjectConfig, type ProjectConfig } from "./config.ts";
 import {
+  copyTrustedVerificationPlan,
+  freezeTrustedVerificationPlan,
   normalizeVerificationPlan,
   trustedVerificationPlan,
   verificationPlanDigest,
@@ -106,7 +108,8 @@ export class ProjectRegistry {
     const config = parseProjectConfig({ ...parsed, id: projectId, name, ...(goal === undefined ? {} : { goal }) });
     if (shouldWriteConfig) writeProjectConfig(rootDir, config);
     const physical = fingerprint(rootDir);
-    const plan = trustedVerificationPlan(config, "registration", new Date().toISOString());
+    const proposedPlan = trustedVerificationPlan(config, "registration", new Date().toISOString());
+    const plan = proposedPlan === undefined ? undefined : freezeTrustedVerificationPlan(proposedPlan);
     const canonical: CanonicalProjectData = {
       projectId,
       rootDir,
@@ -133,7 +136,8 @@ export class ProjectRegistry {
     const config = readProjectConfig(project.rootDir);
     if (config === undefined) throw new Error("PROJECT_CONFIG_MISSING: no verification plan is available to trust");
     const canonical = this.canonical.get(project.projectId)!;
-    const next = trustedVerificationPlan(config, "explicit_update", new Date().toISOString(), canonical.trustedVerificationPlan?.digest);
+    const proposedPlan = trustedVerificationPlan(config, "explicit_update", new Date().toISOString(), canonical.trustedVerificationPlan?.digest);
+    const next = proposedPlan === undefined ? undefined : freezeTrustedVerificationPlan(proposedPlan);
     const { trustedVerificationPlan: _previous, ...withoutPlan } = canonical;
     const updated: CanonicalProjectData = { ...withoutPlan, config, ...(next === undefined ? {} : { trustedVerificationPlan: next }) };
     this.canonical.set(project.projectId, updated);
@@ -221,23 +225,26 @@ export class ProjectRegistry {
     let identityState = status("changed_untrusted" as const, "PROJECT_ROOT_DRIFT");
     let planState: ProjectBoundaryState["verificationPlan"] = {
       status: canonical.trustedVerificationPlan === undefined ? "missing" : "changed_untrusted",
-      ...(canonical.trustedVerificationPlan === undefined ? {} : { trustedDigest: canonical.trustedVerificationPlan.digest, provenance: canonical.trustedVerificationPlan.provenance }),
+      ...(canonical.trustedVerificationPlan === undefined ? {} : { trustedDigest: canonical.trustedVerificationPlan.digest, provenance: { ...canonical.trustedVerificationPlan.provenance } }),
       code: "PROJECT_ROOT_DRIFT",
     };
     if (rootState.status === "trusted") {
       if (config === undefined) {
         const code = configError ?? "PROJECT_CONFIG_MISSING";
         identityState = status(configError === undefined ? "missing" : "changed_untrusted", code);
-        planState = { status: canonical.trustedVerificationPlan === undefined ? "missing" : "changed_untrusted", ...(canonical.trustedVerificationPlan === undefined ? {} : { trustedDigest: canonical.trustedVerificationPlan.digest, provenance: canonical.trustedVerificationPlan.provenance }), code };
+        planState = { status: canonical.trustedVerificationPlan === undefined ? "missing" : "changed_untrusted", ...(canonical.trustedVerificationPlan === undefined ? {} : { trustedDigest: canonical.trustedVerificationPlan.digest, provenance: { ...canonical.trustedVerificationPlan.provenance } }), code };
       } else {
         identityState = config.id === undefined ? status("missing", "PROJECT_CONFIG_ID_MISSING") : config.id === projectId ? status("trusted") : status("changed_untrusted", "PROJECT_IDENTITY_DRIFT");
         const proposedDigest = verificationPlanDigest(normalizeVerificationPlan(config));
         const trusted = canonical.trustedVerificationPlan;
+        const trustedPlanValid = trusted === undefined ? false : verificationPlanDigest(trusted.plan) === trusted.digest;
         planState = trusted === undefined
           ? { status: "missing", proposedDigest, code: "TRUSTED_VERIFICATION_PLAN_MISSING" }
+          : !trustedPlanValid
+            ? { status: "changed_untrusted", trustedDigest: trusted.digest, proposedDigest, provenance: { ...trusted.provenance }, code: "TRUSTED_VERIFICATION_PLAN_INVALID" }
           : proposedDigest === trusted.digest
-            ? { status: "trusted", trustedDigest: trusted.digest, proposedDigest, provenance: trusted.provenance }
-            : { status: "changed_untrusted", trustedDigest: trusted.digest, proposedDigest, provenance: trusted.provenance, code: "VERIFICATION_PLAN_DRIFT" };
+            ? { status: "trusted", trustedDigest: trusted.digest, proposedDigest, provenance: { ...trusted.provenance } }
+            : { status: "changed_untrusted", trustedDigest: trusted.digest, proposedDigest, provenance: { ...trusted.provenance }, code: "VERIFICATION_PLAN_DRIFT" };
       }
     }
     const boundary: ProjectBoundaryState = {
@@ -256,7 +263,7 @@ export class ProjectRegistry {
       ...(canonical.goal === undefined ? {} : { goal: canonical.goal }),
       config: config ?? canonical.config,
       boundary,
-      ...(canonical.trustedVerificationPlan === undefined ? {} : { trustedVerificationPlan: canonical.trustedVerificationPlan }),
+      ...(canonical.trustedVerificationPlan === undefined ? {} : { trustedVerificationPlan: copyTrustedVerificationPlan(canonical.trustedVerificationPlan) }),
     };
     return project;
   }
@@ -277,7 +284,7 @@ export class ProjectRegistry {
         ...(typeof data.registeredRealRoot === "string" ? { registeredRealRoot: data.registeredRealRoot } : {}),
         ...(typeof data.rootDevice === "string" ? { rootDevice: data.rootDevice } : {}),
         ...(typeof data.rootInode === "string" ? { rootInode: data.rootInode } : {}),
-        ...(data.trustedVerificationPlan === undefined ? {} : { trustedVerificationPlan: data.trustedVerificationPlan }),
+        ...(data.trustedVerificationPlan === undefined ? {} : { trustedVerificationPlan: freezeTrustedVerificationPlan(data.trustedVerificationPlan) }),
       });
     }
     for (const id of this.canonical.keys()) this.refresh(id);

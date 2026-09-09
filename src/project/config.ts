@@ -1,5 +1,6 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { pid, platform } from "node:process";
 
 /** The versioned, repository-owned part of an AER project. */
 export const PROJECT_CONFIG_VERSION = 1 as const;
@@ -44,24 +45,69 @@ export function projectConfigPath(rootDir: string): string {
 
 function assertWithinRoot(rootDir: string, candidate: string): void {
   const pathFromRoot = relative(resolve(rootDir), resolve(candidate));
-  if (pathFromRoot.startsWith("..") || isAbsolute(pathFromRoot)) {
+  if (pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot)) {
     throw new Error("PROJECT_CONFIG_ESCAPE: .aer/project.json resolves outside the registered project root");
   }
 }
 
-function confinedConfigPath(rootDir: string, forWrite: boolean): string {
+function causeCode(cause: unknown): string {
+  return cause !== null && typeof cause === "object" && "code" in cause ? String(cause.code) : "";
+}
+
+/** Keep both root and .aer descriptors open while accessing project.json. */
+function withConfinedConfigDirectory<T>(rootDir: string, forWrite: boolean, action: (directory: string, physicalRoot: string) => T): T | undefined {
+  if (platform !== "linux") throw new Error("PROJECT_CONFIG_CONFINEMENT_UNSUPPORTED: race-resistant project config access requires Linux /proc descriptor anchoring");
   const physicalRoot = realpathSync(rootDir);
-  const path = projectConfigPath(rootDir);
-  const directory = dirname(path);
-  if (forWrite) mkdirSync(directory, { recursive: true });
-  if (existsSync(directory)) assertWithinRoot(physicalRoot, realpathSync(directory));
-  let fileStat: ReturnType<typeof lstatSync> | undefined;
-  try { fileStat = lstatSync(path); } catch { /* missing is valid for reads and creation */ }
-  if (fileStat !== undefined) {
-    if (fileStat.isSymbolicLink()) throw new Error("PROJECT_CONFIG_SYMLINK: .aer/project.json must not be a symbolic link");
-    assertWithinRoot(physicalRoot, realpathSync(path));
+  let rootFd: number;
+  try {
+    rootFd = openSync(rootDir, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (cause) {
+    if (causeCode(cause) === "ELOOP") throw new Error("PROJECT_ROOT_SYMLINK: registered project root must not be a symbolic link");
+    throw cause;
   }
-  return path;
+  try {
+    const anchoredRoot = `/proc/self/fd/${rootFd}`;
+    if (realpathSync(anchoredRoot) !== physicalRoot) throw new Error("PROJECT_ROOT_DRIFT: registered project root changed during config access");
+    const directory = join(anchoredRoot, PROJECT_CONFIG_DIRECTORY);
+    if (forWrite) {
+      try { mkdirSync(directory); }
+      catch (cause) { if (causeCode(cause) !== "EEXIST") throw cause; }
+    }
+    let directoryFd: number;
+    try {
+      directoryFd = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (cause) {
+      if (!forWrite && causeCode(cause) === "ENOENT") return undefined;
+      if (causeCode(cause) === "ELOOP") throw new Error("PROJECT_CONFIG_SYMLINK: .aer must not be a symbolic link");
+      throw cause;
+    }
+    try {
+      const anchoredDirectory = `/proc/self/fd/${directoryFd}`;
+      assertWithinRoot(physicalRoot, realpathSync(anchoredDirectory));
+      return action(anchoredDirectory, physicalRoot);
+    } finally {
+      closeSync(directoryFd);
+    }
+  } finally {
+    closeSync(rootFd);
+  }
+}
+
+function readOpenedFile(file: number): Uint8Array {
+  const initial = fstatSync(file);
+  if (!initial.isFile()) throw new Error("PROJECT_CONFIG_INVALID: .aer/project.json must be a regular file");
+  const bytes = new Uint8Array(initial.size);
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const count = readSync(file, bytes, offset, bytes.byteLength - offset, offset);
+    if (count === 0) throw new Error("PROJECT_CONFIG_READ_RACE: .aer/project.json changed while being read");
+    offset += count;
+  }
+  const final = fstatSync(file);
+  if (final.size !== initial.size || final.dev !== initial.dev || final.ino !== initial.ino) {
+    throw new Error("PROJECT_CONFIG_READ_RACE: .aer/project.json changed while being read");
+  }
+  return bytes;
 }
 
 function nonEmptyString(value: unknown, field: string): string | undefined {
@@ -137,15 +183,30 @@ export function parseProjectConfig(value: unknown): ProjectConfig {
 }
 
 export function readProjectConfig(rootDir: string): ProjectConfig | undefined {
-  const path = confinedConfigPath(rootDir, false);
-  if (!existsSync(path)) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(new TextDecoder().decode(readFileSync(path))) as unknown;
-  } catch (cause) {
-    throw new Error(`Could not read ${path}: ${cause instanceof Error ? cause.message : "invalid JSON"}`);
-  }
-  return parseProjectConfig(parsed);
+  return withConfinedConfigDirectory(rootDir, false, (directory, physicalRoot) => {
+    const path = join(directory, PROJECT_CONFIG_FILENAME);
+    let file: number;
+    try {
+      file = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (cause) {
+      if (causeCode(cause) === "ENOENT") return undefined;
+      if (causeCode(cause) === "ELOOP") throw new Error("PROJECT_CONFIG_SYMLINK: .aer/project.json must not be a symbolic link");
+      throw cause;
+    }
+    try {
+      assertWithinRoot(physicalRoot, realpathSync(`/proc/self/fd/${file}`));
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(new TextDecoder().decode(readOpenedFile(file))) as unknown;
+      } catch (cause) {
+        if (cause instanceof Error && cause.message.startsWith("PROJECT_")) throw cause;
+        throw new Error(`Could not read ${projectConfigPath(rootDir)}: ${cause instanceof Error ? cause.message : "invalid JSON"}`);
+      }
+      return parseProjectConfig(parsed);
+    } finally {
+      closeSync(file);
+    }
+  });
 }
 
 /** Write only project configuration; mutable task/run state never enters this file. */
@@ -155,9 +216,21 @@ export function createProjectConfig(input: ProjectConfigInput = {}): ProjectConf
 
 export function writeProjectConfig(rootDir: string, config: ProjectConfigInput): string {
   const normalized = createProjectConfig(config);
-  const path = confinedConfigPath(rootDir, true);
-  writeFileSync(path, `${JSON.stringify(normalized, null, 2)}\n`);
-  return path;
+  const lexicalPath = projectConfigPath(rootDir);
+  withConfinedConfigDirectory(rootDir, true, (directory) => {
+    const destination = join(directory, PROJECT_CONFIG_FILENAME);
+    let destinationStat: ReturnType<typeof lstatSync> | undefined;
+    try { destinationStat = lstatSync(destination); } catch (cause) { if (causeCode(cause) !== "ENOENT") throw cause; }
+    if (destinationStat?.isSymbolicLink() === true) throw new Error("PROJECT_CONFIG_SYMLINK: .aer/project.json must not be a symbolic link");
+    const temporary = join(directory, `.project.json.tmp-${pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      writeFileSync(temporary, `${JSON.stringify(normalized, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+      renameSync(temporary, destination);
+    } finally {
+      if (existsSync(temporary)) unlinkSync(temporary);
+    }
+  });
+  return lexicalPath;
 }
 
 export function configuredVerificationCommands(config: ProjectConfig): readonly ConfiguredVerification[] {

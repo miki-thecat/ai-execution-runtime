@@ -10,7 +10,7 @@ import { Tracer } from "../observability/index.ts";
 import { sanitizeDurableText } from "../observability/redaction.ts";
 import type { StateEntity, StateStore } from "../state/store.ts";
 import { ProjectRegistry } from "../project/registry.ts";
-import type { NormalizedVerificationCheck, VerificationExecutionPosture, VerificationPlanProvenance } from "../project/trust.ts";
+import { copyTrustedVerificationPlan, verificationPlanDigest, type NormalizedVerificationCheck, type VerificationExecutionPosture, type VerificationPlanProvenance } from "../project/trust.ts";
 import { ensureTracerEventsPersisted } from "../project/events.ts";
 import type { ProjectIdentity, ProjectOperationInput, ProjectRef } from "../project/types.ts";
 
@@ -133,17 +133,20 @@ function processEvidence(check: NormalizedVerificationCheck, result: ProcessResu
 }
 
 const CREDENTIAL_KEY = /(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|API[_-]?KEY|ACCESS[_-]?KEY|AUTH(?:ORIZATION)?)/i;
-const PROVIDER_KEY = /^(?:GH|GITHUB|AWS|AZURE|GOOGLE|GCP|CLOUDFLARE|OPENAI|ANTHROPIC|LINEAR|JIRA|SLACK|STRIPE|SENTRY|DATADOG)_/i;
+const PROVIDER_KEY = /^(?:GH|GITHUB|AWS|AZURE|GOOGLE|GCP|CLOUDFLARE|OPENAI|ANTHROPIC|LINEAR|JIRA|SLACK|STRIPE|SENTRY|DATADOG|DOCKER|KUBE|NPM|PYPI|TWILIO|HUGGINGFACE|HF)_/i;
+const CREDENTIAL_FILE_KEY = /^(?:KUBECONFIG|NETRC|PGPASSFILE|GIT_ASKPASS|SSH_ASKPASS|NPM_CONFIG_USERCONFIG|DOCKER_CONFIG|AWS_SHARED_CREDENTIALS_FILE|GOOGLE_APPLICATION_CREDENTIALS|AZURE_CONFIG_DIR|TF_CLI_CONFIG_FILE)$/i;
+const CREDENTIAL_URL_KEY = /^(?:(?:DATABASE|DB|POSTGRES(?:QL)?|MYSQL|MARIADB|MONGO(?:DB)?|REDIS|AMQP|BROKER|ELASTIC(?:SEARCH)?)_URL|(?:DATABASE|DB)_URI)$/i;
+const ORDINARY_ENVIRONMENT_KEY = /^(?:PATH|HOME|USER|LOGNAME|SHELL|HOSTNAME|TMPDIR|TMP|TEMP|LANG|LANGUAGE|LC_[A-Z0-9_]+|TZ|TERM|COLORTERM|NO_COLOR|FORCE_COLOR|CI|CONTINUOUS_INTEGRATION|AER_[A-Z0-9_]+)$/i;
+
+function isCredentialEnvironmentKey(key: string): boolean {
+  return CREDENTIAL_KEY.test(key) || PROVIDER_KEY.test(key) || CREDENTIAL_FILE_KEY.test(key) || CREDENTIAL_URL_KEY.test(key) || key === "SSH_AUTH_SOCK";
+}
 
 function sanitizedEnvironment(exceptions: readonly string[]): { readonly env: Readonly<Record<string, string | undefined>>; readonly allowed: readonly string[] } {
   const exceptionSet = new Set(exceptions);
   const env: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(parentEnvironment)) {
-    const sensitive = CREDENTIAL_KEY.test(key) || PROVIDER_KEY.test(key) || key === "SSH_AUTH_SOCK";
-    if (!sensitive) env[key] = value;
-    else if (exceptionSet.has(key)) {
-      env[key] = value;
-    }
+    if (exceptionSet.has(key) || (ORDINARY_ENVIRONMENT_KEY.test(key) && !isCredentialEnvironmentKey(key))) env[key] = value;
   }
   return { env, allowed: [...exceptionSet].sort() };
 }
@@ -235,9 +238,13 @@ export class VerificationRunner {
       if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
       if (project.boundary.root.status !== "trusted") throw createRuntimeError({ code: project.boundary.root.code ?? "PROJECT_ROOT_DRIFT", message: "Registered project root provenance is not trusted", retryable: false, effect: "none" });
       if (project.boundary.identity.status !== "trusted") throw createRuntimeError({ code: project.boundary.identity.code ?? "PROJECT_IDENTITY_DRIFT", message: "Repository project identity does not match the durable registry", retryable: false, effect: "none" });
-      const trustedPlan = project.trustedVerificationPlan;
-      if (trustedPlan === undefined) throw createRuntimeError({ code: "TRUSTED_VERIFICATION_PLAN_MISSING", message: "No trusted verification plan is registered", retryable: false, effect: "none" });
+      const registeredPlan = project.trustedVerificationPlan;
+      if (registeredPlan === undefined) throw createRuntimeError({ code: "TRUSTED_VERIFICATION_PLAN_MISSING", message: "No trusted verification plan is registered", retryable: false, effect: "none" });
       if (project.boundary.verificationPlan.status !== "trusted") throw createRuntimeError({ code: project.boundary.verificationPlan.code ?? "VERIFICATION_PLAN_DRIFT", message: "Repository verification plan differs from the trusted plan; explicitly trust the update before execution", retryable: false, effect: "none" });
+      const trustedPlan = copyTrustedVerificationPlan(registeredPlan);
+      if (verificationPlanDigest(trustedPlan.plan) !== trustedPlan.digest) {
+        throw createRuntimeError({ code: "TRUSTED_VERIFICATION_PLAN_INVALID", message: "Trusted verification plan content does not match its durable digest", retryable: false, effect: "none" });
+      }
       const configured = trustedPlan.plan.checks;
       if (configured.length === 0) throw createRuntimeError({ code: "VERIFY_NOT_CONFIGURED", message: "No verification commands are configured", retryable: false, effect: "none" });
       const checks = configured.filter((check) => options.checkNames === undefined || options.checkNames.includes(check.name));

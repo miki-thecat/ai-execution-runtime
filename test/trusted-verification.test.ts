@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -29,8 +29,15 @@ test("trusted verification plan survives reopen, rejects drift before spawn, and
     });
     const originalDigest = project.trustedVerificationPlan?.digest;
     assert.ok(originalDigest);
+    const exposedCheck = project.trustedVerificationPlan?.plan.checks[0] as { args: string[] };
+    exposedCheck.args[1] = "process.stdout.write('caller-mutated')";
     const initialRunner = new VerificationRunner({ state, registry, artifacts: new FileArtifactStore(join(runtimeRoot, "artifacts")) });
-    assert.equal((await initialRunner.run(project.projectId)).ok, true);
+    const initial = await initialRunner.run(project.projectId);
+    assert.equal(initial.ok, true);
+    if (initial.ok) {
+      assert.equal(initial.data.checks[0]?.stdout, "safe");
+      assert.equal(initial.data.trustedPlanDigest, originalDigest);
+    }
     assert.equal(initialRunner.hasCanonicalFullPass(project.projectId), true);
     state.close();
 
@@ -94,6 +101,7 @@ test("canonical identity, confined config and physical root block fabricated or 
   const root = join(base, "project");
   const moved = join(base, "registered-project-moved");
   const outsideConfig = join(base, "outside-project.json");
+  const outsideDirectory = join(base, "outside-aer");
   const runtimeRoot = join(base, "runtime");
   mkdirSync(root);
   mkdirSync(runtimeRoot);
@@ -127,8 +135,19 @@ test("canonical identity, confined config and physical root block fabricated or 
     const configSymlink = registry.require(project.projectId);
     assert.equal(configSymlink.boundary.identity.code, "PROJECT_CONFIG_SYMLINK");
     assert.equal((await runner.run(project.projectId)).ok, false);
+    assert.throws(() => writeProjectConfig(root, { id: project.projectId, verify: project.config.verify }), /PROJECT_CONFIG_SYMLINK/);
+    assert.equal(JSON.parse(readFileSync(outsideConfig, "utf8")).id, project.projectId);
 
     rmSync(projectConfigPath(root));
+    rmSync(join(root, ".aer"), { recursive: true });
+    mkdirSync(outsideDirectory);
+    writeFileSync(join(outsideDirectory, "project.json"), "outside-parent-sentinel\n");
+    symlinkSync(outsideDirectory, join(root, ".aer"));
+    assert.equal(registry.require(project.projectId).boundary.identity.code, "PROJECT_CONFIG_SYMLINK");
+    assert.throws(() => writeProjectConfig(root, { id: project.projectId, verify: project.config.verify }), /PROJECT_CONFIG_SYMLINK/);
+    assert.equal(readFileSync(join(outsideDirectory, "project.json"), "utf8"), "outside-parent-sentinel\n");
+
+    rmSync(join(root, ".aer"));
     writeProjectConfig(root, { id: project.projectId, verify: project.config.verify });
     renameSync(root, moved);
     mkdirSync(root);
@@ -159,19 +178,25 @@ test("verification sanitizes credentials and distinguishes partial success from 
   const state = new SqliteStateStore(dbPath);
   const priorSecret = process.env.GH_TOKEN;
   const priorOrdinary = process.env.AER_REQUIRED_ORDINARY;
+  const priorDatabaseUrl = process.env.DATABASE_URL;
+  const priorKubeconfig = process.env.KUBECONFIG;
+  const priorNpmUserconfig = process.env.NPM_CONFIG_USERCONFIG;
   process.env.GH_TOKEN = "secret-sentinel";
   process.env.AER_REQUIRED_ORDINARY = "ordinary-value";
+  process.env.DATABASE_URL = "database-secret-sentinel";
+  process.env.KUBECONFIG = "kube-secret-sentinel";
+  process.env.NPM_CONFIG_USERCONFIG = "npm-secret-sentinel";
   try {
     const registry = new ProjectRegistry({ state });
     const project = registry.register({ rootDir: root, verify: [
-      { name: "environment", executable: process.execPath, args: ["-e", "process.stdout.write(`${process.env.GH_TOKEN ?? 'absent'}|${process.env.AER_REQUIRED_ORDINARY ?? 'missing'}`)"] },
+      { name: "environment", executable: process.execPath, args: ["-e", "process.stdout.write(`${process.env.GH_TOKEN ?? 'absent'}|${process.env.DATABASE_URL ?? 'absent'}|${process.env.KUBECONFIG ?? 'absent'}|${process.env.NPM_CONFIG_USERCONFIG ?? 'absent'}|${process.env.AER_REQUIRED_ORDINARY ?? 'missing'}`)"] },
       { name: "second", executable: process.execPath, args: ["-e", "process.stdout.write('second')"] },
     ] });
     const runner = new VerificationRunner({ state, registry, artifacts: new FileArtifactStore(join(runtimeRoot, "artifacts")) });
     const partial = await runner.run({ project: project.projectId, checkNames: ["environment"] });
     assert.equal(partial.ok, true);
     if (!partial.ok) return;
-    assert.equal(partial.data.checks[0]?.stdout, "absent|ordinary-value");
+    assert.equal(partial.data.checks[0]?.stdout, "absent|absent|absent|absent|ordinary-value");
     assert.equal(partial.data.coverage, "partial");
     assert.equal(partial.data.checksPassed, true);
     assert.equal(partial.data.passed, false);
@@ -188,7 +213,7 @@ test("verification sanitizes credentials and distinguishes partial success from 
     const excepted = await exceptionRunner.run({ project: project.projectId, checkNames: ["environment"] });
     assert.equal(excepted.ok, true);
     if (excepted.ok) {
-      assert.equal(excepted.data.checks[0]?.stdout, "secret-sentinel|ordinary-value");
+      assert.equal(excepted.data.checks[0]?.stdout, "secret-sentinel|absent|absent|absent|ordinary-value");
       assert.deepEqual(excepted.data.allowedEnvironmentKeys, ["GH_TOKEN"]);
       assert.equal(JSON.stringify(state.getEntity("verifications", excepted.data.verificationId)).includes("secret-sentinel"), false);
     }
@@ -207,6 +232,12 @@ test("verification sanitizes credentials and distinguishes partial success from 
     else process.env.GH_TOKEN = priorSecret;
     if (priorOrdinary === undefined) delete process.env.AER_REQUIRED_ORDINARY;
     else process.env.AER_REQUIRED_ORDINARY = priorOrdinary;
+    if (priorDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = priorDatabaseUrl;
+    if (priorKubeconfig === undefined) delete process.env.KUBECONFIG;
+    else process.env.KUBECONFIG = priorKubeconfig;
+    if (priorNpmUserconfig === undefined) delete process.env.NPM_CONFIG_USERCONFIG;
+    else process.env.NPM_CONFIG_USERCONFIG = priorNpmUserconfig;
     state.close();
     rmSync(root, { recursive: true, force: true });
     rmSync(runtimeRoot, { recursive: true, force: true });

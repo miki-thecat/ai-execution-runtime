@@ -40,6 +40,45 @@ export interface TrustedVerificationPlan {
   readonly provenance: VerificationPlanProvenance;
 }
 
+/** Copy a trusted plan at registry boundaries so callers never share its runtime-owned object graph. */
+export function copyTrustedVerificationPlan(trusted: TrustedVerificationPlan): TrustedVerificationPlan {
+  return {
+    digest: trusted.digest,
+    plan: {
+      version: trusted.plan.version,
+      configVersion: trusted.plan.configVersion,
+      checks: trusted.plan.checks.map((check) => ({
+        checkId: check.checkId,
+        name: check.name,
+        kind: check.kind,
+        ...(check.command === undefined ? {} : { command: check.command }),
+        ...(check.executable === undefined ? {} : { executable: check.executable }),
+        args: [...check.args],
+        ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }),
+        ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }),
+      })),
+    },
+    provenance: {
+      source: trusted.provenance.source,
+      trustedAt: trusted.provenance.trustedAt,
+      ...(trusted.provenance.previousDigest === undefined ? {} : { previousDigest: trusted.provenance.previousDigest }),
+    },
+  };
+}
+
+/** Retain an immutable private snapshot inside the canonical registry. */
+export function freezeTrustedVerificationPlan(trusted: TrustedVerificationPlan): TrustedVerificationPlan {
+  const snapshot = copyTrustedVerificationPlan(trusted);
+  for (const check of snapshot.plan.checks) {
+    Object.freeze(check.args);
+    Object.freeze(check);
+  }
+  Object.freeze(snapshot.plan.checks);
+  Object.freeze(snapshot.plan);
+  Object.freeze(snapshot.provenance);
+  return Object.freeze(snapshot);
+}
+
 export interface ProjectBoundaryState {
   readonly identity: {
     readonly status: TrustStatus;
