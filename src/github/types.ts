@@ -112,9 +112,10 @@ export interface GitHubIssue {
 
 export interface GitHubIssueDependencies {
   readonly issue: number;
+  /** Dependency links whose Issues are not known to be closed. */
   readonly blockedBy: readonly number[];
   readonly blocking: readonly number[];
-  /** Present when one or more native dependency endpoint reads failed. */
+  /** Present when one or more native dependency reads are incomplete or failed. */
   readonly state?: "unknown";
 }
 
