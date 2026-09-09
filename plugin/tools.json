@@ -1,0 +1,16 @@
+{
+  "schema_version": "v1",
+  "server": "aer",
+  "tools": [
+    { "name": "project.inspect", "input": { "projectId": "string?", "project": "string?", "budgets": "bounded?" } },
+    { "name": "project.resume", "input": { "projectId": "string?", "project": "string?", "eventLimit": "positive integer?", "itemLimit": "positive integer?" } },
+    { "name": "file.read", "input": { "projectId": "string?", "path": "string", "maxBytes": "positive integer?" } },
+    { "name": "shell.run", "input": { "projectId": "string?", "command": "string", "timeoutMs": "positive integer?", "maxOutputBytes": "positive integer?" } },
+    { "name": "verify.run", "input": { "projectId": "string?", "checkNames": "string[]?" } },
+    { "name": "github.snapshot", "input": { "projectId": "string?", "issueNumber": "positive integer?", "includeWork": "boolean?" } },
+    { "name": "github.wait", "input": { "projectId": "string?", "pullRequest": "positive integer|string", "condition": "checks_terminal|checks_passed?" } },
+    { "name": "agent.run", "input": { "projectId": "string?", "title": "string?", "prompt": "string?" } },
+    { "name": "device.list", "input": { "budgets": "bounded?" } },
+    { "name": "run.inspect", "input": { "runId": "string" } }
+  ]
+}
