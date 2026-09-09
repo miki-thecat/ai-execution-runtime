@@ -40,7 +40,15 @@ jobs:
         run: pnpm run --if-present typecheck
       - name: Lint
         if: ${{ hashFiles('package.json') != '' }}
-        run: pnpm run --if-present lint
+        shell: bash
+        run: |
+          typecheck=$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).scripts?.typecheck ?? ''")
+          lint=$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).scripts?.lint ?? ''")
+          if [[ -n "$lint" && "$lint" != "$typecheck" ]]; then
+            pnpm run lint
+          else
+            echo "Skipping duplicate or absent lint script"
+          fi
       - name: Test
         if: ${{ hashFiles('package.json') != '' }}
         run: pnpm run --if-present test
