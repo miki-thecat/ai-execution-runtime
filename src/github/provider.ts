@@ -752,7 +752,16 @@ export class GitHubProvider {
       if (branch === undefined || localHead === undefined) {
         throw createRuntimeError({ code: "GITHUB_LOCAL_HEAD_UNAVAILABLE", message: "A named local branch and HEAD are required to publish", retryable: false, effect: "none" });
       }
-      const base = input.base ?? repository.defaultBranch ?? "main";
+      const base = input.base ?? repository.defaultBranch;
+      if (base === undefined) {
+        throw createRuntimeError({
+          code: "GITHUB_DEFAULT_BRANCH_UNAVAILABLE",
+          message: "A verified repository default branch or an explicit pull request base is required to publish",
+          retryable: false,
+          effect: "none",
+          details: { repository: repository.nameWithOwner },
+        });
+      }
       let remoteHead = await this.remoteHead(remote, branch, cwd, operationContext, metrics);
       let pushed = false;
       let reconciled = false;
@@ -1279,7 +1288,10 @@ export class GitHubProvider {
     // compatibility retry when the installed CLI rejects that filter.
     let structured = await this.jsonCommand(["pr", "list", "--head", head, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
     if (structured === undefined) {
-      structured = await this.jsonCommand(["pr", "list", "--head", branch, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+      // The bare-branch compatibility query can include PRs opened from a
+      // same-named fork. Keep the repository identity in the response so the
+      // fallback can reject those candidates safely.
+      structured = await this.jsonCommand(["pr", "list", "--head", branch, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
     }
     if (structured !== undefined) {
       const value = selectPullRequest(parsePullRequests(structured.value), branch, repository);
@@ -1301,7 +1313,7 @@ export class GitHubProvider {
     }
     let raw = await this.rawJson(["pr", "list", "--head", head, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
     if (raw === undefined) {
-      raw = await this.rawJson(["pr", "list", "--head", branch, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+      raw = await this.rawJson(["pr", "list", "--head", branch, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
     }
     if (raw !== undefined) {
       const value = selectPullRequest(parsePullRequests(raw.value), branch, repository);
@@ -1339,7 +1351,9 @@ function headBelongsToRepository(pullRequest: GitHubPullRequest, repository: Git
   if (pullRequest.headRepositoryNameWithOwner !== undefined) {
     return pullRequest.headRepositoryNameWithOwner.toLowerCase() === repository.nameWithOwner.toLowerCase();
   }
-  return pullRequest.headRepositoryOwner === undefined || pullRequest.headRepositoryOwner.toLowerCase() === repository.owner.toLowerCase();
+  // An owner-only or absent identity cannot distinguish this repository from
+  // another repository/fork with the same branch name.
+  return false;
 }
 
 function parsePullRequestNumber(value: number | string | undefined): number | undefined {

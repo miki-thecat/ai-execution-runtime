@@ -71,6 +71,7 @@ const repo = {
   defaultBranchRef: { name: "main" },
   owner: { login: "miki-thecat" },
 };
+const prLookupFields = "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews,headRepositoryOwner,headRepository";
 
 test("github capabilities report gh, authentication, and current repository", async () => {
   const runner = new FixtureRunner()
@@ -163,7 +164,7 @@ test("github.publish reuses an already reconciled PR without pushing or creating
     .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: "feature/semantic\n", stderr: "", exitCode: 0 })
     .when(["rev-parse", "HEAD"], { stdout: "abc123\n", stderr: "", exitCode: 0 })
     .when(["ls-remote", "--heads", "origin", "refs/heads/feature/semantic"], { stdout: "abc123\trefs/heads/feature/semantic\n", stderr: "", exitCode: 0 })
-    .when(["pr", "list", "--head", "feature/semantic", "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json([{ number: 7, title: "semantic layer", state: "OPEN", headRefName: "feature/semantic", headRefOid: "abc123", baseRefName: "main" }]))
+    .when(["pr", "list", "--head", "feature/semantic", "--state", "all", "--json", prLookupFields], json([{ number: 7, title: "semantic layer", state: "OPEN", headRefName: "feature/semantic", headRefOid: "abc123", headRepository: { nameWithOwner: "miki-thecat/runtime" }, baseRefName: "main" }]))
     .when(["pr", "view", "7", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 7, title: "semantic layer", state: "OPEN", headRefName: "feature/semantic", headRefOid: "abc123", baseRefName: "main" }));
   const provider = new GitHubProvider({ runner });
   const result = await provider.publish({ title: "ignored on reuse" });
@@ -184,7 +185,7 @@ test("github.publish creates through the API only after confirming no PR exists"
     .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: "feature/new\n", stderr: "", exitCode: 0 })
     .when(["rev-parse", "HEAD"], { stdout: "fedcba\n", stderr: "", exitCode: 0 })
     .when(["ls-remote", "--heads", "origin", "refs/heads/feature/new"], { stdout: "fedcba\trefs/heads/feature/new\n", stderr: "", exitCode: 0 })
-    .when(["pr", "list", "--head", "feature/new", "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json([]))
+    .when(["pr", "list", "--head", "feature/new", "--state", "all", "--json", prLookupFields], json([]))
     .when(["api", "repos/miki-thecat/runtime/pulls", "--method", "POST", "--raw-field", "title=new PR", "--raw-field", "head=feature/new", "--raw-field", "base=main", "--raw-field", "body=body"], json({ number: 11, title: "new PR", state: "OPEN", head: { ref: "feature/new", sha: "fedcba" }, base: { ref: "main" } }))
     .when(["pr", "view", "11", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 11, title: "new PR", state: "OPEN", headRefName: "feature/new", headRefOid: "fedcba", baseRefName: "main" }));
   const provider = new GitHubProvider({ runner });
@@ -242,7 +243,7 @@ test("github.publish reconciles an ambiguous push before reusing a PR", async ()
       { stdout: "def456\trefs/heads/feature/ambiguous\n", stderr: "", exitCode: 0 },
     ])
     .when(["push", "origin", "HEAD:refs/heads/feature/ambiguous"], { stdout: "", stderr: "transport closed", exitCode: 1 })
-    .when(["pr", "list", "--head", "feature/ambiguous", "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json([{ number: 9, state: "OPEN", headRefName: "feature/ambiguous", headRefOid: "def456", baseRefName: "main" }]))
+    .when(["pr", "list", "--head", "feature/ambiguous", "--state", "all", "--json", prLookupFields], json([{ number: 9, state: "OPEN", headRefName: "feature/ambiguous", headRefOid: "def456", headRepository: { nameWithOwner: "miki-thecat/runtime" }, baseRefName: "main" }]))
     .when(["pr", "view", "9", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 9, state: "OPEN", headRefName: "feature/ambiguous", headRefOid: "def456", baseRefName: "main" }));
   const provider = new GitHubProvider({ runner });
   const result = await provider.publish({ title: "ambiguous" });
@@ -305,9 +306,10 @@ test("github.publish never retries an ambiguous API create with raw gh create", 
     state: "OPEN",
     headRefName: branch,
     headRefOid: "fed123",
+    head: { repo: { full_name: "miki-thecat/runtime" } },
     baseRefName: "main",
   };
-  const listArgs = ["pr", "list", "--head", branch, "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"];
+  const listArgs = ["pr", "list", "--head", branch, "--state", "all", "--json", prLookupFields];
   const freshArgs = ["pr", "view", "12", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"];
   const runner = new FixtureRunner()
     .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
@@ -332,13 +334,13 @@ test("github.publish never retries an ambiguous API create with raw gh create", 
 
 test("github.publish does not return a stale PR when the required fresh read fails", async () => {
   const branch = "feature/stale-pr";
-  const listArgs = ["pr", "list", "--head", branch, "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"];
+  const listArgs = ["pr", "list", "--head", branch, "--state", "all", "--json", prLookupFields];
   const runner = new FixtureRunner()
     .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
     .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
     .when(["rev-parse", "HEAD"], { stdout: "stale123\n", stderr: "", exitCode: 0 })
     .when(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], { stdout: "stale123\trefs/heads/" + branch + "\n", stderr: "", exitCode: 0 })
-    .when(listArgs, json([{ number: 13, state: "OPEN", headRefName: branch, headRefOid: "stale123", baseRefName: "main" }]));
+    .when(listArgs, json([{ number: 13, state: "OPEN", headRefName: branch, headRefOid: "stale123", headRepository: { nameWithOwner: "miki-thecat/runtime" }, baseRefName: "main" }]));
   const provider = new GitHubProvider({ runner });
 
   const result = await provider.publish({ branch, title: "stale" });
@@ -396,7 +398,7 @@ test("github.publish preserves a REST repository default branch", async () => {
     .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
     .when(["rev-parse", "HEAD"], { stdout: "rest123\n", stderr: "", exitCode: 0 })
     .when(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], { stdout: "rest123\trefs/heads/" + branch + "\n", stderr: "", exitCode: 0 })
-    .when(["pr", "list", "--head", branch, "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json([]))
+    .when(["pr", "list", "--head", branch, "--state", "all", "--json", prLookupFields], json([]))
     .when(["api", "repos/miki-thecat/runtime/pulls", "--method", "POST", "--raw-field", "title=REST branch", "--raw-field", `head=${branch}`, "--raw-field", "base=develop", "--raw-field", "body="], json({ number: 21, title: "REST branch", state: "OPEN", head: { ref: branch, sha: "rest123" }, base: { ref: "develop" } }))
     .when(["pr", "view", "21", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 21, title: "REST branch", state: "OPEN", headRefName: branch, headRefOid: "rest123", baseRefName: "develop" }));
   const provider = new GitHubProvider({ runner });
@@ -408,6 +410,51 @@ test("github.publish preserves a REST repository default branch", async () => {
   assert.equal(result.data.repository.defaultBranch, "develop");
   assert.equal(result.data.pullRequest.baseRefName, "develop");
   assert.equal(runner.executableCalls.some((args) => args.includes("base=develop")), true);
+});
+
+test("github.publish does not reuse an identity-free PR from the bare-branch fallback", async () => {
+  const branch = "feature/unverified-head";
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "unverified123\n", stderr: "", exitCode: 0 })
+    .when(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], { stdout: "unverified123\trefs/heads/" + branch + "\n", stderr: "", exitCode: 0 })
+    // The owner-qualified query is intentionally unavailable, exercising the
+    // compatibility retry. Its bare-branch result has no source identity.
+    .when(["pr", "list", "--head", branch, "--state", "all", "--json", prLookupFields], json([{ number: 41, state: "OPEN", headRefName: branch, headRefOid: "unverified123", baseRefName: "main" }]))
+    .when(["api", "repos/miki-thecat/runtime/pulls", "--method", "POST", "--raw-field", "title=local PR", "--raw-field", `head=${branch}`, "--raw-field", "base=main", "--raw-field", "body="], json({ number: 42, title: "local PR", state: "OPEN", head: { ref: branch, sha: "unverified123" }, base: { ref: "main" } }))
+    .when(["pr", "view", "42", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 42, title: "local PR", state: "OPEN", headRefName: branch, headRefOid: "unverified123", baseRefName: "main" }));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.publish({ branch, title: "local PR" });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.created, true);
+  assert.equal(result.data.pullRequest.number, 42);
+  assert.equal(runner.executableCalls.some((args) => args[0] === "gh" && args[1] === "api" && args[2] === "repos/miki-thecat/runtime/pulls"), true);
+});
+
+test("github.publish requires an explicit base when the repository default is unverified", async () => {
+  const repositoryWithoutDefault = {
+    name: "runtime",
+    nameWithOwner: "miki-thecat/runtime",
+    url: "https://github.com/miki-thecat/runtime",
+    owner: { login: "miki-thecat" },
+  };
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repositoryWithoutDefault))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: "feature/no-default\n", stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "no-default123\n", stderr: "", exitCode: 0 });
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.publish({ branch: "feature/no-default", title: "must not guess base" });
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, "GITHUB_DEFAULT_BRANCH_UNAVAILABLE");
+  assert.equal(runner.executableCalls.some((args) => args[0] === "git" && args[1] === "ls-remote"), false);
+  assert.equal(runner.executableCalls.some((args) => args[0] === "git" && args[1] === "push"), false);
 });
 
 test("github.work marks incomplete native dependency reads as unknown", async () => {
