@@ -98,6 +98,8 @@ interface RateLimitInfo {
   readonly retryAfterMs?: number;
   readonly resetAtMs?: number;
   readonly secondary: boolean;
+  /** A reset hint is retryable for a secondary limit only when primary quota is exhausted. */
+  readonly primaryExhausted: boolean;
 }
 
 function boundPaginatedAttempt(attempt: Attempt<unknown>, collectionKey: string): Attempt<unknown> {
@@ -324,7 +326,7 @@ function rateLimitInfo(result: GitHubCommandResult, nowMs = Date.now()): RateLim
   const exhausted = remaining === 0 && !successful;
   const looksLimited = status === 429 || rateMessage || secondary || exhausted || (status === 403 && (retryAfterMs !== undefined || resetAtMs !== undefined));
   if (!looksLimited) return undefined;
-  let info: RateLimitInfo = { secondary };
+  let info: RateLimitInfo = { secondary, primaryExhausted: remaining === 0 };
   if (typeof status === "number" && Number.isSafeInteger(status)) info = { ...info, status };
   if (retryAfterMs !== undefined) info = { ...info, retryAfterMs };
   if (resetAtMs !== undefined) info = { ...info, resetAtMs };
@@ -377,6 +379,14 @@ function rateLimitError(info: RateLimitInfo, attempts: number): RuntimeError {
 
 function rateLimitDelay(info: RateLimitInfo, retryNumber: number, nowMs: number): number | undefined {
   const exponential = BASE_RATE_LIMIT_BACKOFF_MS * (2 ** retryNumber);
+  // GitHub's secondary-limit guidance requires at least one minute when no
+  // Retry-After is supplied, unless the primary limit is exhausted and its
+  // reset time is available. This provider caps one sleep at 30 seconds, so
+  // there is no safe retry in the former case. In particular, do not treat a
+  // reset hint from a secondary response with nonzero/unknown remaining as a
+  // reason to retry after the ordinary 1s/2s backoff.
+  if (info.secondary && info.retryAfterMs === undefined &&
+    !(info.primaryExhausted && info.resetAtMs !== undefined)) return undefined;
   const resetDelay = info.resetAtMs === undefined ? 0 : Math.max(0, info.resetAtMs - nowMs);
   const requestedDelay = Math.max(exponential, info.retryAfterMs ?? 0, resetDelay);
   // Do not retry while an unreasonably long server hint is active. Returning

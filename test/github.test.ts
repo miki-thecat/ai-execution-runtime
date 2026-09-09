@@ -759,3 +759,28 @@ test("github rate-limit hints beyond the bound terminate without an early duplic
   assert.equal(runner.shellCalls.length, 0);
   assert.equal(result.meta.metrics.retries, 0);
 });
+
+test("github secondary rate limits without a retry floor hint terminate without retry or shell duplication", async () => {
+  const nowMs = Date.now();
+  const delays: number[] = [];
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], {
+      stdout: "",
+      stderr: "HTTP 403: secondary rate limit\n",
+      exitCode: 1,
+      httpStatus: 403,
+      headers: { "x-ratelimit-remaining": "42", "x-ratelimit-reset": String(Math.ceil(nowMs / 1_000) + 2) },
+    });
+  const provider = new GitHubProvider({ runner, clock: () => nowMs, sleep: async (milliseconds) => { delays.push(milliseconds); } });
+
+  const result = await provider.wait({ pullRequest: 7, condition: "checks_passed", intervalMs: 0, timeoutMs: 5_000, maxPolls: 1 });
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, "GITHUB_RATE_LIMITED");
+  assert.deepEqual(delays, []);
+  assert.equal(runner.executableCalls.filter((args) => args[0] === "gh" && args[1] === "pr" && args[2] === "checks").length, 1);
+  assert.equal(runner.shellCalls.length, 0);
+  assert.equal(result.meta.metrics.retries, 0);
+});
