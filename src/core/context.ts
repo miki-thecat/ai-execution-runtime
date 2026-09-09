@@ -1,5 +1,6 @@
 import type { Capabilities } from "./capabilities.ts";
-import { permissiveEffectPolicy, type EffectPolicy } from "./effects.ts";
+import { fullAlphaDefaultPolicy, type EffectPolicy } from "./effects.ts";
+import { resolveRuntimeBudgets, type RuntimeBudgets, type RuntimeBudgetOverrides } from "../policy/budgets.ts";
 import type {
   DeviceId,
   ProjectId,
@@ -21,6 +22,7 @@ export interface OperationContext {
   readonly deadline?: number;
   readonly signal: AbortSignal;
   readonly effectPolicy: EffectPolicy;
+  readonly budgets: RuntimeBudgets;
   readonly idempotencyKey?: string;
   readonly capabilities: Capabilities;
   /** The span belonging to the current operation, when instrumentation has started. */
@@ -29,14 +31,19 @@ export interface OperationContext {
   readonly parentSpanId?: SpanId;
 }
 
-export interface OperationContextInit extends Omit<OperationContext, "actor" | "signal" | "effectPolicy" | "capabilities"> {
+export interface OperationContextInit extends Omit<OperationContext, "actor" | "signal" | "effectPolicy" | "capabilities" | "budgets" | "deadline"> {
   readonly actor?: Actor;
   readonly signal?: AbortSignal;
   readonly effectPolicy?: EffectPolicy;
   readonly capabilities?: Capabilities;
+  readonly budgets?: RuntimeBudgetOverrides;
+  readonly deadline?: number;
 }
 
 export function createOperationContext(init: OperationContextInit): OperationContext {
+  const budgets = resolveRuntimeBudgets(init.budgets);
+  const budgetDeadline = Date.now() + budgets.maxExecutionMs;
+  const deadline = init.deadline === undefined ? budgetDeadline : Math.min(init.deadline, budgetDeadline);
   return {
     traceId: init.traceId,
     runId: init.runId,
@@ -44,9 +51,10 @@ export function createOperationContext(init: OperationContextInit): OperationCon
     ...(init.projectId === undefined ? {} : { projectId: init.projectId }),
     ...(init.deviceId === undefined ? {} : { deviceId: init.deviceId }),
     actor: init.actor ?? "runtime",
-    ...(init.deadline === undefined ? {} : { deadline: init.deadline }),
+    deadline,
     signal: init.signal ?? new AbortController().signal,
-    effectPolicy: init.effectPolicy ?? permissiveEffectPolicy(),
+    effectPolicy: init.effectPolicy ?? fullAlphaDefaultPolicy(),
+    budgets,
     ...(init.idempotencyKey === undefined ? {} : { idempotencyKey: init.idempotencyKey }),
     capabilities: init.capabilities ?? {},
     ...(init.spanId === undefined ? {} : { spanId: init.spanId }),

@@ -1,4 +1,8 @@
 export * from "./core/index.ts";
+export * from "./policy/budgets.ts";
+export { EffectPolicyEngine, evaluatePolicy } from "./policy/policy.ts";
+export { buildChildEnvironment, credentialClassifiers, SAFE_BASELINE_ENVIRONMENT_KEYS } from "./policy/environment.ts";
+export * from "./sandbox/index.ts";
 export * from "./observability/index.ts";
 export * from "./operations/index.ts";
 export * from "./state/index.ts";

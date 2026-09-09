@@ -8,12 +8,13 @@ import type {
   TaskId,
   TraceId,
 } from "../core/ids.ts";
-import type { EffectClass, EffectState } from "../core/effects.ts";
+import type { EffectClass, EffectState, PolicyDecision, PolicyDecisionEvidence } from "../core/effects.ts";
 import {
   createEventId,
   type OperationId,
 } from "../core/ids.ts";
 import type { Actor } from "../core/context.ts";
+import type { EnvironmentEvidence } from "../policy/environment.ts";
 import {
   emptyOperationMeasurements,
   type OperationMeasurements,
@@ -102,6 +103,9 @@ export interface RuntimeEvent {
   readonly compressionRatio: number;
   readonly effectClass?: EffectClass;
   readonly effectState?: EffectState;
+  readonly policyDecision?: PolicyDecision;
+  readonly policyEvidence?: PolicyDecisionEvidence;
+  readonly environment?: EnvironmentEvidence;
   readonly idempotencyKey?: string;
   readonly changesetId?: string;
   readonly verificationId?: string;
@@ -133,6 +137,9 @@ export interface RuntimeEventInput {
   readonly measurements?: Partial<OperationMeasurements>;
   readonly effectClass?: EffectClass;
   readonly effectState?: EffectState;
+  readonly policyDecision?: PolicyDecision;
+  readonly policyEvidence?: PolicyDecisionEvidence;
+  readonly environment?: EnvironmentEvidence;
   readonly idempotencyKey?: string;
   readonly changesetId?: string;
   readonly verificationId?: string;
@@ -185,6 +192,9 @@ export function createRuntimeEvent(input: RuntimeEventInput): RuntimeEvent {
     compressionRatio: measurements.compressionRatio,
     ...(input.effectClass === undefined ? {} : { effectClass: input.effectClass }),
     ...(input.effectState === undefined ? {} : { effectState: input.effectState }),
+    ...(input.policyDecision === undefined ? {} : { policyDecision: input.policyDecision }),
+    ...(input.policyEvidence === undefined ? {} : { policyEvidence: input.policyEvidence }),
+    ...(input.environment === undefined ? {} : { environment: input.environment }),
     ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
     ...(input.changesetId === undefined ? {} : { changesetId: input.changesetId }),
     ...(input.verificationId === undefined ? {} : { verificationId: input.verificationId }),

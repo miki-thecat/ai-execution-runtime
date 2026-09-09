@@ -1,6 +1,6 @@
 import { FileArtifactStore } from "../artifacts/store.ts";
 import { createOperationContext, isDeadlineExceeded, type OperationContext } from "../core/context.ts";
-import { isEffectAllowed, requiresApproval, type EffectClass } from "../core/effects.ts";
+import { isEffectAllowed, policyDecisionEvidence, requiresApproval, type EffectClass } from "../core/effects.ts";
 import {
   createOperationMeta,
   createRuntimeError,
@@ -42,6 +42,7 @@ function failureMeta(
   artifactRefs: readonly import("../core/ids.ts").ArtifactRef[] = [],
   commandInputBytes = 0,
   effectClass: EffectClass = DIRECT_EFFECT_CLASS,
+  policyEvidence = policyDecisionEvidence(context.effectPolicy, effectClass),
 ) {
   return createOperationMeta({
     context,
@@ -63,6 +64,8 @@ function failureMeta(
       ...(metrics.signal === undefined ? {} : { signal: metrics.signal }),
     },
     truncated: metrics?.truncated ?? false,
+    policyDecision: policyEvidence.decision,
+    policyEvidence,
   });
 }
 
@@ -79,12 +82,15 @@ export class DirectExecutor {
       ...(options.defaultMaxOutputBytes === undefined ? {} : { defaultMaxOutputBytes: options.defaultMaxOutputBytes }),
       ...(options.cancelGraceMs === undefined ? {} : { cancelGraceMs: options.cancelGraceMs }),
       ...(options.reconcileOnStart === undefined ? {} : { reconcileOnStart: options.reconcileOnStart }),
+      ...(options.credentialClassifiers === undefined ? {} : { credentialClassifiers: options.credentialClassifiers }),
     });
   }
 
   startExecutable(command: ExecutableCommand, context: OperationContext, options: Pick<DirectRunOptions, "effectClass"> = {}): ProcessHandle {
     const effectClass = options.effectClass ?? DIRECT_EFFECT_CLASS;
     this.assertAllowed(context, effectClass);
+    const commandBytes = inputBytes({ executable: command.executable, args: command.args ?? [], cwd: command.cwd, env: command.env });
+    if (commandBytes > context.budgets.maxInputBytes) throw createRuntimeError({ code: "PROCESS_INPUT_TOO_LARGE", message: "Direct command input exceeds the runtime budget", retryable: false, effect: "none", details: { inputBytes: commandBytes, maxInputBytes: context.budgets.maxInputBytes } });
     if (context.signal.aborted || isDeadlineExceeded(context)) {
       throw createRuntimeError({
         code: "PROCESS_CANCELLED_BEFORE_START",
@@ -176,6 +182,7 @@ export class DirectExecutor {
     effectClass: EffectClass,
   ): Promise<RuntimeResult<T>> {
     const startedAt = this.tracer.now().toISOString();
+    const policyEvidence = policyDecisionEvidence(context.effectPolicy, effectClass);
     const span = instrument ? this.tracer.startOperation({
       traceId: context.traceId,
       runId: context.runId,
@@ -189,6 +196,8 @@ export class DirectExecutor {
       ...(context.idempotencyKey === undefined ? {} : { idempotencyKey: context.idempotencyKey }),
       executor: "direct",
       provider: "node:child_process",
+      policyDecision: policyEvidence.decision,
+      policyEvidence,
       metadata: { executable: command.executable, argumentCount: command.args?.length ?? 0 },
     }) : undefined;
     const operationContext = span === undefined ? context : createOperationContext({
@@ -197,7 +206,13 @@ export class DirectExecutor {
       ...(context.spanId === undefined ? {} : { parentSpanId: context.spanId }),
     });
     try {
+      if (commandInputBytes > operationContext.budgets.maxInputBytes) {
+        throw createRuntimeError({ code: "PROCESS_INPUT_TOO_LARGE", message: "Direct command input exceeds the runtime budget", retryable: false, effect: "none", details: { inputBytes: commandInputBytes, maxInputBytes: operationContext.budgets.maxInputBytes } });
+      }
       this.assertAllowed(operationContext, effectClass);
+      if (operationContext.signal.aborted || isDeadlineExceeded(operationContext)) {
+        throw createRuntimeError({ code: "PROCESS_CANCELLED_BEFORE_START", message: "The execution context was already cancelled or expired", retryable: false, effect: "none" });
+      }
       const handle = start(operationContext, effectClass);
       const processResult = await handle.wait();
       const result = map(processResult);
@@ -232,6 +247,7 @@ export class DirectExecutor {
           processResult.artifactRefs,
           commandInputBytes,
           effectClass,
+          policyEvidence,
         ));
       }
       if (processResult.status === "unknown") {
@@ -254,6 +270,7 @@ export class DirectExecutor {
           processResult.artifactRefs,
           commandInputBytes,
           effectClass,
+          policyEvidence,
         ));
       }
       if (processResult.status === "failed") {
@@ -276,6 +293,7 @@ export class DirectExecutor {
           processResult.artifactRefs,
           commandInputBytes,
           effectClass,
+          policyEvidence,
         ));
       }
       const event = span?.complete({ artifactRefs: processResult.artifactRefs, effectState: processResult.effectState });
@@ -292,6 +310,8 @@ export class DirectExecutor {
         truncated: processResult.truncated,
         executor: "direct",
         provider: "node:child_process",
+        policyDecision: policyEvidence.decision,
+        policyEvidence,
       }));
     } catch (cause: unknown) {
       const error = cause && typeof cause === "object" && "code" in cause
@@ -315,6 +335,7 @@ export class DirectExecutor {
         [],
         commandInputBytes,
         effectClass,
+        policyEvidence,
       ));
     }
   }

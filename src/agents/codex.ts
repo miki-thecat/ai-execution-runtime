@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { env as parentEnvironment } from "node:process";
 import type { RunId } from "../core/ids.ts";
-import { createSpanId, createRuntimeError, type OperationContext, type RuntimeError } from "../core/index.ts";
-import { effectDecision, type EffectClass, type EffectState } from "../core/effects.ts";
+import { createSpanId, createRuntimeError, isDeadlineExceeded, type OperationContext, type RuntimeError } from "../core/index.ts";
+import { credentialGrant, effectDecision, type EffectClass, type EffectState, type EffectPolicy } from "../core/effects.ts";
 import { FileArtifactStore, type ArtifactStore } from "../artifacts/store.ts";
 import { ensureTracerEventsPersisted } from "../project/events.ts";
 import type { ProjectIdentity } from "../project/types.ts";
@@ -147,7 +147,7 @@ function evidenceEntry(key: string, classifiers: readonly CredentialClassifier[]
   return classification === undefined ? undefined : { key, class: classification };
 }
 
-function environmentFor(options: CodexEnvironmentOptions | undefined): BuiltEnvironment {
+function environmentFor(options: CodexEnvironmentOptions | undefined, policy?: EffectPolicy): BuiltEnvironment {
   const input = options ?? {};
   const classifiers = [...DEFAULT_CREDENTIAL_CLASSIFIERS, ...(input.credentialClassifiers ?? [])];
   const values: Record<string, string | undefined> = {};
@@ -159,12 +159,15 @@ function environmentFor(options: CodexEnvironmentOptions | undefined): BuiltEnvi
     if (value !== undefined && SAFE_ORDINARY_ENVIRONMENT.test(key) && credentialClass(key, classifiers) === undefined) values[key] = value;
   }
   for (const key of [...(input.passThroughKeys ?? []), ...(input.allowedEnvironmentKeys ?? [])]) {
-    if (parent[key] !== undefined) values[key] = parent[key];
+    if (parent[key] !== undefined && (credentialClass(key, classifiers) === undefined || credentialGrant(policy, key, "agent.run") !== undefined)) values[key] = parent[key];
   }
   for (const key of [...(input.providerKeys ?? []), ...(input.providerRequiredKeys ?? [])]) {
-    if (parent[key] !== undefined) values[key] = parent[key];
+    if (parent[key] !== undefined && (credentialClass(key, classifiers) === undefined || credentialGrant(policy, key, "agent.run") !== undefined)) values[key] = parent[key];
   }
-  for (const [key, value] of Object.entries({ ...(input.safeVariables ?? {}), ...(input.variables ?? {}) })) values[key] = value;
+  for (const [key, value] of Object.entries({ ...(input.safeVariables ?? {}), ...(input.variables ?? {}) })) {
+    if (credentialClass(key, classifiers) !== undefined && credentialGrant(policy, key, "agent.run") === undefined) continue;
+    values[key] = value;
+  }
   const providerHome = input.codexHome ?? input.providerHome;
   if (providerHome !== undefined) {
     if (!existsSync(providerHome)) mkdirSync(providerHome, { recursive: true, mode: 0o700 });
@@ -285,14 +288,15 @@ export class CodexAgentExecutor implements AgentExecutor {
     const agentRunId = createAgentRunId();
     const startedAt = this.tracer.now().toISOString();
     let project: ProjectIdentity | undefined;
-    let environment = environmentFor(this.environmentOptions);
+    let environment = environmentFor(this.environmentOptions, context.effectPolicy);
     let posture = capabilityPosture();
     let effectClass: EffectClass = "read";
     let prompt = "";
     try {
       project = this.resolveProject(task, context);
       prompt = inputFor(task);
-      if (byteLength(prompt) > this.maxInputBytes) throw createRuntimeError({ code: "AGENT_INPUT_TOO_LARGE", message: "Agent task input exceeds the configured bound", retryable: false, effect: "none", details: { maxInputBytes: this.maxInputBytes } });
+      const maxInputBytes = Math.min(this.maxInputBytes, context.budgets.maxInputBytes);
+      if (byteLength(prompt) > maxInputBytes) throw createRuntimeError({ code: "AGENT_INPUT_TOO_LARGE", message: "Agent task input exceeds the configured bound", retryable: false, effect: "none", details: { maxInputBytes } });
       if (task.workspace !== undefined && realpathSync(resolve(task.workspace)) !== project.rootDir) throw createRuntimeError({ code: "AGENT_WORKSPACE_NOT_CANONICAL", message: "Agent workspace must be the registered project root", retryable: false, effect: "none" });
       const prepared = await this.prepare(task, context, project, prompt, environment);
       environment = prepared.environment;
@@ -300,7 +304,7 @@ export class CodexAgentExecutor implements AgentExecutor {
       effectClass = prepared.effectClass;
       const queued: AgentRun = { ...this.baseRun(agentRunId, task, context, "failed", "incomplete", "none", startedAt, startedAt, "", "Agent execution was not started", this.emptyMetrics(byteLength(prompt), false), posture, environment.evidence, [], undefined, undefined), capabilitySnapshot: prepared.capabilities };
       this.persistAgent(queued, "queued");
-      if (context.signal.aborted) return this.finishWithoutProcess(queued, "cancelled", createRuntimeError({ code: "AGENT_CANCELLED", message: "Agent execution was cancelled before spawn", retryable: false, effect: "none" }));
+      if (context.signal.aborted || isDeadlineExceeded(context)) return this.finishWithoutProcess(queued, "cancelled", createRuntimeError({ code: "AGENT_CANCELLED", message: "Agent execution was cancelled before spawn", retryable: false, effect: "none" }));
       this.persistAgent(queued, "running");
       this.emitAgent("agent.started", queued, "running", effectClass, "Agent execution started");
       if (this.tasks?.get(task.taskId) !== undefined) this.tasks.start(task.taskId, { reason: "Delegated to Codex" }, context);
@@ -431,7 +435,9 @@ export class CodexAgentExecutor implements AgentExecutor {
   }
 
   private async execute(agentRunId: AgentRunId, task: AgentTask, context: OperationContext, prepared: PreparedExecution, startedAt: string): Promise<AgentRun> {
-    const parser = new CodexJsonlParser(this.maxOutputBytes);
+    const maxOutputBytes = Math.min(this.maxOutputBytes, context.budgets.maxOutputBytes, context.budgets.maxReturnedOutputBytes);
+    const parser = new CodexJsonlParser(maxOutputBytes);
+    const transcriptLimit = Math.min(256 * 1024, context.budgets.maxArtifactBytes, context.budgets.maxRawOutputBytes);
     const transcript: string[] = [];
     let rawOutputBytes = 0;
     let stderrBytes = 0;
@@ -455,14 +461,14 @@ export class CodexAgentExecutor implements AgentExecutor {
     const closed = new Promise<void>((resolveClose, rejectClose) => { closeResolve = resolveClose; closeReject = rejectClose; });
     child.stdout.on("data", (chunk) => {
       rawOutputBytes += typeof chunk === "string" ? byteLength(chunk) : chunk.byteLength;
-      if (this.captureTranscript && byteLength(transcript.join("")) < 256 * 1024) transcript.push(bounded(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk), 256 * 1024 - byteLength(transcript.join(""))));
+      if (this.captureTranscript && byteLength(transcript.join("")) < transcriptLimit) transcript.push(bounded(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk), transcriptLimit - byteLength(transcript.join(""))));
       parser.push(chunk);
     });
     child.stderr.on("data", (chunk) => {
       const value = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
       stderrBytes += typeof chunk === "string" ? byteLength(chunk) : chunk.byteLength;
       if (stderr.length < 4_096) stderr = bounded(`${stderr}${value}`, 4_096);
-      if (this.captureTranscript && byteLength(transcript.join("")) < 256 * 1024) transcript.push(bounded(value, 256 * 1024 - byteLength(transcript.join(""))));
+      if (this.captureTranscript && byteLength(transcript.join("")) < transcriptLimit) transcript.push(bounded(value, transcriptLimit - byteLength(transcript.join(""))));
     });
     child.on("error", (error) => { spawnError = error; closeReject?.(error); });
     child.on("close", (code, signal) => { closeCode = code; closeSignal = signal; closeResolve?.(); });
@@ -471,6 +477,11 @@ export class CodexAgentExecutor implements AgentExecutor {
       child.kill("SIGTERM");
       active.cancelTimer = setTimeout(() => { child.kill("SIGKILL"); }, this.cancelGraceMs);
     };
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    if (context.deadline !== undefined) {
+      const remaining = Math.max(0, context.deadline - Date.now());
+      deadlineTimer = setTimeout(abort, remaining);
+    }
     if (context.signal.aborted) abort();
     else context.signal.addEventListener("abort", abort, { once: true });
     let parsed: ParsedCodexJsonl;
@@ -482,6 +493,7 @@ export class CodexAgentExecutor implements AgentExecutor {
       spawnError = spawnError ?? (cause instanceof Error ? cause : new Error(String(cause)));
     } finally {
       context.signal.removeEventListener("abort", abort);
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
       if (active.cancelTimer !== undefined) clearTimeout(active.cancelTimer);
     }
     const durationMs = Math.max(0, this.tracer.now().getTime() - processStarted.getTime());
@@ -491,7 +503,7 @@ export class CodexAgentExecutor implements AgentExecutor {
     else if (closeSignal !== null) terminal = terminal === "completed" ? "contradictory" : "failed";
     else if (closeCode !== 0) terminal = terminal === "completed" ? "contradictory" : terminal === "contradictory" ? "contradictory" : terminal === "incomplete" ? "failed" : terminal;
     const status = statusForTerminal(terminal);
-    const output = bounded(parsed.output, this.maxOutputBytes);
+    const output = bounded(parsed.output, maxOutputBytes);
     const artifactRefs = this.captureTranscript && transcript.length > 0
       ? [this.artifacts.put(transcript.join(""), { mediaType: "application/x-ndjson", origin: "codex.exec", sensitivity: this.transcriptSensitivity }).ref]
       : [];

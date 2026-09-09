@@ -243,6 +243,14 @@ export const STATE_MIGRATIONS: readonly StateMigration[] = [
         AND json_type(data_json, '$.evidence.checks') = 'array';
     `,
   },
+  {
+    version: 4,
+    sql: `
+      ALTER TABLE events ADD COLUMN policy_decision TEXT;
+      ALTER TABLE events ADD COLUMN policy_evidence_json TEXT;
+      ALTER TABLE events ADD COLUMN environment_json TEXT;
+    `,
+  },
 ] as const;
 
 export const CURRENT_STATE_SCHEMA_VERSION = STATE_MIGRATIONS.at(-1)?.version ?? 0;

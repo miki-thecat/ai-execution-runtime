@@ -215,7 +215,12 @@ export class VerificationRunner {
     const project = this.registry.get(requestedProject);
     const requestedContext = context ?? (project === undefined ? createOperationContext({ traceId: createTraceId(), runId: createRunId(), actor: "runtime" }) : defaultContext(project.projectId));
     const { projectId: _callerProjectId, ...contextWithoutProject } = requestedContext;
-    const operationContext = createOperationContext({ ...contextWithoutProject, ...(project === undefined ? {} : { projectId: project.projectId }) });
+    const credentialGrants = this.allowedEnvironmentKeys.map((key) => ({ key, operations: ["process.run", "shell.run"] }));
+    const operationContext = createOperationContext({
+      ...contextWithoutProject,
+      ...(project === undefined ? {} : { projectId: project.projectId }),
+      ...(credentialGrants.length === 0 ? {} : { effectPolicy: { ...contextWithoutProject.effectPolicy, credentialGrants: [...(contextWithoutProject.effectPolicy.credentialGrants ?? []), ...credentialGrants] } }),
+    });
     const span = this.tracer.startOperation({
       traceId: operationContext.traceId,
       runId: operationContext.runId,

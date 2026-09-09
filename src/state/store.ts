@@ -3,6 +3,8 @@ import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { RuntimeEvent } from "../observability/events.ts";
+import type { EnvironmentEvidence } from "../policy/environment.ts";
+import type { PolicyDecisionEvidence } from "../core/effects.ts";
 import type { RuntimeStatus } from "../core/result.ts";
 import type {
   ArtifactRef,
@@ -146,12 +148,13 @@ const EVENT_INSERT_SQL = `
     input_bytes, raw_output_bytes, returned_output_bytes, artifact_bytes,
     files_read, files_changed, exit_code, signal, token_input, token_output,
     token_cached, compression_ratio, effect_class, effect_state,
+    policy_decision, policy_evidence_json, environment_json,
     idempotency_key, changeset_id, verification_id, artifact_refs_json,
     error_code, metadata_json, payload_json
   ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
   )
 `;
@@ -173,6 +176,19 @@ function sanitizeStrings(value: unknown): unknown {
     return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, sanitizeStrings(child)]));
   }
   return value;
+}
+
+function sanitizeEnvironmentEvidence(value: EnvironmentEvidence): EnvironmentEvidence {
+  const keys = (entries: readonly { readonly key: string; readonly class: string }[]): readonly { readonly key: string; readonly class: string }[] =>
+    entries
+      .filter((entry) => typeof entry?.key === "string" && typeof entry.class === "string")
+      .map((entry) => ({ key: sanitizeDurableText(entry.key), class: sanitizeDurableText(entry.class) }));
+  return {
+    baselineKeys: value.baselineKeys.filter((key): key is string => typeof key === "string").map(sanitizeDurableText),
+    granted: keys(value.granted),
+    withheld: keys(value.withheld),
+    valueLogging: "disabled",
+  };
 }
 
 const PROCESS_STATE_KEYS = new Set([
@@ -259,6 +275,8 @@ function eventFromRow(row: Record<string, unknown>): RuntimeEvent {
   }
   const metadata = parseJson(row.metadata_json);
   const payload = parseJson(row.payload_json);
+  const policyEvidence = parseJson(row.policy_evidence_json);
+  const environment = parseJson(row.environment_json);
   const result = {
     schemaVersion: numberValue(row, "schema_version") as RuntimeEvent["schemaVersion"],
     eventId: stringValue(row, "event_id") as EventId,
@@ -298,6 +316,9 @@ function eventFromRow(row: Record<string, unknown>): RuntimeEvent {
     ...(row.token_cached === null || row.token_cached === undefined ? {} : { tokenCached: numberValue(row, "token_cached") }),
     ...(optionalString(row, "effect_class") === undefined ? {} : { effectClass: optionalString(row, "effect_class") as RuntimeEvent["effectClass"] }),
     ...(optionalString(row, "effect_state") === undefined ? {} : { effectState: optionalString(row, "effect_state") as RuntimeEvent["effectState"] }),
+    ...(optionalString(row, "policy_decision") === undefined ? {} : { policyDecision: optionalString(row, "policy_decision") as RuntimeEvent["policyDecision"] }),
+    ...(policyEvidence === undefined ? {} : { policyEvidence: policyEvidence as PolicyDecisionEvidence }),
+    ...(environment === undefined ? {} : { environment: environment as EnvironmentEvidence }),
     ...(optionalString(row, "idempotency_key") === undefined ? {} : { idempotencyKey: optionalString(row, "idempotency_key") }),
     ...(optionalString(row, "changeset_id") === undefined ? {} : { changesetId: optionalString(row, "changeset_id") }),
     ...(optionalString(row, "verification_id") === undefined ? {} : { verificationId: optionalString(row, "verification_id") }),
@@ -340,6 +361,7 @@ export class SqliteStateStore implements StateStore {
       ...event,
       ...(event.summary === undefined ? {} : { summary: sanitizeDurableText(event.summary) }),
       ...(event.metadata === undefined ? {} : { metadata: durableRedactor.sanitizeMetadata(event.metadata) }),
+      ...(event.environment === undefined ? {} : { environment: sanitizeEnvironmentEvidence(event.environment) }),
     };
     try {
       this.database.exec("BEGIN IMMEDIATE;");
@@ -353,7 +375,10 @@ export class SqliteStateStore implements StateStore {
         durableEvent.rawOutputBytes, durableEvent.returnedOutputBytes, durableEvent.artifactBytes, durableEvent.filesRead,
         durableEvent.filesChanged, nullable(durableEvent.exitCode), nullable(durableEvent.signal), nullable(durableEvent.tokenInput),
         nullable(durableEvent.tokenOutput), nullable(durableEvent.tokenCached), durableEvent.compressionRatio,
-        nullable(durableEvent.effectClass), nullable(durableEvent.effectState), nullable(durableEvent.idempotencyKey),
+        nullable(durableEvent.effectClass), nullable(durableEvent.effectState), nullable(durableEvent.policyDecision),
+        durableEvent.policyEvidence === undefined ? null : json(durableEvent.policyEvidence),
+        durableEvent.environment === undefined ? null : json(durableEvent.environment),
+        nullable(durableEvent.idempotencyKey),
         nullable(durableEvent.changesetId), nullable(durableEvent.verificationId), json(durableEvent.artifactRefs),
         nullable(durableEvent.errorCode), durableEvent.metadata === undefined ? null : json(durableEvent.metadata),
         durableEvent.payload === undefined ? null : json(durableEvent.payload),

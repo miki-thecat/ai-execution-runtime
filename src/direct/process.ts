@@ -1,11 +1,13 @@
 import { spawn, type ChildProcessLike, type SpawnOptions } from "node:child_process";
-import { env as parentEnvironment, kill as killProcess, platform } from "node:process";
+import { kill as killProcess, platform } from "node:process";
 import { closeSync, openSync, readSync, unlinkSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createOperationId, createSpanId, type ArtifactRef } from "../core/ids.ts";
 import { createRuntimeError, type OperationContext, type RuntimeError } from "../core/index.ts";
-import type { EffectClass } from "../core/effects.ts";
+import { policyDecisionEvidence, type EffectClass } from "../core/effects.ts";
+import { buildChildEnvironment, type EnvironmentEvidence } from "../policy/environment.ts";
+import { narrowBudget } from "../policy/budgets.ts";
 import { FileArtifactStore, type ArtifactStore } from "../artifacts/store.ts";
 import type { StateStore } from "../state/store.ts";
 import { Tracer } from "../observability/tracer.ts";
@@ -13,6 +15,7 @@ import type { ProcessHandle, ProcessId, ProcessResult } from "./types.ts";
 import type { ExecutableCommand } from "./types.ts";
 
 export const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024;
+export const MAX_RAW_CAPTURE_BYTES = 1 * 1024 * 1024;
 export const DEFAULT_CANCEL_GRACE_MS = 250;
 const ARTIFACT_CHUNK_BYTES = 64 * 1024;
 
@@ -23,6 +26,9 @@ export interface ProcessStartOptions {
   readonly context: OperationContext;
   readonly effectClass?: EffectClass;
   readonly maxOutputBytes?: number;
+  readonly maxRawOutputBytes?: number;
+  readonly environmentEvidence?: EnvironmentEvidence;
+  readonly credentialClassifiers?: readonly import("../policy/environment.ts").CredentialClassifier[];
 }
 
 interface ProcessRecord {
@@ -48,11 +54,14 @@ class OutputCollector {
   private returnedBytes = 0;
   private total = 0;
   private readonly maxBytes: number;
+  private readonly captureLimit: number;
   private readonly path: string;
   private file: number | undefined;
+  private stored = 0;
 
-  constructor(maxBytes: number, id: ProcessId, stream: "stdout" | "stderr") {
+  constructor(maxBytes: number, captureLimit: number, id: ProcessId, stream: "stdout" | "stderr") {
     this.maxBytes = maxBytes;
+    this.captureLimit = captureLimit;
     this.returned = new Uint8Array(maxBytes);
     this.path = join(tmpdir(), `aer-direct-${id}-${stream}-${Date.now()}`);
     this.file = openSync(this.path, "wx", 0o600);
@@ -61,12 +70,14 @@ class OutputCollector {
   add(chunk: Uint8Array | string): void {
     const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
     this.total += bytes.byteLength;
+    const storable = Math.min(bytes.byteLength, Math.max(0, this.captureLimit - this.stored));
     let offset = 0;
-    while (offset < bytes.byteLength) {
-      const written = writeSync(this.file!, bytes, offset, bytes.byteLength - offset);
+    while (offset < storable) {
+      const written = writeSync(this.file!, bytes, offset, storable - offset);
       if (written <= 0) throw new Error("Unable to spill process output");
       offset += written;
     }
+    this.stored += storable;
     if (this.returnedBytes < this.maxBytes) {
       const count = Math.min(this.maxBytes - this.returnedBytes, bytes.byteLength);
       this.returned.set(bytes.subarray(0, count), this.returnedBytes);
@@ -75,6 +86,8 @@ class OutputCollector {
   }
 
   get byteLength(): number { return this.total; }
+  get capturedByteLength(): number { return this.stored; }
+  get discardedByteLength(): number { return this.total - this.stored; }
 
   boundedBytes(): Uint8Array {
     this.close();
@@ -83,7 +96,7 @@ class OutputCollector {
 
   spill(put: (bytes: Uint8Array) => void): void {
     this.close();
-    if (this.total <= this.maxBytes) {
+    if (this.stored <= this.maxBytes) {
       this.remove();
       return;
     }
@@ -91,8 +104,8 @@ class OutputCollector {
     try {
       const buffer = new Uint8Array(ARTIFACT_CHUNK_BYTES);
       let offset = 0;
-      while (offset < this.total) {
-        const count = readSync(file, buffer, 0, Math.min(buffer.byteLength, this.total - offset), offset);
+      while (offset < this.stored) {
+        const count = readSync(file, buffer, 0, Math.min(buffer.byteLength, this.stored - offset), offset);
         if (count === 0) throw new Error("Unable to read spilled process output");
         put(buffer.slice(0, count));
         offset += count;
@@ -143,17 +156,17 @@ function validTimeout(value: number | undefined): number | undefined {
 function safeEnvironment(
   values: Readonly<Record<string, string | undefined>> | undefined,
   inherit: boolean,
-): Readonly<Record<string, string | undefined>> | undefined {
-  if (values === undefined && inherit) return undefined;
-  const result: Record<string, string | undefined> = inherit ? { ...parentEnvironment } : {};
-  for (const [key, value] of Object.entries(values ?? {})) result[key] = value;
-  return result;
+  operation: string,
+  policy: OperationContext["effectPolicy"],
+  classifiers: readonly import("../policy/environment.ts").CredentialClassifier[],
+): { readonly values: Readonly<Record<string, string | undefined>>; readonly evidence: EnvironmentEvidence } {
+  return buildChildEnvironment({ operation, inheritEnvironment: inherit, policy, classifiers, ...(values === undefined ? {} : { values }) });
 }
 
 function metadataFor(
   command: ExecutableCommand,
   args: readonly string[],
-  env: Readonly<Record<string, string | undefined>> | undefined,
+  environment: EnvironmentEvidence,
   shell: boolean,
 ): Record<string, unknown> {
   return {
@@ -161,8 +174,12 @@ function metadataFor(
     ...(shell ? {} : { executable: command.executable }),
     argumentCount: args.length,
     ...(command.cwd === undefined ? {} : { cwd: command.cwd }),
-    environmentKeys: Object.keys(env ?? {}).sort(),
-    environmentValueLogging: "disabled",
+    environment: {
+      baselineKeys: environment.baselineKeys,
+      granted: environment.granted,
+      withheld: environment.withheld,
+      valueLogging: environment.valueLogging,
+    },
   };
 }
 
@@ -176,6 +193,7 @@ export class DirectProcessManager {
   private readonly artifacts: ArtifactStore | undefined;
   private readonly defaultMaxOutputBytes: number;
   private readonly cancelGraceMs: number;
+  private readonly credentialClassifiers: readonly import("../policy/environment.ts").CredentialClassifier[];
   private readonly handles = new Map<ProcessId, ProcessHandle>();
 
   constructor(options: {
@@ -185,22 +203,39 @@ export class DirectProcessManager {
     readonly defaultMaxOutputBytes?: number;
     readonly cancelGraceMs?: number;
     readonly reconcileOnStart?: boolean;
+    readonly credentialClassifiers?: readonly import("../policy/environment.ts").CredentialClassifier[];
   } = {}) {
     this.tracer = options.tracer ?? new Tracer();
     this.state = options.state;
     this.artifacts = options.artifacts ?? new FileArtifactStore();
-    this.defaultMaxOutputBytes = validByteLimit(options.defaultMaxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES);
+    this.defaultMaxOutputBytes = Math.min(validByteLimit(options.defaultMaxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES), DEFAULT_MAX_OUTPUT_BYTES);
     this.cancelGraceMs = options.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS;
+    this.credentialClassifiers = options.credentialClassifiers ?? [];
     if (!Number.isSafeInteger(this.cancelGraceMs) || this.cancelGraceMs < 0) throw new RangeError("cancelGraceMs must be a non-negative integer");
     if (options.reconcileOnStart !== false) this.reconcile();
   }
 
   start(options: ProcessStartOptions): ProcessHandle {
     const effectClass = options.effectClass ?? "destructive";
-    const maxOutputBytes = validByteLimit(options.maxOutputBytes ?? options.command.maxOutputBytes, this.defaultMaxOutputBytes);
+    const policyEvidence = policyDecisionEvidence(options.context.effectPolicy, effectClass);
+    if (policyEvidence.decision !== "allow") {
+      throw createRuntimeError({
+        code: policyEvidence.decision === "approval_required" ? "EFFECT_APPROVAL_REQUIRED" : "EFFECT_NOT_ALLOWED",
+        message: policyEvidence.reason,
+        retryable: false,
+        effect: "none",
+        details: { ...policyEvidence },
+      });
+    }
+    const requestedOutputBytes = narrowBudget(options.maxOutputBytes ?? options.command.maxOutputBytes, Math.min(this.defaultMaxOutputBytes, options.context.budgets.maxOutputBytes), "maxOutputBytes");
+    // stdout and stderr are returned together, so a narrowed aggregate
+    // ceiling must be divided across the two streams.
+    const maxOutputBytes = Math.min(requestedOutputBytes, Math.floor(options.context.budgets.maxReturnedOutputBytes / 2));
+    const maxRawOutputBytes = narrowBudget(options.maxRawOutputBytes, Math.min(MAX_RAW_CAPTURE_BYTES, options.context.budgets.maxRawOutputBytes, options.context.budgets.maxArtifactBytes), "maxRawOutputBytes");
     const timeoutMs = validTimeout(options.command.timeoutMs);
     const args = [...(options.command.args ?? [])];
-    const env = safeEnvironment(options.command.env, options.command.inheritEnvironment !== false);
+    const environment = safeEnvironment(options.command.env, options.command.inheritEnvironment !== false, options.operation, options.context.effectPolicy, options.credentialClassifiers ?? this.credentialClassifiers);
+    const env = environment.values;
     const id = processId();
     const spanId = createSpanId();
     const operationId = createOperationId();
@@ -243,8 +278,10 @@ export class DirectProcessManager {
       throw this.spawnError(error);
     }
 
-    const stdout = new OutputCollector(maxOutputBytes, id, "stdout");
-    const stderr = new OutputCollector(maxOutputBytes, id, "stderr");
+    // Keep the combined stdout/stderr capture below the runtime ceiling.
+    const streamCaptureLimit = Math.floor(maxRawOutputBytes / 2);
+    const stdout = new OutputCollector(maxOutputBytes, streamCaptureLimit, id, "stdout");
+    const stderr = new OutputCollector(maxOutputBytes, streamCaptureLimit, id, "stderr");
     child.stdout?.on("data", (chunk) => stdout.add(chunk));
     child.stderr?.on("data", (chunk) => stderr.add(chunk));
     const runningRecord: ProcessRecord = { ...record, ...(child.pid === undefined ? {} : { pid: child.pid }) };
@@ -266,7 +303,10 @@ export class DirectProcessManager {
       provider: "node:child_process",
       effectClass,
       effectState: "none",
-      metadata: { ...metadataFor(options.command, args, env, options.shell !== undefined && options.shell !== false), pid: child.pid, processId: id },
+      policyDecision: policyEvidence.decision,
+      policyEvidence,
+      environment: environment.evidence,
+      metadata: { ...metadataFor(options.command, args, environment.evidence, options.shell !== undefined && options.shell !== false), pid: child.pid, processId: id },
     });
 
     let settled = false;
@@ -311,6 +351,8 @@ export class DirectProcessManager {
       const status = cancelled ? "cancelled" : finalizationError === undefined ? "completed" : "unknown";
       const effectState = status === "completed" ? "applied" : "unknown";
       const returnedOutputBytes = Math.min(stdoutBytes, maxOutputBytes) + Math.min(stderrBytes, maxOutputBytes);
+      const discardedOutputBytes = stdout.discardedByteLength + stderr.discardedByteLength;
+      const truncated = stdoutBytes > maxOutputBytes || stderrBytes > maxOutputBytes || discardedOutputBytes > 0;
       const result: ProcessResult = {
         processId: id,
         status,
@@ -325,7 +367,11 @@ export class DirectProcessManager {
         rawOutputBytes: stdoutBytes + stderrBytes,
         artifactRefs: refs,
         artifactBytes,
-        truncated: stdoutBytes > maxOutputBytes || stderrBytes > maxOutputBytes,
+        truncated,
+        discardedOutputBytes,
+        capturedOutputBytes: stdout.capturedByteLength + stderr.capturedByteLength,
+        environment: environment.evidence,
+        ...(discardedOutputBytes > 0 ? { truncationReason: "raw_capture_limit" as const } : stdoutBytes > maxOutputBytes || stderrBytes > maxOutputBytes ? { truncationReason: "returned_output_limit" as const } : {}),
         durationMs: Math.max(0, endedAt.getTime() - startedAt.getTime()),
         timedOut,
         cancelled,
@@ -370,9 +416,11 @@ export class DirectProcessManager {
           ...(signal === null ? {} : { signal }),
         },
         artifactRefs: refs,
-        effectClass,
-        effectState,
-        metadata: { processId: id, timedOut, cancelled },
+          effectClass,
+          effectState,
+          policyDecision: policyEvidence.decision,
+          policyEvidence,
+          metadata: { processId: id, timedOut, cancelled, capturedOutputBytes: result.capturedOutputBytes, discardedOutputBytes, rawCaptureLimitBytes: maxRawOutputBytes, ...(result.truncationReason === undefined ? {} : { truncationReason: result.truncationReason }) },
         });
       } finally {
         this.handles.delete(id);
