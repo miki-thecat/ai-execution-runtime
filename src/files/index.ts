@@ -5,13 +5,15 @@ import { pid, platform } from "node:process";
 import {
   createOperationMeta,
   createRuntimeError,
+  isDeadlineExceeded,
   runtimeFailure,
   runtimeSuccess,
   type OperationContext,
   type RuntimeError,
   type RuntimeResult,
 } from "../core/index.ts";
-import { isEffectAllowed, requiresApproval } from "../core/effects.ts";
+import { isEffectAllowed, policyDecisionEvidence, requiresApproval } from "../core/effects.ts";
+import { narrowBudget } from "../policy/budgets.ts";
 import type { ArtifactRef } from "../core/ids.ts";
 import type { ArtifactStore } from "../artifacts/store.ts";
 import {
@@ -155,6 +157,10 @@ function assertEffectAllowed(context: OperationContext, effectClass: "read" | "w
   if (requiresApproval(context.effectPolicy, effectClass)) throw createRuntimeError({ code: "EFFECT_APPROVAL_REQUIRED", message: `File ${effectClass} requires approval`, retryable: false, effect: "none" });
 }
 
+function assertDeadline(context: OperationContext): void {
+  if (isDeadlineExceeded(context)) throw createRuntimeError({ code: "OPERATION_DEADLINE_EXCEEDED", message: "File operation exceeded the runtime execution budget", retryable: true, effect: "none" });
+}
+
 function unifiedPatch(source: string, patch: string): string {
   const lines = source.split("\n");
   const patchLines = patch.replace(/\r\n/g, "\n").split("\n");
@@ -227,8 +233,11 @@ export class FileOperations {
     const operationContext = instrumentation.context;
     try {
       assertEffectAllowed(operationContext, "read");
-      const maxBytes = validLimit(input.maxBytes, this.maxReadBytes, "maxBytes");
-      const opened = readConfinedFile(this.rootDir, input.path);
+      assertDeadline(operationContext);
+      const requestBytes = inputBytes(input);
+      if (requestBytes > operationContext.budgets.maxInputBytes) throw createRuntimeError({ code: "FILE_INPUT_TOO_LARGE", message: "File read input exceeds the runtime budget", retryable: false, effect: "none", details: { inputBytes: requestBytes, maxInputBytes: operationContext.budgets.maxInputBytes } });
+      const maxBytes = validLimit(narrowBudget(input.maxBytes ?? this.maxReadBytes, operationContext.budgets.maxFileReadBytes, "maxBytes"), this.maxReadBytes, "maxBytes");
+      const opened = readConfinedFile(this.rootDir, input.path, false, operationContext.budgets.maxFileReadBytes);
       const path = opened.path;
       const bytes = opened.bytes!;
       const fullText = new TextDecoder().decode(bytes);
@@ -248,7 +257,7 @@ export class FileOperations {
         : selectedLines.length;
       const nextLine = bounded.truncated || endLine < lines.length ? startLine + completeLines : undefined;
       const hasMore = nextLine !== undefined;
-      const refs = bounded.truncated ? this.putArtifact(bytes, "file.read", operationContext) : [];
+      const refs = bounded.truncated ? this.putArtifact(bytes.slice(0, operationContext.budgets.maxArtifactBytes), "file.read", operationContext) : [];
       const data: FileReadResult = {
         path: relativeFile(this.rootDir, path),
         content: bounded.text,
@@ -263,7 +272,7 @@ export class FileOperations {
         truncated: bounded.truncated,
         artifactRefs: refs,
       };
-      const metrics = { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes: bytes.byteLength, returnedOutputBytes: byteLength(data.content), artifactBytes: refs.length === 0 ? 0 : bytes.byteLength, filesRead: 1 };
+      const metrics = { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes: bytes.byteLength, returnedOutputBytes: byteLength(data.content), artifactBytes: refs.length === 0 ? 0 : Math.min(bytes.byteLength, operationContext.budgets.maxArtifactBytes), filesRead: 1 };
       return runtimeSuccess(data, this.finish(instrumentation, operationContext, "file.read", "read", metrics, refs, "completed", bounded.truncated ? "bounded file read; full content is in an artifact" : "bounded file read", "none", bounded.truncated));
     } catch (cause: unknown) {
       return this.failure(instrumentation, operationContext, "file.read", "read", safeError(cause, "FILE_READ_FAILED"), inputBytes(input));
@@ -277,19 +286,23 @@ export class FileOperations {
     const operationContext = instrumentation.context;
     try {
       assertEffectAllowed(operationContext, "read");
-      const maxResults = validLimit(input.maxResults, this.maxSearchResults, "maxResults");
+      assertDeadline(operationContext);
+      const requestBytes = inputBytes(input);
+      if (requestBytes > operationContext.budgets.maxInputBytes) throw createRuntimeError({ code: "FILE_INPUT_TOO_LARGE", message: "File search input exceeds the runtime budget", retryable: false, effect: "none", details: { inputBytes: requestBytes, maxInputBytes: operationContext.budgets.maxInputBytes } });
+      const maxResults = validLimit(narrowBudget(input.maxResults ?? this.maxSearchResults, operationContext.budgets.maxSearchResults, "maxResults"), this.maxSearchResults, "maxResults");
       if (input.query === "") throw createRuntimeError({ code: "SEARCH_QUERY_INVALID", message: "Search query cannot be empty", retryable: false, effect: "none" });
       const searchRoot = input.path === undefined ? this.rootDir : resolveConfinedPath(this.rootDir, input.path);
-      const rg = this.searchWithRg(input, searchRoot, maxResults);
-      const computation = rg ?? this.searchFallback(input, searchRoot, maxResults);
+      const rg = this.searchWithRg(input, searchRoot, maxResults, operationContext.budgets.maxRawOutputBytes);
+      const computation = rg ?? this.searchFallback(input, searchRoot, maxResults, operationContext.budgets.maxFileReadBytes);
       const result = computation.result;
-      const boundedByBytes = boundSearchBytes(result, input.maxBytes ?? DEFAULT_MAX_FILE_READ_BYTES);
-      const refs = boundedByBytes.hasMore ? this.putArtifact(new TextEncoder().encode(JSON.stringify(result.matches)), "file.search", operationContext) : [];
+      const boundedByBytes = boundSearchBytes(result, narrowBudget(input.maxBytes, Math.min(DEFAULT_MAX_FILE_READ_BYTES, operationContext.budgets.maxReturnedOutputBytes), "maxBytes"));
+      const searchArtifact = new TextEncoder().encode(JSON.stringify(result.matches));
+      const refs = boundedByBytes.hasMore ? this.putArtifact(searchArtifact.slice(0, operationContext.budgets.maxArtifactBytes), "file.search", operationContext) : [];
       const boundedResult: FileSearchResult = { ...boundedByBytes, artifactRefs: refs };
       const returnedOutputBytes = byteLength(JSON.stringify(boundedResult));
       const rawOutputBytes = computation.rawOutputBytes;
       const filesRead = new Set(result.matches.map((match) => match.path)).size;
-      return runtimeSuccess(boundedResult, this.finish(instrumentation, operationContext, "file.search", "read", { internalCalls: 1, inputBytes: inputBytes(input), rawOutputBytes, returnedOutputBytes, artifactBytes: refs.length === 0 ? 0 : rawOutputBytes, filesRead }, refs, "completed", boundedResult.hasMore ? "bounded search results" : "search completed", "none", boundedResult.truncated));
+      return runtimeSuccess(boundedResult, this.finish(instrumentation, operationContext, "file.search", "read", { internalCalls: 1, inputBytes: requestBytes, rawOutputBytes, returnedOutputBytes, artifactBytes: refs.length === 0 ? 0 : Math.min(searchArtifact.byteLength, operationContext.budgets.maxArtifactBytes), filesRead }, refs, "completed", boundedResult.hasMore ? "bounded search results" : "search completed", "none", boundedResult.truncated));
     } catch (cause: unknown) {
       return this.failure(instrumentation, operationContext, "file.search", "read", safeError(cause, "FILE_SEARCH_FAILED"), inputBytes(input));
     }
@@ -301,8 +314,11 @@ export class FileOperations {
     let writeApplied = false;
     try {
       assertEffectAllowed(operationContext, "workspace_write");
+      assertDeadline(operationContext);
+      const requestBytes = inputBytes(input);
+      if (requestBytes > operationContext.budgets.maxInputBytes) throw createRuntimeError({ code: "FILE_INPUT_TOO_LARGE", message: "File patch input exceeds the runtime budget", retryable: false, effect: "none", details: { inputBytes: requestBytes, maxInputBytes: operationContext.budgets.maxInputBytes } });
       if ((input.content === undefined) === (input.patch === undefined)) throw createRuntimeError({ code: "PATCH_INPUT_INVALID", message: "Provide exactly one of content or patch", retryable: false, effect: "none" });
-      const opened = readConfinedFile(this.rootDir, input.path, true);
+      const opened = readConfinedFile(this.rootDir, input.path, true, operationContext.budgets.maxFileReadBytes);
       const path = opened.path;
       const before = opened.bytes;
       const expectedHash = input.expectedHash ?? input.baseHash;
@@ -315,6 +331,8 @@ export class FileOperations {
       const source = before === undefined ? "" : new TextDecoder().decode(before);
       const replacement = input.content !== undefined ? input.content : unifiedPatch(source, input.patch!);
       const after = typeof replacement === "string" ? new TextEncoder().encode(replacement) : replacement;
+      const changeContentBytes = (before?.byteLength ?? 0) + after.byteLength;
+      if (changeContentBytes > operationContext.budgets.maxArtifactBytes) throw createRuntimeError({ code: "CHANGESET_CONTENT_TOO_LARGE", message: "File change evidence exceeds the runtime artifact budget", retryable: false, effect: "none", details: { path: input.path, contentBytes: changeContentBytes, maxArtifactBytes: operationContext.budgets.maxArtifactBytes } });
       const beforeHash = before === undefined ? undefined : sha256(before);
       const outputPath = path;
       const parent = dirname(outputPath);
@@ -347,6 +365,10 @@ export class FileOperations {
   rollback(changeset: ChangeSet, context: OperationContext, options: InternalOptions = {}): RuntimeResult<ChangeSet> {
     const instrumentation = this.start("change.rollback", "workspace_write", context, options.instrument !== false);
     const operationContext = instrumentation.context;
+    try { assertDeadline(operationContext); } catch (cause) {
+      const error = safeError(cause, "OPERATION_DEADLINE_EXCEEDED");
+      return this.failure(instrumentation, operationContext, "change.rollback", "workspace_write", error, 0);
+    }
     const result = isEffectAllowed(operationContext.effectPolicy, "workspace_write") && !requiresApproval(operationContext.effectPolicy, "workspace_write")
       ? this.changes.rollback({ changeset, context: operationContext })
       : runtimeFailure(createRuntimeError({ code: requiresApproval(operationContext.effectPolicy, "workspace_write") ? "EFFECT_APPROVAL_REQUIRED" : "EFFECT_NOT_ALLOWED", message: "File rollback is not allowed by the effect policy", retryable: false, effect: "none" }), this.finishMeta(operationContext, "change.rollback", "workspace_write", "failed", { internalCalls: 1 }, instrumentation, undefined, "none", "File rollback is not allowed by the effect policy"));
@@ -361,11 +383,11 @@ export class FileOperations {
     return runtimeFailure(error, this.finishMeta(operationContext, "change.rollback", "workspace_write", unknown ? "unknown" : "failed", { internalCalls: 1 }, instrumentation, event?.timestamp, error.effect, "ChangeSet rollback rejected"));
   }
 
-  private searchWithRg(input: FileSearchInput, searchRoot: string, maxResults: number): SearchComputation | undefined {
+  private searchWithRg(input: FileSearchInput, searchRoot: string, maxResults: number, maxRawOutputBytes: number): SearchComputation | undefined {
     const args = ["--json", "--color", "never", "--no-heading", "--max-count", String(Math.min(Number.MAX_SAFE_INTEGER, maxResults + 1))];
     if (!input.regex) args.push("--fixed-strings");
     args.push("--", input.query, searchRoot);
-    const processResult = spawnSync("rg", args, { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+    const processResult = spawnSync("rg", args, { encoding: "utf8", maxBuffer: Math.min(8 * 1024 * 1024, maxRawOutputBytes) });
     if (processResult.error?.message.includes("ENOENT")) return undefined;
     const outputTruncated = processResult.error !== undefined && /maxbuffer|enobufs/i.test(processResult.error.message);
     if (processResult.error && !outputTruncated) throw processResult.error;
@@ -396,14 +418,24 @@ export class FileOperations {
     return { result: { query: input.query, matches: boundedMatches, resultCount: boundedMatches.length, hasMore, truncated: hasMore, backend: "rg", artifactRefs: [] }, rawOutputBytes: byteLength(String(processResult.stdout)) };
   }
 
-  private searchFallback(input: FileSearchInput, searchRoot: string, maxResults: number): SearchComputation {
+  private searchFallback(input: FileSearchInput, searchRoot: string, maxResults: number, maxFileReadBytes: number): SearchComputation {
     const files: string[] = [];
     walk(searchRoot, this.rootDir, files);
     files.sort();
     const matches: FileSearchMatch[] = [];
+    let skippedOversize = false;
     const expression = input.regex ? new RegExp(input.query) : undefined;
     for (const file of files) {
-      const bytes = readConfinedFile(this.rootDir, relative(this.rootDir, file)).bytes!;
+      let bytes: Uint8Array;
+      try {
+        bytes = readConfinedFile(this.rootDir, relative(this.rootDir, file), false, maxFileReadBytes).bytes!;
+      } catch (cause) {
+        if (cause !== null && typeof cause === "object" && "code" in cause && cause.code === "FILE_READ_TOO_LARGE") {
+          skippedOversize = true;
+          continue;
+        }
+        throw cause;
+      }
       if (bytes.includes(0)) continue;
       const lines = new TextDecoder().decode(bytes).split("\n");
       for (let index = 0; index < lines.length; index += 1) {
@@ -417,7 +449,7 @@ export class FileOperations {
         }
       }
     }
-    return { result: { query: input.query, matches, resultCount: matches.length, hasMore: false, truncated: false, backend: "fallback", artifactRefs: [] }, rawOutputBytes: matches.reduce((total, match) => total + byteLength(JSON.stringify(match)), 0) };
+    return { result: { query: input.query, matches, resultCount: matches.length, hasMore: skippedOversize, truncated: skippedOversize, backend: "fallback", artifactRefs: [] }, rawOutputBytes: matches.reduce((total, match) => total + byteLength(JSON.stringify(match)), 0) };
   }
 
   private putArtifact(content: Uint8Array, origin: string, context: OperationContext): readonly ArtifactRef[] {
@@ -430,7 +462,8 @@ export class FileOperations {
   private start(operation: string, effectClass: "read" | "workspace_write", context: OperationContext, enabled: boolean): Instrumentation {
     if (!enabled || this.tracer === undefined) return { startedAt: new Date().toISOString(), context };
     const parentSpanId = context.spanId ?? context.parentSpanId;
-    const span = this.tracer.startOperation({ traceId: context.traceId, runId: context.runId, actor: context.actor, operation, effectClass, ...(parentSpanId === undefined ? {} : { parentSpanId }), ...(context.taskId === undefined ? {} : { taskId: context.taskId }), ...(context.projectId === undefined ? {} : { projectId: context.projectId }), ...(context.deviceId === undefined ? {} : { deviceId: context.deviceId }), ...(context.idempotencyKey === undefined ? {} : { idempotencyKey: context.idempotencyKey }), executor: "direct", provider: "node:fs" });
+    const evidence = policyDecisionEvidence(context.effectPolicy, effectClass);
+    const span = this.tracer.startOperation({ traceId: context.traceId, runId: context.runId, actor: context.actor, operation, effectClass, ...(parentSpanId === undefined ? {} : { parentSpanId }), ...(context.taskId === undefined ? {} : { taskId: context.taskId }), ...(context.projectId === undefined ? {} : { projectId: context.projectId }), ...(context.deviceId === undefined ? {} : { deviceId: context.deviceId }), ...(context.idempotencyKey === undefined ? {} : { idempotencyKey: context.idempotencyKey }), executor: "direct", provider: "node:fs", policyDecision: evidence.decision, policyEvidence: evidence });
     return { span, startedAt: span.startedAt, context: { ...context, spanId: span.spanId, ...(parentSpanId === undefined ? {} : { parentSpanId }) } };
   }
 
@@ -440,7 +473,8 @@ export class FileOperations {
   }
 
   private finishMeta(context: OperationContext, operation: string, effectClass: "read" | "workspace_write", status: "completed" | "failed" | "unknown", metrics: Record<string, number>, instrumentation: Instrumentation, completedAt: string | undefined, effectState: "none" | "unknown" | "applied", summary: string, refs: readonly ArtifactRef[] = [], eventDuration?: number, truncated = false) {
-    return createOperationMeta({ context: { ...context, ...(instrumentation.span === undefined ? {} : { spanId: instrumentation.span.spanId }) }, operation, status, effectClass, effectState, startedAt: instrumentation.startedAt, completedAt: completedAt ?? new Date().toISOString(), metrics: { ...metrics, ...(eventDuration === undefined ? {} : { durationMs: eventDuration }) }, artifactRefs: refs, summary, truncated, executor: "direct", provider: "node:fs" });
+    const evidence = policyDecisionEvidence(context.effectPolicy, effectClass);
+    return createOperationMeta({ context: { ...context, ...(instrumentation.span === undefined ? {} : { spanId: instrumentation.span.spanId }) }, operation, status, effectClass, effectState, startedAt: instrumentation.startedAt, completedAt: completedAt ?? new Date().toISOString(), metrics: { ...metrics, ...(eventDuration === undefined ? {} : { durationMs: eventDuration }) }, artifactRefs: refs, summary, truncated, executor: "direct", provider: "node:fs", policyDecision: evidence.decision, policyEvidence: evidence });
   }
 
   private failure(instrumentation: Instrumentation, context: OperationContext, operation: string, effectClass: "read" | "workspace_write", error: RuntimeError, inputSize: number): RuntimeResult<never> {

@@ -9,7 +9,8 @@ export interface ExecutableCommand {
   readonly cwd?: string;
   /** Environment values are passed to the child but are never included in telemetry. */
   readonly env?: Readonly<Record<string, string | undefined>>;
-  /** When true, inherit the parent environment before applying env. Defaults to true. */
+  /** Compatibility input; the runtime always starts from its safe baseline. */
+  /** Compatibility input; the runtime always starts from its safe baseline. */
   readonly inheritEnvironment?: boolean;
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
@@ -35,6 +36,7 @@ export interface DirectExecutionOptions {
   readonly cancelGraceMs?: number;
   /** Reconciliation is enabled by default when a durable state store is supplied. */
   readonly reconcileOnStart?: boolean;
+  readonly credentialClassifiers?: readonly import("../policy/environment.ts").CredentialClassifier[];
 }
 
 /** Semantic providers may narrow the conservative raw-execution default. */
@@ -60,6 +62,11 @@ export interface ProcessResult {
   readonly artifactRefs: readonly ArtifactRef[];
   readonly artifactBytes: number;
   readonly truncated: boolean;
+  /** Bytes received after the runtime's raw capture ceiling. */
+  readonly discardedOutputBytes: number;
+  readonly capturedOutputBytes: number;
+  readonly truncationReason?: "returned_output_limit" | "raw_capture_limit" | "artifact_unavailable";
+  readonly environment?: import("../policy/environment.ts").EnvironmentEvidence;
   readonly durationMs: number;
   readonly timedOut: boolean;
   readonly cancelled: boolean;

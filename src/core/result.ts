@@ -7,7 +7,7 @@ import type {
   TaskId,
   TraceId,
 } from "./ids.ts";
-import type { EffectClass, EffectState } from "./effects.ts";
+import type { EffectClass, EffectState, PolicyDecision, PolicyDecisionEvidence } from "./effects.ts";
 import type { OperationContext } from "./context.ts";
 
 export type RuntimeStatus =
@@ -124,6 +124,8 @@ export interface OperationMeta {
   readonly completedAt?: string;
   readonly effectClass: EffectClass;
   readonly effectState: EffectState;
+  readonly policyDecision?: PolicyDecision;
+  readonly policyEvidence?: PolicyDecisionEvidence;
   readonly idempotencyKey?: string;
   readonly artifactRefs: readonly ArtifactRef[];
   readonly metrics: OperationMeasurements;
@@ -140,6 +142,8 @@ export interface OperationMetaInit {
   readonly status: OperationStatus;
   readonly effectClass: EffectClass;
   readonly effectState?: EffectState;
+  readonly policyDecision?: PolicyDecision;
+  readonly policyEvidence?: PolicyDecisionEvidence;
   readonly startedAt?: string;
   readonly completedAt?: string;
   readonly metrics?: Partial<OperationMeasurements>;
@@ -170,6 +174,8 @@ export function createOperationMeta(init: OperationMetaInit): OperationMeta {
     ...(init.completedAt === undefined ? {} : { completedAt: init.completedAt }),
     effectClass: init.effectClass,
     effectState: init.effectState ?? "none",
+    ...(init.policyDecision === undefined ? {} : { policyDecision: init.policyDecision }),
+    ...(init.policyEvidence === undefined ? {} : { policyEvidence: init.policyEvidence }),
     ...(init.context.idempotencyKey === undefined
       ? {}
       : { idempotencyKey: init.context.idempotencyKey }),

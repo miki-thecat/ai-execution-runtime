@@ -1,5 +1,5 @@
-import { createOperationContext, type OperationContext } from "../core/context.ts";
-import { isEffectAllowed, requiresApproval, type EffectClass, type EffectState } from "../core/effects.ts";
+import { createOperationContext, isDeadlineExceeded, type OperationContext } from "../core/context.ts";
+import { isEffectAllowed, policyDecisionEvidence, requiresApproval, type EffectClass, type EffectState } from "../core/effects.ts";
 import {
   createOperationMeta,
   createRuntimeError,
@@ -14,6 +14,7 @@ import { createRunId, createTraceId, type ArtifactRef } from "../core/ids.ts";
 import { DirectExecutor } from "../direct/index.ts";
 import type { ExecutableCommand, ShellRunInput } from "../direct/types.ts";
 import { Tracer, type OperationSpan } from "../observability/index.ts";
+import { DEFAULT_RUNTIME_BUDGETS, narrowBudget } from "../policy/budgets.ts";
 import type {
   GitHubCapabilityInput,
   GitHubCapabilities,
@@ -235,6 +236,27 @@ function internalContext(context: OperationContext): OperationContext {
 
 function byteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
+}
+
+function boundText(value: string, maxBytes: number): string {
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.byteLength <= maxBytes) return value;
+  return new TextDecoder().decode(bytes.slice(0, maxBytes));
+}
+
+function boundedCommandResult(result: GitHubCommandResult, maxBytes: number): GitHubCommandResult {
+  const stdout = boundText(result.stdout, maxBytes);
+  const stderr = boundText(result.stderr, maxBytes);
+  const rawOutputBytes = Math.max(result.rawOutputBytes ?? 0, byteLength(result.stdout) + byteLength(result.stderr));
+  const returnedOutputBytes = byteLength(stdout) + byteLength(stderr);
+  return {
+    ...result,
+    stdout,
+    stderr,
+    rawOutputBytes,
+    returnedOutputBytes,
+    truncated: result.truncated === true || stdout !== result.stdout || stderr !== result.stderr,
+  };
 }
 
 function isObject(value: unknown): value is JsonObject {
@@ -898,7 +920,7 @@ export class GitHubProvider {
         const value = configuredClock();
         return value instanceof Date ? value.getTime() : value;
       };
-    this.maxOutputBytes = options.maxOutputBytes ?? GH_OUTPUT_LIMIT;
+    this.maxOutputBytes = narrowBudget(options.maxOutputBytes ?? GH_OUTPUT_LIMIT, DEFAULT_RUNTIME_BUDGETS.maxOutputBytes, "maxOutputBytes");
     this.runner = options.runner ?? new DirectGitHubCommandRunner(this.direct, this.maxOutputBytes);
     this.sleep = options.sleep ?? ((milliseconds, signal) => new Promise<void>((resolve, reject) => {
       if (signal.aborted) {
@@ -951,6 +973,7 @@ export class GitHubProvider {
   async snapshot(input: GitHubSnapshotInput = {}, context: OperationContext = defaultContext(), options: { readonly instrument?: boolean } = {}): Promise<GitHubOperationResult<GitHubSnapshot>> {
     const cwd = input.cwd ?? input.rootDir;
     return this.runOperation("github.snapshot", "network", context, async (metrics, operationContext) => {
+      if ((input.issueNumbers?.length ?? 0) > operationContext.budgets.maxSearchResults) throw createRuntimeError({ code: "GITHUB_INPUT_TOO_LARGE", message: "GitHub issue list exceeds the runtime budget", retryable: false, effect: "none", details: { maxIssues: operationContext.budgets.maxSearchResults } });
       const routes = new Set<GitHubProviderRoute>();
       const repositoryAttempt = await this.readRepositoryAttempt(cwd, operationContext, metrics, routes);
       const repository = repositoryAttempt?.value;
@@ -1075,6 +1098,7 @@ export class GitHubProvider {
 
   async work(input: GitHubWorkInput, context: OperationContext = defaultContext(), options: { readonly instrument?: boolean } = {}): Promise<GitHubOperationResult<GitHubWorkSnapshot>> {
     return this.runOperation("github.work", "network", context, async (metrics, operationContext) => {
+      if (input.issueNumbers.length > operationContext.budgets.maxSearchResults) throw createRuntimeError({ code: "GITHUB_INPUT_TOO_LARGE", message: "GitHub issue list exceeds the runtime budget", retryable: false, effect: "none", details: { maxIssues: operationContext.budgets.maxSearchResults } });
       const routes = new Set<GitHubProviderRoute>();
       const repository = (await this.readRepositoryAttempt(input.cwd, operationContext, metrics, routes))?.value;
       if (repository === undefined) {
@@ -1244,6 +1268,7 @@ export class GitHubProvider {
     options: { readonly instrument?: boolean } = {},
   ): Promise<RuntimeResult<T>> {
     const startedAt = this.tracer.now().toISOString();
+    const policyEvidence = policyDecisionEvidence(context.effectPolicy, effectClass);
     const span = options.instrument === false ? undefined : this.tracer.startOperation({
       traceId: context.traceId,
       runId: context.runId,
@@ -1257,6 +1282,8 @@ export class GitHubProvider {
       ...(context.idempotencyKey === undefined ? {} : { idempotencyKey: context.idempotencyKey }),
       executor: "direct",
       provider: "github",
+      policyDecision: policyEvidence.decision,
+      policyEvidence,
     });
     const operationContext = createOperationContext({
       ...context,
@@ -1272,10 +1299,26 @@ export class GitHubProvider {
       if (requiresApproval(operationContext.effectPolicy, effectClass)) {
         throw createRuntimeError({ code: "EFFECT_APPROVAL_REQUIRED", message: `GitHub operation ${operation} requires approval`, retryable: false, effect: "none" });
       }
+      if (isDeadlineExceeded(operationContext)) throw createRuntimeError({ code: "GITHUB_DEADLINE_EXCEEDED", message: "GitHub operation exceeded the runtime execution budget", retryable: true, effect: "none" });
       const result = await work(metrics, operationContext);
       const artifactRefs = result.artifactRefs ?? metrics.artifactRefs;
       const truncated = result.truncated ?? metrics.truncated;
-      metrics.setReturnedOutputBytes(byteLength(JSON.stringify(result.data) ?? ""));
+      const serializedResult = JSON.stringify(result.data) ?? "";
+      const returnedOutputBytes = byteLength(serializedResult);
+      // Command-level bounds do not bound the aggregate object assembled for
+      // the model. Do not expose an oversized snapshot merely because each
+      // individual gh call was below its own ceiling.
+      if (returnedOutputBytes > operationContext.budgets.maxReturnedOutputBytes) {
+        metrics.setReturnedOutputBytes(0);
+        throw createRuntimeError({
+          code: "GITHUB_OUTPUT_TOO_LARGE",
+          message: "GitHub model-facing result exceeds the runtime return budget",
+          retryable: false,
+          effect: "none",
+          details: { returnedOutputBytes, maxReturnedOutputBytes: operationContext.budgets.maxReturnedOutputBytes },
+        });
+      }
+      metrics.setReturnedOutputBytes(returnedOutputBytes);
       const snapshot = metrics.snapshot();
       span?.record(snapshot);
       const event = span?.complete({
@@ -1296,6 +1339,8 @@ export class GitHubProvider {
         truncated,
         executor: "direct",
         provider: "github",
+        policyDecision: policyEvidence.decision,
+        policyEvidence,
       }));
     } catch (cause) {
       const error = errorFor(cause, "GITHUB_OPERATION_FAILED", effectClass === "remote_write" ? "unknown" : "none");
@@ -1317,15 +1362,18 @@ export class GitHubProvider {
         truncated: metrics.truncated,
         executor: "direct",
         provider: "github",
+        policyDecision: policyEvidence.decision,
+        policyEvidence,
       }));
     }
   }
 
   private async execute(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<GitHubCommandResult> {
     metrics.call({ executable: "gh", args, cwd });
-    const result = await this.runner.runExecutable({ executable: "gh", args: [...args], ...(cwd === undefined ? {} : { cwd }), maxOutputBytes: this.maxOutputBytes }, context, this.commandEffectClass(context));
-    metrics.observe(result);
-    return result;
+    const result = await this.runner.runExecutable({ executable: "gh", args: [...args], ...(cwd === undefined ? {} : { cwd }), maxOutputBytes: this.commandOutputLimit(context) }, context, this.commandEffectClass(context));
+    const bounded = boundedCommandResult(result, this.commandOutputLimit(context));
+    metrics.observe(bounded);
+    return bounded;
   }
 
   private async executeRead(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, retryable = true): Promise<GitHubCommandResult> {
@@ -1349,9 +1397,10 @@ export class GitHubProvider {
   private async shell(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, options: { readonly timeoutMs?: number } = {}): Promise<GitHubCommandResult> {
     const command = rawCommand(args);
     metrics.call({ shell: command, cwd });
-    const result = await this.runner.runShell({ command, ...(cwd === undefined ? {} : { cwd }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), maxOutputBytes: this.maxOutputBytes }, context, this.commandEffectClass(context));
-    metrics.observe(result);
-    return result;
+    const result = await this.runner.runShell({ command, ...(cwd === undefined ? {} : { cwd }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), maxOutputBytes: this.commandOutputLimit(context) }, context, this.commandEffectClass(context));
+    const bounded = boundedCommandResult(result, this.commandOutputLimit(context));
+    metrics.observe(bounded);
+    return bounded;
   }
 
   private async shellRead(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, options: { readonly timeoutMs?: number } = {}): Promise<GitHubCommandResult> {
@@ -1385,16 +1434,21 @@ export class GitHubProvider {
 
   private async gitCommand(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<GitHubCommandResult> {
     metrics.call({ executable: "git", args, cwd });
-    const result = await this.runner.runExecutable({ executable: "git", args: [...args], ...(cwd === undefined ? {} : { cwd }), maxOutputBytes: this.maxOutputBytes }, context, this.commandEffectClass(context));
-    metrics.observe(result);
-    if ((result.exitCode ?? 0) !== 0) {
-      throw createRuntimeError({ code: "GIT_COMMAND_FAILED", message: result.stderr.trim() || `git ${args.join(" ")} failed`, retryable: false, effect: "none", details: { args: [...args], exitCode: result.exitCode } });
+    const result = await this.runner.runExecutable({ executable: "git", args: [...args], ...(cwd === undefined ? {} : { cwd }), maxOutputBytes: this.commandOutputLimit(context) }, context, this.commandEffectClass(context));
+    const bounded = boundedCommandResult(result, this.commandOutputLimit(context));
+    metrics.observe(bounded);
+    if ((bounded.exitCode ?? 0) !== 0) {
+      throw createRuntimeError({ code: "GIT_COMMAND_FAILED", message: bounded.stderr.trim() || `git ${args.join(" ")} failed`, retryable: false, effect: "none", details: { args: [...args], exitCode: bounded.exitCode } });
     }
-    return result;
+    return bounded;
   }
 
   private commandEffectClass(context: OperationContext): EffectClass {
     return this.commandEffectClasses.get(context) ?? "destructive";
+  }
+
+  private commandOutputLimit(context: OperationContext): number {
+    return Math.min(this.maxOutputBytes, context.budgets.maxOutputBytes, Math.floor(context.budgets.maxReturnedOutputBytes / 2));
   }
 
   private async gitText(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<string | undefined> {

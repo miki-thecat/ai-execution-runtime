@@ -1,5 +1,5 @@
 import type { Actor } from "../core/context.ts";
-import type { EffectClass, EffectState } from "../core/effects.ts";
+import type { EffectClass, EffectState, PolicyDecision, PolicyDecisionEvidence } from "../core/effects.ts";
 import {
   createRunId,
   createSpanId,
@@ -53,6 +53,8 @@ export interface OperationStartOptions extends IdentityOptions {
   readonly parentSpanId?: SpanId;
   readonly effectClass: EffectClass;
   readonly effectState?: EffectState;
+  readonly policyDecision?: PolicyDecision;
+  readonly policyEvidence?: PolicyDecisionEvidence;
   readonly idempotencyKey?: string;
   readonly executor?: string;
   readonly provider?: string;
@@ -144,6 +146,8 @@ export class Tracer {
       status: "running",
       effectClass: options.effectClass,
       effectState: options.effectState ?? "none",
+      ...(options.policyDecision === undefined ? {} : { policyDecision: options.policyDecision }),
+      ...(options.policyEvidence === undefined ? {} : { policyEvidence: options.policyEvidence }),
       ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
       ...(options.executor === undefined ? {} : { executor: options.executor }),
       ...(options.provider === undefined ? {} : { provider: options.provider }),
@@ -358,6 +362,8 @@ export class OperationSpan {
       measurements,
       effectClass: this.options.effectClass,
       effectState: options.effectState ?? this.options.effectState ?? "none",
+      ...(this.options.policyDecision === undefined ? {} : { policyDecision: this.options.policyDecision }),
+      ...(this.options.policyEvidence === undefined ? {} : { policyEvidence: this.options.policyEvidence }),
       ...(this.options.idempotencyKey === undefined ? {} : { idempotencyKey: this.options.idempotencyKey }),
       ...(this.options.executor === undefined ? {} : { executor: this.options.executor }),
       ...(this.options.provider === undefined ? {} : { provider: this.options.provider }),

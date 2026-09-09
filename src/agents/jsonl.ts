@@ -10,6 +10,8 @@ const KNOWN_EVENT_TYPES = new Set([
 const TERMINAL_TYPES = new Set(["thread.completed", "thread.failed", "thread.cancelled", "turn.completed", "turn.failed", "turn.cancelled", "item.failed", "item.error", "error"]);
 const DEFAULT_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_EVENT_LIMIT = 10_000;
+const MAX_PENDING_LINE_BYTES = 1 * 1024 * 1024;
+const MAX_STORED_EVENT_BYTES = 64 * 1024;
 
 function textValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
@@ -90,26 +92,53 @@ export class CodexJsonlParser {
   private finished = false;
   private readonly maxOutputBytes: number;
   private readonly maxEvents: number;
+  private discardingOversizeLine = false;
 
   constructor(maxOutputBytes = DEFAULT_OUTPUT_BYTES, maxEvents = DEFAULT_EVENT_LIMIT) {
-    this.maxOutputBytes = maxOutputBytes;
-    this.maxEvents = maxEvents;
+    this.maxOutputBytes = Math.min(maxOutputBytes, DEFAULT_OUTPUT_BYTES);
+    this.maxEvents = Math.min(maxEvents, DEFAULT_EVENT_LIMIT);
     if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 0) throw new RangeError("maxOutputBytes must be a non-negative integer");
     if (!Number.isSafeInteger(maxEvents) || maxEvents < 1) throw new RangeError("maxEvents must be a positive integer");
   }
 
   push(chunk: Uint8Array | string): readonly ParsedCodexEvent[] {
     if (this.finished) throw new Error("Cannot push after JSONL parser has finished");
-    this.pending += typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
+    let addition = typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
     const newEvents: ParsedCodexEvent[] = [];
-    let newline = this.pending.indexOf("\n");
-    while (newline >= 0) {
-      const line = this.pending.slice(0, newline).replace(/\r$/, "");
-      this.pending = this.pending.slice(newline + 1);
-      this.lineNumber += 1;
-      const parsed = this.parseLine(line);
-      if (parsed !== undefined) newEvents.push(parsed);
-      newline = this.pending.indexOf("\n");
+    while (addition.length > 0) {
+      if (this.discardingOversizeLine) {
+        const newline = addition.indexOf("\n");
+        if (newline < 0) return newEvents;
+        addition = addition.slice(newline + 1);
+        this.discardingOversizeLine = false;
+        continue;
+      }
+      const newline = addition.indexOf("\n");
+      const segment = newline < 0 ? addition : addition.slice(0, newline + 1);
+      // Check character length before concatenating. This keeps a malicious
+      // unterminated JSONL record from turning the pending buffer into an
+      // unbounded allocation; UTF-8 validation below handles the exact byte
+      // boundary for records that are close to the limit.
+      if (this.pending.length + segment.length > MAX_PENDING_LINE_BYTES) {
+        this.pending = "";
+        this.malformedLines += 1;
+        if (newline < 0) this.discardingOversizeLine = true;
+        addition = newline < 0 ? "" : addition.slice(newline + 1);
+        continue;
+      }
+      this.pending += segment;
+      addition = newline < 0 ? "" : addition.slice(newline + 1);
+      if (newline >= 0) {
+        const line = this.pending.slice(0, -1).replace(/\r$/, "");
+        this.pending = "";
+        this.lineNumber += 1;
+        const parsed = this.parseLine(line);
+        if (parsed !== undefined) newEvents.push(parsed);
+      } else if (new TextEncoder().encode(this.pending).byteLength > MAX_PENDING_LINE_BYTES) {
+        this.pending = "";
+        this.discardingOversizeLine = true;
+        this.malformedLines += 1;
+      }
     }
     return newEvents;
   }
@@ -161,7 +190,12 @@ export class CodexJsonlParser {
       return undefined;
     }
     const event: ParsedCodexEvent = { type, value: record, line: this.lineNumber };
-    if (this.events.length < this.maxEvents) this.events.push(event);
+    if (this.events.length < this.maxEvents) {
+      const serializedBytes = new TextEncoder().encode(JSON.stringify(record)).byteLength;
+      this.events.push(serializedBytes <= MAX_STORED_EVENT_BYTES
+        ? event
+        : { ...event, value: { type, truncated: true } });
+    }
     if (!KNOWN_EVENT_TYPES.has(type)) this.unknown.add(type);
     const thread = textValue(record.thread_id) ?? textValue(nestedRecord(record.thread)?.id);
     const turn = textValue(record.turn_id) ?? textValue(nestedRecord(record.turn)?.id);

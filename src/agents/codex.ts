@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { env as parentEnvironment } from "node:process";
 import type { RunId } from "../core/ids.ts";
-import { createSpanId, createRuntimeError, type OperationContext, type RuntimeError } from "../core/index.ts";
-import { effectDecision, type EffectClass, type EffectState } from "../core/effects.ts";
+import { createSpanId, createRuntimeError, isDeadlineExceeded, type OperationContext, type RuntimeError } from "../core/index.ts";
+import { credentialGrant, effectDecision, type EffectClass, type EffectState, type EffectPolicy } from "../core/effects.ts";
 import { FileArtifactStore, type ArtifactStore } from "../artifacts/store.ts";
 import { ensureTracerEventsPersisted } from "../project/events.ts";
 import type { ProjectIdentity } from "../project/types.ts";
@@ -42,6 +42,7 @@ const EXECUTOR = "agent" as const;
 const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024;
 const DEFAULT_MAX_INPUT_BYTES = 32 * 1024;
 const DEFAULT_CANCEL_GRACE_MS = 250;
+const DEFAULT_CAPABILITY_PROBE_TIMEOUT_MS = 2_000;
 const SAFE_BASELINE_KEYS = [
   "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR", "CI",
 ] as const;
@@ -147,7 +148,7 @@ function evidenceEntry(key: string, classifiers: readonly CredentialClassifier[]
   return classification === undefined ? undefined : { key, class: classification };
 }
 
-function environmentFor(options: CodexEnvironmentOptions | undefined): BuiltEnvironment {
+function environmentFor(options: CodexEnvironmentOptions | undefined, policy?: EffectPolicy): BuiltEnvironment {
   const input = options ?? {};
   const classifiers = [...DEFAULT_CREDENTIAL_CLASSIFIERS, ...(input.credentialClassifiers ?? [])];
   const values: Record<string, string | undefined> = {};
@@ -159,12 +160,15 @@ function environmentFor(options: CodexEnvironmentOptions | undefined): BuiltEnvi
     if (value !== undefined && SAFE_ORDINARY_ENVIRONMENT.test(key) && credentialClass(key, classifiers) === undefined) values[key] = value;
   }
   for (const key of [...(input.passThroughKeys ?? []), ...(input.allowedEnvironmentKeys ?? [])]) {
-    if (parent[key] !== undefined) values[key] = parent[key];
+    if (parent[key] !== undefined && (credentialClass(key, classifiers) === undefined || credentialGrant(policy, key, "agent.run") !== undefined)) values[key] = parent[key];
   }
   for (const key of [...(input.providerKeys ?? []), ...(input.providerRequiredKeys ?? [])]) {
-    if (parent[key] !== undefined) values[key] = parent[key];
+    if (parent[key] !== undefined && (credentialClass(key, classifiers) === undefined || credentialGrant(policy, key, "agent.run") !== undefined)) values[key] = parent[key];
   }
-  for (const [key, value] of Object.entries({ ...(input.safeVariables ?? {}), ...(input.variables ?? {}) })) values[key] = value;
+  for (const [key, value] of Object.entries({ ...(input.safeVariables ?? {}), ...(input.variables ?? {}) })) {
+    if (credentialClass(key, classifiers) !== undefined && credentialGrant(policy, key, "agent.run") === undefined) continue;
+    values[key] = value;
+  }
   const providerHome = input.codexHome ?? input.providerHome;
   if (providerHome !== undefined) {
     if (!existsSync(providerHome)) mkdirSync(providerHome, { recursive: true, mode: 0o700 });
@@ -276,8 +280,8 @@ export class CodexAgentExecutor implements AgentExecutor {
     if (!Number.isSafeInteger(this.cancelGraceMs) || this.cancelGraceMs < 0) throw new RangeError("cancelGraceMs must be a non-negative integer");
   }
 
-  capabilities(): Promise<AgentCapabilities> {
-    this.capabilityPromise ??= this.detectCapabilities();
+  capabilities(context?: OperationContext): Promise<AgentCapabilities> {
+    this.capabilityPromise ??= this.detectCapabilities(context);
     return this.capabilityPromise;
   }
 
@@ -285,14 +289,15 @@ export class CodexAgentExecutor implements AgentExecutor {
     const agentRunId = createAgentRunId();
     const startedAt = this.tracer.now().toISOString();
     let project: ProjectIdentity | undefined;
-    let environment = environmentFor(this.environmentOptions);
+    let environment = environmentFor(this.environmentOptions, context.effectPolicy);
     let posture = capabilityPosture();
     let effectClass: EffectClass = "read";
     let prompt = "";
     try {
       project = this.resolveProject(task, context);
       prompt = inputFor(task);
-      if (byteLength(prompt) > this.maxInputBytes) throw createRuntimeError({ code: "AGENT_INPUT_TOO_LARGE", message: "Agent task input exceeds the configured bound", retryable: false, effect: "none", details: { maxInputBytes: this.maxInputBytes } });
+      const maxInputBytes = Math.min(this.maxInputBytes, context.budgets.maxInputBytes);
+      if (byteLength(prompt) > maxInputBytes) throw createRuntimeError({ code: "AGENT_INPUT_TOO_LARGE", message: "Agent task input exceeds the configured bound", retryable: false, effect: "none", details: { maxInputBytes } });
       if (task.workspace !== undefined && realpathSync(resolve(task.workspace)) !== project.rootDir) throw createRuntimeError({ code: "AGENT_WORKSPACE_NOT_CANONICAL", message: "Agent workspace must be the registered project root", retryable: false, effect: "none" });
       const prepared = await this.prepare(task, context, project, prompt, environment);
       environment = prepared.environment;
@@ -300,7 +305,7 @@ export class CodexAgentExecutor implements AgentExecutor {
       effectClass = prepared.effectClass;
       const queued: AgentRun = { ...this.baseRun(agentRunId, task, context, "failed", "incomplete", "none", startedAt, startedAt, "", "Agent execution was not started", this.emptyMetrics(byteLength(prompt), false), posture, environment.evidence, [], undefined, undefined), capabilitySnapshot: prepared.capabilities };
       this.persistAgent(queued, "queued");
-      if (context.signal.aborted) return this.finishWithoutProcess(queued, "cancelled", createRuntimeError({ code: "AGENT_CANCELLED", message: "Agent execution was cancelled before spawn", retryable: false, effect: "none" }));
+      if (context.signal.aborted || isDeadlineExceeded(context)) return this.finishWithoutProcess(queued, "cancelled", createRuntimeError({ code: "AGENT_CANCELLED", message: "Agent execution was cancelled before spawn", retryable: false, effect: "none" }));
       this.persistAgent(queued, "running");
       this.emitAgent("agent.started", queued, "running", effectClass, "Agent execution started");
       if (this.tasks?.get(task.taskId) !== undefined) this.tasks.start(task.taskId, { reason: "Delegated to Codex" }, context);
@@ -324,20 +329,20 @@ export class CodexAgentExecutor implements AgentExecutor {
     await active.complete;
   }
 
-  private async detectCapabilities(): Promise<AgentCapabilities> {
+  private async detectCapabilities(context?: OperationContext): Promise<AgentCapabilities> {
     const detectedAt = this.tracer.now().toISOString();
     const environment = environmentFor(this.environmentOptions);
     let versionProbe: ProbeResult;
-    try { versionProbe = await this.probe(["--version"], environment.values); }
+    try { versionProbe = await this.probe(["--version"], environment.values, context); }
     catch { return this.capabilityResult(detectedAt, undefined, [], "unsupported", ["codex executable is unavailable"]); }
     const installedVersion = versionOf(versionProbe.stdout);
     let help: ProbeResult;
-    try { help = await this.probe(["exec", "--help"], environment.values); }
+    try { help = await this.probe(["exec", "--help"], environment.values, context); }
     catch { help = { code: null, signal: null, stdout: "" }; }
     const supportedFlags = flagsFromHelp(help.stdout);
     let appServer: CodexCapabilityProbe["appServer"] = "unsupported";
     try {
-      const appHelp = await this.probe(["app-server", "--help"], environment.values);
+      const appHelp = await this.probe(["app-server", "--help"], environment.values, context);
       appServer = appHelp.code === 0 ? "available" : "unsupported";
     } catch { appServer = "unsupported"; }
     const missing = REQUIRED_FLAGS.filter((flag) => !supportedFlags.includes(flag));
@@ -401,8 +406,7 @@ export class CodexAgentExecutor implements AgentExecutor {
   }
 
   private async prepare(task: AgentTask, context: OperationContext, project: ProjectIdentity, prompt: string, environment: BuiltEnvironment): Promise<PreparedExecution> {
-    const capabilities = await this.capabilities();
-    if (!capabilities.compatible) throw createRuntimeError({ code: "AGENT_INCOMPATIBLE", message: "Installed Codex cannot provide the required isolated non-interactive contract", retryable: false, effect: "none", details: { reasons: capabilities.incompatibilities } });
+    if (context.signal.aborted || isDeadlineExceeded(context)) throw createRuntimeError({ code: "AGENT_CANCELLED", message: "Agent execution was cancelled before capability probing", retryable: false, effect: "none" });
     const readDecision = effectDecision(context.effectPolicy, "read");
     if (readDecision === "deny") throw createRuntimeError({ code: "AGENT_EFFECT_DENIED", message: "AER policy does not allow the agent to read the project", retryable: false, effect: "none" });
     if (readDecision === "approval_required") throw createRuntimeError({ code: "AGENT_APPROVAL_REQUIRED_NONINTERACTIVE", message: "Project reads require approval and Codex execution is unattended", retryable: false, effect: "none" });
@@ -410,6 +414,12 @@ export class CodexAgentExecutor implements AgentExecutor {
     const canNetwork = effectDecision(context.effectPolicy, "network") === "allow";
     if (effectDecision(context.effectPolicy, "workspace_write") === "approval_required") throw createRuntimeError({ code: "AGENT_APPROVAL_REQUIRED_NONINTERACTIVE", message: "Workspace writes require approval and Codex execution is unattended", retryable: false, effect: "none" });
     if (this.grantNetwork && !canNetwork) throw createRuntimeError({ code: "AGENT_NETWORK_POLICY_DENIED", message: "Network access was requested but denied by AER policy", retryable: false, effect: "none" });
+    // Policy and the caller's bounded context are checked before any provider
+    // executable is probed. A broken/unresponsive installation cannot turn a
+    // denied or expired agent operation into an unbounded preflight.
+    const capabilities = await this.capabilities(context);
+    if (context.signal.aborted || isDeadlineExceeded(context)) throw createRuntimeError({ code: "AGENT_CANCELLED", message: "Agent execution was cancelled during capability probing", retryable: false, effect: "none" });
+    if (!capabilities.compatible) throw createRuntimeError({ code: "AGENT_INCOMPATIBLE", message: "Installed Codex cannot provide the required isolated non-interactive contract", retryable: false, effect: "none", details: { reasons: capabilities.incompatibilities } });
     const sandbox = canWrite ? "workspace-write" : "read-only";
     const network = this.grantNetwork && canNetwork;
     if (network && !capabilities.supportedAutomationFlags.includes("--config")) throw createRuntimeError({ code: "AGENT_NETWORK_UNSUPPORTED", message: "The installed Codex cannot express the requested network posture", retryable: false, effect: "none" });
@@ -431,7 +441,9 @@ export class CodexAgentExecutor implements AgentExecutor {
   }
 
   private async execute(agentRunId: AgentRunId, task: AgentTask, context: OperationContext, prepared: PreparedExecution, startedAt: string): Promise<AgentRun> {
-    const parser = new CodexJsonlParser(this.maxOutputBytes);
+    const maxOutputBytes = Math.min(this.maxOutputBytes, context.budgets.maxOutputBytes, context.budgets.maxReturnedOutputBytes);
+    const parser = new CodexJsonlParser(maxOutputBytes);
+    const transcriptLimit = Math.min(256 * 1024, context.budgets.maxArtifactBytes, context.budgets.maxRawOutputBytes);
     const transcript: string[] = [];
     let rawOutputBytes = 0;
     let stderrBytes = 0;
@@ -455,14 +467,14 @@ export class CodexAgentExecutor implements AgentExecutor {
     const closed = new Promise<void>((resolveClose, rejectClose) => { closeResolve = resolveClose; closeReject = rejectClose; });
     child.stdout.on("data", (chunk) => {
       rawOutputBytes += typeof chunk === "string" ? byteLength(chunk) : chunk.byteLength;
-      if (this.captureTranscript && byteLength(transcript.join("")) < 256 * 1024) transcript.push(bounded(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk), 256 * 1024 - byteLength(transcript.join(""))));
+      if (this.captureTranscript && byteLength(transcript.join("")) < transcriptLimit) transcript.push(bounded(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk), transcriptLimit - byteLength(transcript.join(""))));
       parser.push(chunk);
     });
     child.stderr.on("data", (chunk) => {
       const value = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
       stderrBytes += typeof chunk === "string" ? byteLength(chunk) : chunk.byteLength;
       if (stderr.length < 4_096) stderr = bounded(`${stderr}${value}`, 4_096);
-      if (this.captureTranscript && byteLength(transcript.join("")) < 256 * 1024) transcript.push(bounded(value, 256 * 1024 - byteLength(transcript.join(""))));
+      if (this.captureTranscript && byteLength(transcript.join("")) < transcriptLimit) transcript.push(bounded(value, transcriptLimit - byteLength(transcript.join(""))));
     });
     child.on("error", (error) => { spawnError = error; closeReject?.(error); });
     child.on("close", (code, signal) => { closeCode = code; closeSignal = signal; closeResolve?.(); });
@@ -471,6 +483,11 @@ export class CodexAgentExecutor implements AgentExecutor {
       child.kill("SIGTERM");
       active.cancelTimer = setTimeout(() => { child.kill("SIGKILL"); }, this.cancelGraceMs);
     };
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    if (context.deadline !== undefined) {
+      const remaining = Math.max(0, context.deadline - Date.now());
+      deadlineTimer = setTimeout(abort, remaining);
+    }
     if (context.signal.aborted) abort();
     else context.signal.addEventListener("abort", abort, { once: true });
     let parsed: ParsedCodexJsonl;
@@ -482,6 +499,7 @@ export class CodexAgentExecutor implements AgentExecutor {
       spawnError = spawnError ?? (cause instanceof Error ? cause : new Error(String(cause)));
     } finally {
       context.signal.removeEventListener("abort", abort);
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
       if (active.cancelTimer !== undefined) clearTimeout(active.cancelTimer);
     }
     const durationMs = Math.max(0, this.tracer.now().getTime() - processStarted.getTime());
@@ -491,7 +509,7 @@ export class CodexAgentExecutor implements AgentExecutor {
     else if (closeSignal !== null) terminal = terminal === "completed" ? "contradictory" : "failed";
     else if (closeCode !== 0) terminal = terminal === "completed" ? "contradictory" : terminal === "contradictory" ? "contradictory" : terminal === "incomplete" ? "failed" : terminal;
     const status = statusForTerminal(terminal);
-    const output = bounded(parsed.output, this.maxOutputBytes);
+    const output = bounded(parsed.output, maxOutputBytes);
     const artifactRefs = this.captureTranscript && transcript.length > 0
       ? [this.artifacts.put(transcript.join(""), { mediaType: "application/x-ndjson", origin: "codex.exec", sensitivity: this.transcriptSensitivity }).ref]
       : [];
@@ -656,14 +674,43 @@ export class CodexAgentExecutor implements AgentExecutor {
     if (this.state !== undefined && this.state.getEvent(event.eventId) === undefined) this.state.append(event);
   }
 
-  private async probe(args: readonly string[], environment: Readonly<Record<string, string | undefined>>): Promise<ProbeResult> {
+  private async probe(args: readonly string[], environment: Readonly<Record<string, string | undefined>>, context?: OperationContext): Promise<ProbeResult> {
     const child = this.spawnProcess(this.executable, args, { cwd: tmpdir(), env: environment, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let settled = false;
+    const configuredDeadline = context?.deadline;
+    const deadline = configuredDeadline === undefined || !Number.isFinite(configuredDeadline)
+      ? Date.now() + DEFAULT_CAPABILITY_PROBE_TIMEOUT_MS
+      : configuredDeadline;
     return await new Promise<ProbeResult>((resolveProbe, rejectProbe) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        if (killTimer !== undefined) clearTimeout(killTimer);
+        context?.signal.removeEventListener("abort", abort);
+      };
+      const rejectBounded = (message: string): void => {
+        if (settled) return;
+        settled = true;
+        try { child.kill("SIGTERM"); } catch { /* best effort */ }
+        killTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* best effort */ } }, 25);
+        cleanup();
+        rejectProbe(createRuntimeError({ code: "AGENT_CAPABILITY_PROBE_TIMEOUT", message, retryable: true, effect: "none" }));
+      };
+      const abort = (): void => rejectBounded("Codex capability probing was cancelled or exceeded its runtime budget");
       child.stdout.on("data", (chunk) => { stdout = bounded(`${stdout}${typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk)}`, 32 * 1024); });
-      child.on("error", (error) => { if (!settled) { settled = true; rejectProbe(error); } });
-      child.on("close", (code, signal) => { if (!settled) { settled = true; resolveProbe({ code, signal, stdout }); } });
+      // Drain stderr so a noisy executable cannot block before the bounded
+      // probe timer fires. Its contents are deliberately not model-facing.
+      child.stderr.on("data", () => undefined);
+      child.on("error", (error) => { if (!settled) { settled = true; cleanup(); rejectProbe(error); } });
+      child.on("close", (code, signal) => { if (!settled) { settled = true; cleanup(); resolveProbe({ code, signal, stdout }); } });
+      if (context?.signal.aborted) abort();
+      else {
+        context?.signal.addEventListener("abort", abort, { once: true });
+        const remaining = Math.max(0, deadline - Date.now());
+        timer = setTimeout(() => rejectBounded("Codex capability probing exceeded its bounded deadline"), remaining);
+      }
     });
   }
 }

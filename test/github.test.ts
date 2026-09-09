@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createOperationContext, createRunId, createTraceId, type EffectClass } from "../src/core/index.ts";
+import { createOperationContext, createRunId, createTraceId, permissiveEffectPolicy, type EffectClass } from "../src/core/index.ts";
 import { InMemoryEventSink, Tracer } from "../src/observability/index.ts";
 import { GitHubProvider, type GitHubCommandResult, type GitHubCommandRunner } from "../src/github/index.ts";
 
@@ -64,7 +64,11 @@ function json(value: unknown, extra: Partial<GitHubCommandResult> = {}): GitHubC
 
 function context(tracer: Tracer, allowedClasses?: readonly EffectClass[]) {
   const run = tracer.startRun({ actor: "model" });
-  return { run, context: createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "model", ...(allowedClasses === undefined ? {} : { effectPolicy: { allowedClasses } }) }) };
+  return { run, context: createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "model", effectPolicy: allowedClasses === undefined ? permissiveEffectPolicy() : { allowedClasses } }) };
+}
+
+function permissiveContext(): ReturnType<typeof createOperationContext> {
+  return createOperationContext({ traceId: createTraceId(), runId: createRunId(), actor: "model", effectPolicy: permissiveEffectPolicy() });
 }
 
 const repo = {
@@ -181,7 +185,7 @@ test("github.publish reuses an already reconciled PR without pushing or creating
     .when(["pr", "list", "--head", "feature/semantic", "--state", "all", "--repo", "miki-thecat/runtime", "--json", prLookupFields], json([{ number: 7, title: "semantic layer", state: "OPEN", headRefName: "feature/semantic", headRefOid: "abc123", headRepository: { nameWithOwner: "miki-thecat/runtime" }, baseRefName: "main" }]))
     .when(["pr", "view", "7", "--repo", "miki-thecat/runtime", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 7, title: "semantic layer", state: "OPEN", headRefName: "feature/semantic", headRefOid: "abc123", baseRefName: "main" }));
   const provider = new GitHubProvider({ runner });
-  const result = await provider.publish({ title: "ignored on reuse" });
+  const result = await provider.publish({ title: "ignored on reuse" }, permissiveContext());
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -221,7 +225,7 @@ test("github.publish creates through the API only after confirming no PR exists"
     .when(["api", "repos/miki-thecat/runtime/pulls", "--method", "POST", "--raw-field", "title=new PR", "--raw-field", "head=feature/new", "--raw-field", "base=main", "--raw-field", "body=body"], json({ number: 11, title: "new PR", state: "OPEN", head: { ref: "feature/new", sha: "fedcba" }, base: { ref: "main" } }))
     .when(["pr", "view", "11", "--repo", "miki-thecat/runtime", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 11, title: "new PR", state: "OPEN", headRefName: "feature/new", headRefOid: "fedcba", baseRefName: "main" }));
   const provider = new GitHubProvider({ runner });
-  const result = await provider.publish({ title: "new PR", body: "body" });
+  const result = await provider.publish({ title: "new PR", body: "body" }, permissiveContext());
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -254,7 +258,7 @@ test("github.publish follows an explicitly selected remote and preserves literal
   const tracer = new Tracer();
   const provider = new GitHubProvider({ runner, tracer });
 
-  const result = await provider.publish({ remote: "upstream", branch, title: "123", body: "@body-is-literal" });
+  const result = await provider.publish({ remote: "upstream", branch, title: "123", body: "@body-is-literal" }, permissiveContext());
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -279,7 +283,7 @@ test("github.publish reconciles an ambiguous push before reusing a PR", async ()
     .when(["pr", "list", "--head", "feature/ambiguous", "--state", "all", "--repo", "miki-thecat/runtime", "--json", prLookupFields], json([{ number: 9, state: "OPEN", headRefName: "feature/ambiguous", headRefOid: "def456", headRepository: { nameWithOwner: "miki-thecat/runtime" }, baseRefName: "main" }]))
     .when(["pr", "view", "9", "--repo", "miki-thecat/runtime", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 9, state: "OPEN", headRefName: "feature/ambiguous", headRefOid: "def456", baseRefName: "main" }));
   const provider = new GitHubProvider({ runner });
-  const result = await provider.publish({ title: "ambiguous" });
+  const result = await provider.publish({ title: "ambiguous" }, permissiveContext());
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -355,7 +359,7 @@ test("github.publish never retries an ambiguous API create with raw gh create", 
     .when(freshArgs, json(pullRequest));
   const provider = new GitHubProvider({ runner });
 
-  const result = await provider.publish({ branch, title: "ambiguous" });
+  const result = await provider.publish({ branch, title: "ambiguous" }, permissiveContext());
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -376,7 +380,7 @@ test("github.publish does not return a stale PR when the required fresh read fai
     .when(listArgs, json([{ number: 13, state: "OPEN", headRefName: branch, headRefOid: "stale123", headRepository: { nameWithOwner: "miki-thecat/runtime" }, baseRefName: "main" }]));
   const provider = new GitHubProvider({ runner });
 
-  const result = await provider.publish({ branch, title: "stale" });
+  const result = await provider.publish({ branch, title: "stale" }, permissiveContext());
 
   assert.equal(result.ok, false);
   if (result.ok) return;
@@ -396,7 +400,7 @@ test("github.publish preserves applied effect when post-push reconciliation cann
     .when(["push", "origin", `HEAD:refs/heads/${branch}`], { stdout: "", stderr: "", exitCode: 0 });
   const provider = new GitHubProvider({ runner });
 
-  const result = await provider.publish({ branch, title: "post-push" });
+  const result = await provider.publish({ branch, title: "post-push" }, permissiveContext());
 
   assert.equal(result.ok, false);
   if (result.ok) return;
@@ -437,7 +441,7 @@ test("github.publish preserves a REST repository default branch", async () => {
     .when(["pr", "view", "21", "--repo", "miki-thecat/runtime", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 21, title: "REST branch", state: "OPEN", headRefName: branch, headRefOid: "rest123", baseRefName: "develop" }));
   const provider = new GitHubProvider({ runner });
 
-  const result = await provider.publish({ branch, title: "REST branch" });
+  const result = await provider.publish({ branch, title: "REST branch" }, permissiveContext());
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -460,7 +464,7 @@ test("github.publish does not reuse an identity-free PR from the bare-branch fal
     .when(["pr", "view", "42", "--repo", "miki-thecat/runtime", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 42, title: "local PR", state: "OPEN", headRefName: branch, headRefOid: "unverified123", baseRefName: "main" }));
   const provider = new GitHubProvider({ runner });
 
-  const result = await provider.publish({ branch, title: "local PR" });
+  const result = await provider.publish({ branch, title: "local PR" }, permissiveContext());
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -482,7 +486,7 @@ test("github.publish requires an explicit base when the repository default is un
     .when(["rev-parse", "HEAD"], { stdout: "no-default123\n", stderr: "", exitCode: 0 });
   const provider = new GitHubProvider({ runner });
 
-  const result = await provider.publish({ branch: "feature/no-default", title: "must not guess base" });
+  const result = await provider.publish({ branch: "feature/no-default", title: "must not guess base" }, permissiveContext());
 
   assert.equal(result.ok, false);
   if (result.ok) return;
@@ -614,7 +618,7 @@ test("github.publish ignores a same-named fork pull request", async () => {
     .when(["pr", "view", "5", "--repo", "miki-thecat/runtime", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 5, title: "local PR", state: "OPEN", headRefName: branch, headRefOid: "fork-local-sha", baseRefName: "main" }));
   const provider = new GitHubProvider({ runner });
 
-  const result = await provider.publish({ branch, title: "local PR" });
+  const result = await provider.publish({ branch, title: "local PR" }, permissiveContext());
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -753,7 +757,7 @@ test("github.publish scopes default-remote PR reconciliation to origin", async (
     .when(["pr", "view", "52", "--repo", "miki-thecat/runtime", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 52, state: "OPEN", headRefName: branch, headRefOid: "origin-sha", baseRefName: "main" }));
   const provider = new GitHubProvider({ runner });
 
-  const result = await provider.publish({ branch, title: "origin" });
+  const result = await provider.publish({ branch, title: "origin" }, permissiveContext());
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
@@ -771,7 +775,7 @@ test("github.publish does not fall back to an unscoped repository when origin is
     .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repositoryA));
   const provider = new GitHubProvider({ runner });
 
-  const result = await provider.publish({ branch: "feature/unreadable-origin", title: "must not target A" });
+  const result = await provider.publish({ branch: "feature/unreadable-origin", title: "must not target A" }, permissiveContext());
 
   assert.equal(result.ok, false);
   if (result.ok) return;
