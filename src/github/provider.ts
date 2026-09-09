@@ -301,7 +301,7 @@ function retryAfterMilliseconds(value: string | undefined, nowMs = Date.now()): 
 function rateLimitInfo(result: GitHubCommandResult, nowMs = Date.now()): RateLimitInfo | undefined {
   const output = `${result.stdout}\n${result.stderr}`;
   const statusText = result.httpStatus === undefined
-    ? /\bHTTP(?:\/\d(?:\.\d)?)?\s*[:/]?\s*(403|429)\b/i.exec(output)?.[1]
+    ? /\bHTTP(?:\/\d(?:\.\d)?)?\s*[:/]?\s*(\d{3})\b/i.exec(output)?.[1]
     : String(result.httpStatus);
   const status = statusText === undefined ? undefined : Number(statusText);
   const retryAfterText = numericHeader(result.headers, "retry-after") ??
@@ -316,17 +316,37 @@ function rateLimitInfo(result: GitHubCommandResult, nowMs = Date.now()): RateLim
   const remainingText = numericHeader(result.headers, "x-ratelimit-remaining") ??
     /(?:^|\n)\s*x-ratelimit-remaining\s*:\s*([^\r\n]+)/i.exec(output)?.[1];
   const remaining = nonNegativeNumber(remainingText);
-  const secondary = /secondary rate limit|abuse detection|please wait|too many requests/i.test(output);
+  const secondaryMessage = /secondary rate limit|abuse detection/i.test(output);
   const rateMessage = /api rate limit exceeded|rate limit exceeded|rate[- ]limited/i.test(output);
   // A successful response may legitimately consume the last request in the
   // current budget. Do not turn a valid 200 with x-ratelimit-remaining: 0
   // into a retry/error, especially when its JSON body is the useful result.
   const successful = (result.exitCode ?? 0) === 0 &&
     (status === undefined || (status >= 200 && status < 300));
-  const exhausted = remaining === 0 && !successful;
-  const looksLimited = status === 429 || rateMessage || secondary || exhausted || (status === 403 && (retryAfterMs !== undefined || resetAtMs !== undefined));
+  if (successful) return undefined;
+
+  // Only 403/429 responses are status-level GitHub rate-limit signals. The
+  // body and headers are useful corroboration, but generic phrases such as
+  // "please wait" or "too many requests" also occur in ordinary failures and
+  // must not turn a transient 503/403 into GITHUB_RATE_LIMITED.
+  const rateLimitStatus = status === 403 || status === 429;
+  const primaryExhausted = remaining === 0 && rateLimitStatus;
+  const responseRateMessage = (status === undefined || rateLimitStatus) && (secondaryMessage || rateMessage);
+  const ordinaryForbiddenMessage = /forbidden|unauthorized|permission denied|bad credentials|resource not accessible|insufficient permission/i.test(output);
+  const noSafeSecondaryHint = retryAfterMs === undefined &&
+    (resetAtMs === undefined || resetAtMs - nowMs > MAX_RATE_LIMIT_DELAY_MS);
+  // GitHub uses 403 for secondary limits, including responses without a
+  // Retry-After/reset hint. A bare 403 is therefore treated as secondary only
+  // when it has no primary-exhaustion signal or known permission failure; a
+  // reset-bearing or explicitly forbidden 403 remains an ordinary failure.
+  const hintlessSecondaryStatus = status === 403 && !primaryExhausted &&
+    !secondaryMessage && !rateMessage && !ordinaryForbiddenMessage && noSafeSecondaryHint;
+  const looksLimited = status === 429 || responseRateMessage || primaryExhausted || hintlessSecondaryStatus ||
+    (status === 403 && retryAfterMs !== undefined);
   if (!looksLimited) return undefined;
-  let info: RateLimitInfo = { secondary, primaryExhausted: remaining === 0 };
+  const secondary = status === 429 || secondaryMessage ||
+    (status === 403 && rateMessage && remaining !== 0) || hintlessSecondaryStatus;
+  let info: RateLimitInfo = { secondary, primaryExhausted };
   if (typeof status === "number" && Number.isSafeInteger(status)) info = { ...info, status };
   if (retryAfterMs !== undefined) info = { ...info, retryAfterMs };
   if (resetAtMs !== undefined) info = { ...info, resetAtMs };
@@ -643,8 +663,10 @@ function reviewIsNewer(current: { readonly review: GitHubReview; readonly ordina
   if (Number.isFinite(currentTime) && Number.isFinite(candidateTime) && currentTime !== candidateTime) {
     return (candidateTime as number) > (currentTime as number);
   }
-  if (!Number.isFinite(currentTime) && Number.isFinite(candidateTime)) return true;
-  if (Number.isFinite(currentTime) && !Number.isFinite(candidateTime)) return false;
+  // REST normally returns review history chronologically. If either timestamp
+  // is absent or malformed, it cannot establish temporal order; use that
+  // stable API order instead of allowing an older approval to survive a
+  // later changes-requested/pending row.
   return candidate.ordinal >= current.ordinal;
 }
 
@@ -652,6 +674,8 @@ function effectiveReviews(reviews: readonly GitHubReview[]): { readonly reviews:
   const byAuthor = new Map<string, { readonly review: GitHubReview; readonly ordinal: number }>();
   let complete = true;
   reviews.forEach((review, ordinal) => {
+    const submittedAt = review.submittedAt === undefined ? undefined : Date.parse(review.submittedAt);
+    if (!Number.isFinite(submittedAt)) complete = false;
     const author = review.author?.trim().toLowerCase();
     if (author === undefined || author === "") {
       // Without an identity, historical rows cannot safely be collapsed into

@@ -645,6 +645,33 @@ test("github REST enrichment paginates reviews and merges check runs with legacy
   assert.equal(pullRequest?.checksSummary.state, "failure");
 });
 
+test("github REST review summaries stay incomplete when the effective row has no valid timestamp", async () => {
+  const branch = "feature/review-timestamp-unknown";
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], { stdout: "", stderr: "unsupported", exitCode: 1 })
+    .when(["remote", "get-url", "origin"], { stdout: "git@github.com:miki-thecat/runtime.git\n", stderr: "", exitCode: 0 })
+    .when(["api", "repos/miki-thecat/runtime"], json(repo))
+    .when(["branch", "--show-current"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "review-timestamp-sha\n", stderr: "", exitCode: 0 })
+    .when(["pr", "view", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], { stdout: "", stderr: "unsupported", exitCode: 1 })
+    .when(["api", "repos/miki-thecat/runtime/pulls?head=miki-thecat%3Afeature%2Freview-timestamp-unknown&state=open&per_page=1"], json([{ number: 7, state: "OPEN", head: { ref: branch, sha: "review-timestamp-sha", repo: { full_name: "miki-thecat/runtime" } }, base: { ref: "main" } }]))
+    .when(["api", "repos/miki-thecat/runtime/pulls/7/reviews?per_page=100", "--paginate", "--slurp"], json([
+      { user: { login: "same-reviewer" }, state: "APPROVED", submitted_at: "2026-09-09T00:00:00Z" },
+      { user: { login: "same-reviewer" }, state: "CHANGES_REQUESTED", submitted_at: "not-a-timestamp" },
+    ]))
+    .when(["api", "repos/miki-thecat/runtime/commits/review-timestamp-sha/check-runs?per_page=100", "--paginate", "--slurp"], json({ check_runs: [{ name: "verify", status: "completed", conclusion: "success" }] }))
+    .when(["api", "repos/miki-thecat/runtime/commits/review-timestamp-sha/status?per_page=100", "--paginate", "--slurp"], json({ statuses: [] }));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.snapshot({}, createOperationContext({ traceId: createTraceId(), runId: createRunId(), actor: "model" }));
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.currentPullRequest?.reviewsSummary.approved, 0);
+  assert.equal(result.data.currentPullRequest?.reviewsSummary.changesRequested, 1);
+  assert.equal(result.data.currentPullRequest?.reviewsSummary.complete, false);
+});
+
 test("github.wait keeps a legacy failing status from passing successful check runs", async () => {
   const runner = new FixtureRunner()
     .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
@@ -767,10 +794,10 @@ test("github secondary rate limits without a retry floor hint terminate without 
     .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
     .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], {
       stdout: "",
-      stderr: "HTTP 403: secondary rate limit\n",
+      stderr: "HTTP 403\n",
       exitCode: 1,
       httpStatus: 403,
-      headers: { "x-ratelimit-remaining": "42", "x-ratelimit-reset": String(Math.ceil(nowMs / 1_000) + 2) },
+      headers: { "x-ratelimit-remaining": "42" },
     });
   const provider = new GitHubProvider({ runner, clock: () => nowMs, sleep: async (milliseconds) => { delays.push(milliseconds); } });
 
@@ -783,4 +810,46 @@ test("github secondary rate limits without a retry floor hint terminate without 
   assert.equal(runner.executableCalls.filter((args) => args[0] === "gh" && args[1] === "pr" && args[2] === "checks").length, 1);
   assert.equal(runner.shellCalls.length, 0);
   assert.equal(result.meta.metrics.retries, 0);
+});
+
+test("github 429 without a retry hint is a terminal secondary limit", async () => {
+  const delays: number[] = [];
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], {
+      stdout: "",
+      stderr: "HTTP 429: too many requests\n",
+      exitCode: 1,
+      httpStatus: 429,
+    });
+  const provider = new GitHubProvider({ runner, sleep: async (milliseconds) => { delays.push(milliseconds); } });
+
+  const result = await provider.wait({ pullRequest: 7, condition: "checks_passed", intervalMs: 0, timeoutMs: 5_000, maxPolls: 1 });
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, "GITHUB_RATE_LIMITED");
+  assert.deepEqual(delays, []);
+  assert.equal(runner.executableCalls.filter((args) => args[0] === "gh" && args[1] === "pr" && args[2] === "checks").length, 1);
+  assert.equal(runner.shellCalls.length, 0);
+  assert.equal(result.meta.metrics.retries, 0);
+});
+
+test("github rate-limit wording in successful or ordinary transient responses is not rate limiting", async () => {
+  const successfulRunner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], json([{ name: "please wait", state: "COMPLETED", conclusion: "SUCCESS" }]));
+  const successful = await new GitHubProvider({ runner: successfulRunner }).wait({ pullRequest: 7, condition: "checks_passed", intervalMs: 0, timeoutMs: 100, maxPolls: 1 });
+  assert.equal(successful.ok, true);
+  if (!successful.ok) return;
+  assert.equal(successful.data.passed, true);
+
+  const ordinaryRunner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], { stdout: "", stderr: "HTTP 503: please wait\n", exitCode: 1, httpStatus: 503 })
+    .when(["api", "repos/miki-thecat/runtime/pulls/7"], { stdout: "", stderr: "HTTP 403: forbidden\n", exitCode: 1, httpStatus: 403, headers: { "x-ratelimit-reset": String(Math.ceil(Date.now() / 1_000) + 2) } });
+  const ordinary = await new GitHubProvider({ runner: ordinaryRunner }).wait({ pullRequest: 7, condition: "checks_passed", intervalMs: 0, timeoutMs: 100, maxPolls: 1 });
+  assert.equal(ordinary.ok, false);
+  if (ordinary.ok) return;
+  assert.notEqual(ordinary.error.code, "GITHUB_RATE_LIMITED");
 });
