@@ -6,6 +6,7 @@ import {
   existsSync,
   fstatSync,
   lstatSync,
+  linkSync,
   openSync,
   readFileSync,
   readSync,
@@ -106,6 +107,28 @@ interface Snapshot {
   readonly beforeExists: boolean;
 }
 
+interface LockOwner {
+  readonly pid: number;
+  readonly hostname: string;
+  readonly createdAt: string;
+  readonly nonce: string;
+  readonly processStartIdentity?: string;
+}
+
+/** Linux start time distinguishes a live owner from an unrelated reused PID. */
+function processStartIdentity(processId: number): string | undefined {
+  if (platform !== "linux") return undefined;
+  try {
+    const stat = new TextDecoder().decode(readFileSync(`/proc/${processId}/stat`));
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return undefined;
+    const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
+    return fields[19]; // Field 22; fields[0] is the process state (field 3).
+  } catch {
+    return undefined;
+  }
+}
+
 export function sha256(content: Uint8Array): string {
   return createHash("sha256").update(content).digest("hex");
 }
@@ -176,6 +199,7 @@ export function readConfinedFile(rootDir: string, filePath: string, allowMissing
   const root = realpathSync(resolve(rootDir));
   const candidate = resolve(root, filePath);
   assertInside(root, candidate);
+  if (platform !== "linux") throw createRuntimeError({ code: "FILE_CONFINEMENT_UNSUPPORTED", message: "Race-resistant semantic file reads require Linux /proc descriptor validation", retryable: false, effect: "none" });
   let file: number;
   try {
     file = openSync(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -189,9 +213,7 @@ export function readConfinedFile(rootDir: string, filePath: string, allowMissing
   try {
     const stat = fstatSync(file);
     if (!stat.isFile()) throw createRuntimeError({ code: "FILE_NOT_REGULAR", message: `Not a regular file: ${filePath}`, retryable: false, effect: "none" });
-    let physical = candidate;
-    if (platform === "linux") physical = realpathSync(`/proc/self/fd/${file}`);
-    else physical = realpathSync(candidate);
+    const physical = realpathSync(`/proc/self/fd/${file}`);
     assertInside(root, physical);
     const bytes = new Uint8Array(stat.size);
     let offset = 0;
@@ -225,7 +247,8 @@ function assertCurrent(rootDir: string, path: string, expectedHash: string | und
   }
 }
 
-function atomicReplace(rootDir: string, path: string, content: Uint8Array, expectedHash: string | undefined, expectedExists: boolean, replacementMode?: number): void {
+function atomicReplace(rootDir: string, path: string, content: Uint8Array, expectedHash: string | undefined, expectedExists: boolean, replacementMode?: number, onReplaced?: () => void): void {
+  if (platform !== "linux") throw createRuntimeError({ code: "FILE_CONFINEMENT_UNSUPPORTED", message: "Race-resistant semantic file mutation requires Linux /proc descriptor anchoring", retryable: false, effect: "none" });
   const current = readConfinedFile(rootDir, relative(rootDir, path), true);
   const actualHash = current.bytes === undefined ? undefined : sha256(current.bytes);
   if ((current.bytes !== undefined) !== expectedExists || actualHash !== expectedHash) {
@@ -243,6 +266,7 @@ function atomicReplace(rootDir: string, path: string, content: Uint8Array, expec
     writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
     chmodSync(temporary, replacementMode ?? current.mode ?? 0o600);
     renameSync(temporary, destination);
+    onReplaced?.();
     const actual = currentBytes(rootDir, path);
     if (actual === undefined || sha256(actual) !== sha256(content)) {
       throw createRuntimeError({ code: "FILE_WRITE_RACE", message: "The file changed while applying the guarded change", retryable: false, effect: "unknown", details: { path } });
@@ -380,29 +404,33 @@ export class ChangeSetManager {
   /** Serialize AER-mediated mutations in this project root. */
   withMutationLock<T>(operation: () => T): T {
     const lockPath = join(this.rootDir, ".aer-mutation.lock");
-    let lockFd: number | undefined;
-    const owner = JSON.stringify({ pid, hostname: hostname(), createdAt: this.clock().toISOString(), nonce: Math.random().toString(36).slice(2) });
+    const nonce = Math.random().toString(36).slice(2);
+    const identity = processStartIdentity(pid);
+    const owner = JSON.stringify({ pid, hostname: hostname(), createdAt: this.clock().toISOString(), nonce, ...(identity === undefined ? {} : { processStartIdentity: identity }) } satisfies LockOwner);
+    const claimPath = join(this.rootDir, `.aer-mutation-claim-${pid}-${nonce}`);
+    let acquired = false;
     try {
+      writeFileSync(claimPath, owner, { flag: "wx", mode: 0o600 });
       try {
-        lockFd = openSync(lockPath, "wx", 0o600);
+        linkSync(claimPath, lockPath);
+        acquired = true;
       } catch (cause) {
         const code = cause !== null && typeof cause === "object" && "code" in cause ? String(cause.code) : "";
         if (code !== "EEXIST") throw cause;
         if (!this.reconcileStaleLock(lockPath)) {
           throw createRuntimeError({ code: "FILE_MUTATION_LOCKED", message: "Another semantic file mutation owns the project lock", retryable: true, effect: "none" });
         }
-        try { lockFd = openSync(lockPath, "wx", 0o600); }
+        try { linkSync(claimPath, lockPath); acquired = true; }
         catch (retryCause) {
           const retryCode = retryCause !== null && typeof retryCause === "object" && "code" in retryCause ? String(retryCause.code) : "";
           if (retryCode === "EEXIST") throw createRuntimeError({ code: "FILE_MUTATION_LOCKED", message: "Another semantic file mutation won stale-lock recovery", retryable: true, effect: "none" });
           throw retryCause;
         }
       }
-      writeFileSync(lockFd, owner);
       return operation();
     } finally {
-      if (lockFd !== undefined) {
-        closeSync(lockFd);
+      try { unlinkSync(claimPath); } catch { /* The private claim may already be gone. */ }
+      if (acquired) {
         try { if (new TextDecoder().decode(readFileSync(lockPath)) === owner) unlinkSync(lockPath); } catch { /* Never remove a replacement lock. */ }
       }
     }
@@ -410,6 +438,7 @@ export class ChangeSetManager {
 
   rollback(input: RollbackInput): RuntimeResult<ChangeSet> {
     const { changeset, context } = input;
+    let writeApplied = false;
     try {
       return this.withMutationLock(() => {
         const snapshots = this.snapshots.get(changeset.id);
@@ -442,10 +471,11 @@ export class ChangeSetManager {
           if (currentHash === file.beforeHash || (!file.beforeExists && currentHash === undefined)) continue;
           const content = beforeContent.find((entry) => entry.file === file)?.content;
           if (file.beforeExists && content !== undefined) {
-            atomicReplace(this.rootDir, path, content, file.afterHash, true, file.beforeMode);
+            atomicReplace(this.rootDir, path, content, file.afterHash, true, file.beforeMode, () => { writeApplied = true; });
           } else if (!file.beforeExists) {
             assertCurrent(this.rootDir, path, file.afterHash, true);
             unlinkSync(path);
+            writeApplied = true;
             if (existsSync(path)) throw createRuntimeError({ code: "FILE_WRITE_RACE", message: `Could not remove ${file.path} safely`, retryable: false, effect: "unknown" });
           }
         }
@@ -455,9 +485,10 @@ export class ChangeSetManager {
         return runtimeSuccess(rolledBack, this.rollbackMeta(context, "completed", changeset.files.length));
       });
     } catch (cause: unknown) {
-      const error = cause && typeof cause === "object" && "code" in cause
+      const original = cause && typeof cause === "object" && "code" in cause
         ? cause as ReturnType<typeof createRuntimeError>
         : createRuntimeError({ code: "ROLLBACK_FAILED", message: cause instanceof Error ? cause.message : "Rollback failed", retryable: false, effect: "unknown" });
+      const error = writeApplied && original.effect === "none" ? createRuntimeError({ ...original, effect: "unknown" }) : original;
       return runtimeFailure(error, this.rollbackMeta(context, error.effect === "unknown" ? "unknown" : "failed", 0, error.effect));
     }
   }
@@ -545,16 +576,24 @@ export class ChangeSetManager {
       const raw = new TextDecoder().decode(readFileSync(lockPath));
       let stale = false;
       try {
-        const parsed = JSON.parse(raw) as { pid?: unknown; hostname?: unknown; createdAt?: unknown };
-        if (parsed.hostname === hostname() && typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0) {
-          try { kill(parsed.pid, 0); } catch (cause) { stale = cause !== null && typeof cause === "object" && "code" in cause && cause.code === "ESRCH"; }
-        } else if (typeof parsed.createdAt === "string") {
-          stale = Date.now() - Date.parse(parsed.createdAt) > 30_000;
+        const parsed = JSON.parse(raw) as Partial<LockOwner>;
+        if (parsed.hostname !== hostname() || typeof parsed.pid !== "number" || !Number.isSafeInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.nonce !== "string") return false;
+        let live = true;
+        try { kill(parsed.pid, 0); }
+        catch (cause) {
+          const code = cause !== null && typeof cause === "object" && "code" in cause ? String(cause.code) : "";
+          if (code === "ESRCH") live = false;
+          else return false;
+        }
+        stale = !live;
+        if (live && typeof parsed.processStartIdentity === "string") {
+          const currentIdentity = processStartIdentity(parsed.pid);
+          stale = currentIdentity !== undefined && currentIdentity !== parsed.processStartIdentity;
         }
       } catch {
-        // A crash between exclusive creation and owner-record persistence can
-        // leave an empty lock. Only age, never malformed content alone, makes it stale.
-        stale = Date.now() - before.mtimeMs > 30_000;
+        // Current locks are installed by hard-linking a fully written claim, so
+        // malformed/empty or foreign-host locks cannot be deleted safely.
+        return false;
       }
       if (!stale) return false;
       const after = lstatSync(lockPath);

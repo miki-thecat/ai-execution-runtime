@@ -437,15 +437,27 @@ export class DirectProcessManager {
       const id = entity.id as ProcessId;
       const projectId = data.projectId ?? entity.projectId;
       const taskId = data.taskId ?? entity.taskId;
+      const reconciled: ProcessRecord = {
+        processId: id,
+        ...(typeof data.pid === "number" ? { pid: data.pid } : {}),
+        operation: typeof data.operation === "string" ? data.operation : "process.run",
+        commandKind: data.commandKind === "shell" ? "shell" : "executable",
+        argumentCount: typeof data.argumentCount === "number" && Number.isSafeInteger(data.argumentCount) && data.argumentCount >= 0 ? data.argumentCount : 0,
+        ...(typeof data.cwd === "string" ? { cwd: data.cwd } : {}),
+        startedAt: typeof data.startedAt === "string" ? data.startedAt : entity.createdAt ?? new Date().toISOString(),
+        traceId: data.traceId,
+        runId: data.runId,
+        ...(projectId === undefined ? {} : { projectId }),
+        ...(taskId === undefined ? {} : { taskId }),
+        spanId: data.spanId,
+        operationId: typeof data.operationId === "string" ? data.operationId : createOperationId(),
+        effectClass: data.effectClass === "read" || data.effectClass === "workspace_write" || data.effectClass === "network" || data.effectClass === "remote_write" || data.effectClass === "destructive" || data.effectClass === "privileged" ? data.effectClass : "destructive",
+        reattachable: false,
+      };
       orphaned.push(id);
-      this.state.saveEntity({
-        ...entity,
-        status: "unknown",
-        updatedAt: new Date().toISOString(),
-        data: stateData({ ...(data as ProcessRecord), processId: id }, "unknown", {
-          orphaned: true,
-          orphanReason: "Process handles cannot be safely reattached after runtime restart",
-        }),
+      this.persist(reconciled, "unknown", {
+        orphaned: true,
+        orphanReason: "Process handles cannot be safely reattached after runtime restart",
       });
       this.tracer.emit({
         traceId: data.traceId as import("../core/ids.ts").TraceId,
@@ -455,13 +467,13 @@ export class DirectProcessManager {
         actor: "runtime",
         ...(projectId === undefined ? {} : { projectId: projectId as import("../core/ids.ts").ProjectId }),
         ...(taskId === undefined ? {} : { taskId: taskId as import("../core/ids.ts").TaskId }),
-        ...(data.operation === undefined ? {} : { operation: data.operation }),
-        operationId: data.operationId as import("../core/ids.ts").OperationId,
+        operation: reconciled.operation,
+        operationId: reconciled.operationId as import("../core/ids.ts").OperationId,
         status: "unknown",
         executor: "direct",
         provider: "node:child_process",
         effectState: "unknown",
-        effectClass: data.effectClass ?? "destructive",
+        effectClass: reconciled.effectClass,
         summary: "Process was orphaned during runtime restart; reattachment is unsafe",
         metadata: { processId: id, orphaned: true },
       });

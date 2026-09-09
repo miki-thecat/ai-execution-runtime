@@ -21,7 +21,7 @@ import {
   type RuntimeEvent,
   type RuntimeEventInput,
 } from "./events.ts";
-import { Redactor, sanitizeDurableText } from "./redaction.ts";
+import { Redactor, sanitizeDurableText, type Sensitivity } from "./redaction.ts";
 
 export interface TracerOptions {
   readonly sink?: EventSink;
@@ -78,7 +78,7 @@ export class Tracer {
     this.clock = options.clock ?? (() => new Date());
   }
 
-  emit(input: RuntimeEventInput, payloadSensitivity: "public" | "internal" | "personal" | "secret" = "internal"): RuntimeEvent {
+  emit(input: RuntimeEventInput, payloadSensitivity: Sensitivity = "internal"): RuntimeEvent {
     const captured = input.payload === undefined
       ? undefined
       : this.redactor.capture(input.payload, payloadSensitivity);

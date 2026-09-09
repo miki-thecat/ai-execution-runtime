@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { FileArtifactStore } from "../src/artifacts/index.ts";
-import { createOperationContext } from "../src/core/index.ts";
+import { createOperationContext, createRuntimeError } from "../src/core/index.ts";
 import { FileOperations } from "../src/files/index.ts";
 import { InMemoryEventSink, Tracer } from "../src/observability/index.ts";
 import { SqliteStateStore } from "../src/state/index.ts";
@@ -220,6 +220,11 @@ test("malformed unified patches fail closed without becoming replacement content
     if (result.ok) return;
     assert.equal(result.error.code, "PATCH_INVALID");
     assert.equal(readFileSync(path, "utf8"), "before\n");
+    const wrongNewCount = files.patch({ path: "guarded.txt", expectedHash: read.data.contentHash, patch: "@@ -1,1 +1,99 @@\n-before\n+after\n" }, context);
+    assert.equal(wrongNewCount.ok, false);
+    if (wrongNewCount.ok) return;
+    assert.equal(wrongNewCount.error.code, "PATCH_INVALID");
+    assert.equal(readFileSync(path, "utf8"), "before\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -242,7 +247,44 @@ test("a dead-owner mutation lock is recovered without admitting a live owner", (
     if (blocked.ok) return;
     assert.equal(blocked.error.code, "FILE_MUTATION_LOCKED");
     assert.equal(statSync(lockPath).isFile(), true);
+
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, hostname: "foreign-host", createdAt: "2000-01-01T00:00:00.000Z", nonce: "foreign" }), { mode: 0o600 });
+    const foreignBlocked = files.patch({ path: "foreign-blocked.txt", content: "no\n" }, context);
+    assert.equal(foreignBlocked.ok, false);
+    if (foreignBlocked.ok) return;
+    assert.equal(foreignBlocked.error.code, "FILE_MUTATION_LOCKED");
+
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, hostname: hostname(), createdAt: new Date().toISOString(), nonce: "reused", processStartIdentity: "not-the-current-process" }), { mode: 0o600 });
+    const reusedRecovered = files.patch({ path: "reused-recovered.txt", content: "ok\n" }, context);
+    assert.equal(reusedRecovered.ok, true);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("post-write persistence failures report an unknown patch effect", () => {
+  const root = fixture();
+  const state = new SqliteStateStore(":memory:");
+  try {
+    const tracer = new Tracer();
+    const { context } = contextFor(tracer);
+    const originalSave = state.saveEntity.bind(state);
+    let saves = 0;
+    state.saveEntity = (entity) => {
+      saves += 1;
+      if (saves === 3) throw createRuntimeError({ code: "STATE_STORE_BUSY", message: "busy", retryable: true, effect: "none" });
+      originalSave(entity);
+    };
+    const files = new FileOperations({ rootDir: root, state });
+    const result = files.patch({ path: "effect.txt", content: "written\n" }, context);
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.error.code, "STATE_STORE_BUSY");
+    assert.equal(result.error.effect, "unknown");
+    assert.equal(result.meta.status, "unknown");
+    assert.equal(readFileSync(join(root, "effect.txt"), "utf8"), "written\n");
+  } finally {
+    state.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -166,6 +166,49 @@ function json(value: unknown): string {
   return encoded;
 }
 
+function sanitizeStrings(value: unknown): unknown {
+  if (typeof value === "string") return sanitizeDurableText(value);
+  if (Array.isArray(value)) return value.map(sanitizeStrings);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, sanitizeStrings(child)]));
+  }
+  return value;
+}
+
+const PROCESS_STATE_KEYS = new Set([
+  "processId", "pid", "operation", "commandKind", "argumentCount", "cwd",
+  "startedAt", "traceId", "runId", "projectId", "taskId", "spanId",
+  "operationId", "effectClass", "reattachable", "status", "completedAt",
+  "exitCode", "signal", "timedOut", "cancelled", "artifactRefs",
+  "rawOutputBytes", "returnedOutputBytes", "effectState", "errorCode", "error",
+  "orphaned", "orphanReason",
+]);
+
+function sanitizeVerificationEvidence(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return sanitizeStrings(value);
+  const evidence = sanitizeStrings(value) as Record<string, unknown>;
+  if (Array.isArray(evidence.checks)) {
+    evidence.checks = evidence.checks.map((check) => {
+      if (check === null || typeof check !== "object" || Array.isArray(check)) return check;
+      return { ...(check as Record<string, unknown>), command: "[not persisted]", stdout: "", stderr: "" };
+    });
+  }
+  return evidence;
+}
+
+function sanitizeEntityData(kind: StateEntityType, data: Readonly<Record<string, unknown>> | undefined): Readonly<Record<string, unknown>> | undefined {
+  if (data === undefined) return undefined;
+  if (kind === "processes") {
+    return Object.fromEntries(Object.entries(data).filter(([key]) => PROCESS_STATE_KEYS.has(key)).map(([key, value]) => [key, sanitizeStrings(value)]));
+  }
+  if (kind === "verifications") {
+    const sanitized = sanitizeStrings(data) as Record<string, unknown>;
+    if ("evidence" in sanitized) sanitized.evidence = sanitizeVerificationEvidence(sanitized.evidence);
+    return sanitized;
+  }
+  return data;
+}
+
 function taskStatusForEvent(type: RuntimeEvent["type"]): RuntimeStatus | undefined {
   switch (type) {
     case "task.created": return "queued";
@@ -386,8 +429,9 @@ export class SqliteStateStore implements StateStore {
     const now = new Date().toISOString();
     const createdAt = entity.createdAt ?? now;
     const updatedAt = entity.updatedAt ?? now;
-    const traceId = entity.traceId ?? (entity.data?.traceId as string | undefined) ?? "trace_unknown";
-    const changesetId = entity.changesetId ?? (entity.data?.changesetId as string | undefined);
+    const data = sanitizeEntityData(entity.kind, entity.data);
+    const traceId = entity.traceId ?? (data?.traceId as string | undefined) ?? "trace_unknown";
+    const changesetId = entity.changesetId ?? (data?.changesetId as string | undefined);
     if (entity.kind === "changeset_files" && changesetId === undefined) {
       throw new Error("changeset_files entities require changesetId");
     }
@@ -402,14 +446,14 @@ export class SqliteStateStore implements StateStore {
     ];
     const status = entity.status ?? ((entity.kind === "runs" || entity.kind === "tasks") ? "queued" : undefined);
     const terminal = status === "completed" || status === "failed" || status === "cancelled" || status === "unknown";
-    const completedAt = terminal ? (typeof entity.data?.completedAt === "string" ? entity.data.completedAt : updatedAt) : null;
+    const completedAt = terminal ? (typeof data?.completedAt === "string" ? data.completedAt : updatedAt) : null;
     const values: unknown[] = [
       entity.id,
       ...(table.idColumn === "project_id" ? [] : [nullable(entity.projectId)]),
       ...(table.idColumn === "run_id" ? [] : [nullable(entity.runId)]),
       ...(table.idColumn === "task_id" ? [] : [nullable(entity.taskId)]),
       ...(entity.kind === "changeset_files" ? [changesetId] : []),
-      nullable(status), createdAt, updatedAt, json(entity.data),
+      nullable(status), createdAt, updatedAt, json(data),
       ...(entity.kind === "runs" ? [traceId, createdAt, completedAt] : []),
     ];
     const updates = [
@@ -551,7 +595,10 @@ export class SqliteStateStore implements StateStore {
     const taskId = optionalString(row, "task_id");
     const changesetId = optionalString(row, "changeset_id");
     const status = optionalString(row, "status");
-    const data = parseJson(row.data_json);
+    const parsedData = parseJson(row.data_json);
+    const data = parsedData !== undefined && parsedData !== null && typeof parsedData === "object" && !Array.isArray(parsedData)
+      ? sanitizeEntityData(kind, parsedData as Readonly<Record<string, unknown>>)
+      : undefined;
     return {
       kind,
       id: stringValue(row, table.idColumn),

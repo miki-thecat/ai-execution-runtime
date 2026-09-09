@@ -333,7 +333,7 @@ export class VerificationRunner {
   get(verificationId: VerificationId): VerificationEvidence | undefined {
     const entity = this.state?.getEntity("verifications", verificationId);
     const data = entity?.data?.evidence;
-    if (data !== undefined && typeof data === "object") return data as VerificationEvidence;
+    if (data !== undefined && typeof data === "object") return durableEvidence(data as VerificationEvidence);
     return this.memory.get(verificationId);
   }
 
@@ -343,6 +343,7 @@ export class VerificationRunner {
   }
 
   private persistPartial(id: VerificationId, project: ProjectIdentity, context: OperationContext, status: string, timestamp: string, checks: readonly VerificationCheckEvidence[]): void {
+    const evidence = durableEvidence({ verificationId: id, id, projectId: project.projectId, runId: context.runId, status: "unknown", passed: false, startedAt: timestamp, completedAt: timestamp, summary: "Verification started", checks, artifactRefs: [] });
     this.state?.saveEntity({
       kind: "verifications",
       id,
@@ -352,7 +353,7 @@ export class VerificationRunner {
       traceId: context.traceId,
       createdAt: timestamp,
       updatedAt: timestamp,
-      data: { verificationId: id, traceId: context.traceId, evidence: { verificationId: id, id, projectId: project.projectId, runId: context.runId, status, passed: false, startedAt: timestamp, completedAt: timestamp, summary: "Verification started", checks, artifactRefs: [] } },
+      data: { verificationId: id, traceId: context.traceId, evidence: { ...evidence, status } },
     });
   }
 

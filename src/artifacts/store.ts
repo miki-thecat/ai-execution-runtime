@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import {
-  chmodSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync,
+  chmodSync, closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync,
   readFileSync, readSync, renameSync, unlinkSync, writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { join } from "node:path";
+import { kill, pid, platform } from "node:process";
 import { createArtifactRef, type ArtifactRef } from "../core/ids.ts";
 import { createRuntimeError } from "../core/result.ts";
 import { isSensitivity, strongestSensitivity, type Sensitivity } from "../observability/redaction.ts";
@@ -120,6 +121,29 @@ function writePrivateAtomic(path: string, content: string | Uint8Array, root: st
   }
 }
 
+interface ArtifactLockOwner {
+  readonly pid: number;
+  readonly hostname: string;
+  readonly nonce: string;
+  readonly processStartIdentity?: string;
+}
+
+function processStartIdentity(processId: number): string | undefined {
+  if (platform !== "linux") return undefined;
+  try {
+    const stat = new TextDecoder().decode(readFileSync(`/proc/${processId}/stat`));
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return undefined;
+    return stat.slice(commandEnd + 2).trim().split(/\s+/)[19];
+  } catch {
+    return undefined;
+  }
+}
+
+function pause(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
 /** Local, content-addressed artifact storage for the Full Alpha data root. */
 export class FileArtifactStore implements ArtifactStore {
   readonly rootDir: string;
@@ -138,6 +162,10 @@ export class FileArtifactStore implements ArtifactStore {
   put(content: Uint8Array | string, options: ArtifactPutOptions = {}): ArtifactMetadata {
     const bytes = bytesFor(content);
     const digest = digestFor(bytes);
+    return this.withDigestLock(digest, () => this.putLocked(bytes, digest, options));
+  }
+
+  private putLocked(bytes: Uint8Array, digest: string, options: ArtifactPutOptions): ArtifactMetadata {
     const ref = createArtifactRef(digest);
     const contentPath = this.contentPath(digest);
     const metadataPath = this.metadataPath(digest);
@@ -199,6 +227,65 @@ export class FileArtifactStore implements ArtifactStore {
 
   has(ref: ArtifactRef): boolean {
     try { this.read(ref, { length: 0 }); return true; } catch { return false; }
+  }
+
+  private withDigestLock<T>(digest: string, operation: () => T): T {
+    const directory = join(this.rootDir, "sha256");
+    const lockPath = join(directory, `.${digest}.lock`);
+    const nonce = Math.random().toString(36).slice(2);
+    const identity = processStartIdentity(pid);
+    const owner = JSON.stringify({ pid, hostname: hostname(), nonce, ...(identity === undefined ? {} : { processStartIdentity: identity }) } satisfies ArtifactLockOwner);
+    const claimPath = join(directory, `.${digest}.claim-${pid}-${nonce}`);
+    const deadline = Date.now() + 1_000;
+    let acquired = false;
+    try {
+      writeFileSync(claimPath, owner, { flag: "wx", mode: 0o600 });
+      while (!acquired) {
+        try {
+          linkSync(claimPath, lockPath);
+          acquired = true;
+        } catch (cause) {
+          const code = cause !== null && typeof cause === "object" && "code" in cause ? String(cause.code) : "";
+          if (code !== "EEXIST") throw cause;
+          if (this.reconcileDigestLock(lockPath)) continue;
+          if (Date.now() >= deadline) throw createRuntimeError({ code: "ARTIFACT_STORE_BUSY", message: "Artifact metadata remained locked beyond its bounded contention window", retryable: true, effect: "none" });
+          pause(10);
+        }
+      }
+      return operation();
+    } finally {
+      try { unlinkSync(claimPath); } catch { /* The private claim may already be gone. */ }
+      if (acquired) {
+        try { if (new TextDecoder().decode(readFileSync(lockPath)) === owner) unlinkSync(lockPath); } catch { /* Never remove a replacement lock. */ }
+      }
+    }
+  }
+
+  private reconcileDigestLock(lockPath: string): boolean {
+    try {
+      const before = lstatSync(lockPath);
+      const parsed = JSON.parse(new TextDecoder().decode(readFileSync(lockPath))) as Partial<ArtifactLockOwner>;
+      if (parsed.hostname !== hostname() || typeof parsed.pid !== "number" || !Number.isSafeInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.nonce !== "string") return false;
+      let live = true;
+      try { kill(parsed.pid, 0); }
+      catch (cause) {
+        const code = cause !== null && typeof cause === "object" && "code" in cause ? String(cause.code) : "";
+        if (code === "ESRCH") live = false;
+        else return false;
+      }
+      let stale = !live;
+      if (live && typeof parsed.processStartIdentity === "string") {
+        const currentIdentity = processStartIdentity(parsed.pid);
+        stale = currentIdentity !== undefined && currentIdentity !== parsed.processStartIdentity;
+      }
+      if (!stale) return false;
+      const after = lstatSync(lockPath);
+      if (before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) return false;
+      unlinkSync(lockPath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private readVerified(ref: ArtifactRef, digest: string, metadata: ArtifactMetadata | undefined, offset: number, length: number, expectedSize?: number): Uint8Array {

@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, closeSync, existsSync, openSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
-import { pid } from "node:process";
+import { pid, platform } from "node:process";
 import {
   createOperationMeta,
   createRuntimeError,
@@ -142,7 +142,11 @@ function inputBytes(input: unknown): number {
 }
 
 function safeError(cause: unknown, fallbackCode: string, fallbackEffect: "none" | "unknown" | "applied" = "none"): RuntimeError {
-  if (cause && typeof cause === "object" && "code" in cause && "message" in cause && "effect" in cause) return cause as RuntimeError;
+  if (cause && typeof cause === "object" && "code" in cause && "message" in cause && "effect" in cause) {
+    const error = cause as RuntimeError;
+    if (fallbackEffect === "unknown" && error.effect === "none") return createRuntimeError({ ...error, effect: "unknown" });
+    return error;
+  }
   return createRuntimeError({ code: fallbackCode, message: cause instanceof Error ? cause.message : "File operation failed", retryable: false, effect: fallbackEffect });
 }
 
@@ -157,31 +161,42 @@ function unifiedPatch(source: string, patch: string): string {
   const hunkIndex = patchLines.findIndex((line) => line.startsWith("@@"));
   if (hunkIndex < 0) throw createRuntimeError({ code: "PATCH_INVALID", message: "Unified patch contains no valid hunk", retryable: false, effect: "none" });
   const header = patchLines[hunkIndex]!;
-  const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(header);
+  const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$/.exec(header);
   if (match === null) throw createRuntimeError({ code: "PATCH_INVALID", message: "Unified patch hunk header is invalid", retryable: false, effect: "none" });
   const oldStart = Number(match[1]);
   const oldCount = Number(match[2] ?? "1");
-  let cursor = oldStart - 1;
+  const newStart = Number(match[3]);
+  const newCount = Number(match[4] ?? "1");
+  if (![oldStart, oldCount, newStart, newCount].every(Number.isSafeInteger) || oldCount < 0 || newCount < 0) {
+    throw createRuntimeError({ code: "PATCH_INVALID", message: "Unified patch hunk range is invalid", retryable: false, effect: "none" });
+  }
+  const spliceIndex = oldCount === 0 ? oldStart : oldStart - 1;
+  const expectedNewStart = newCount === 0 ? spliceIndex : spliceIndex + 1;
+  if (spliceIndex < 0 || spliceIndex > lines.length || newStart !== expectedNewStart) {
+    throw createRuntimeError({ code: "PATCH_INVALID", message: "Unified patch hunk position is invalid", retryable: false, effect: "none" });
+  }
+  let cursor = spliceIndex;
   const replacement: string[] = [];
   let consumed = 0;
+  let produced = 0;
   for (const line of patchLines.slice(hunkIndex + 1)) {
     if (line.startsWith("\\ No newline")) continue;
     const marker = line[0];
     const value = line.slice(1);
     if (marker === " ") {
       if (lines[cursor] !== value) throw createRuntimeError({ code: "PATCH_CONTEXT_MISMATCH", message: "Unified patch context does not match the current file", retryable: false, effect: "none" });
-      replacement.push(value); cursor += 1; consumed += 1;
+      replacement.push(value); cursor += 1; consumed += 1; produced += 1;
     } else if (marker === "-") {
       if (lines[cursor] !== value) throw createRuntimeError({ code: "PATCH_CONTEXT_MISMATCH", message: "Unified patch removal does not match the current file", retryable: false, effect: "none" });
       cursor += 1; consumed += 1;
     } else if (marker === "+") {
-      replacement.push(value);
+      replacement.push(value); produced += 1;
     } else if (line !== "") {
       throw createRuntimeError({ code: "PATCH_INVALID", message: "Unified patch contains an unsupported line", retryable: false, effect: "none" });
     }
   }
-  if (consumed !== oldCount) throw createRuntimeError({ code: "PATCH_INVALID", message: "Unified patch line count does not match its hunk header", retryable: false, effect: "none" });
-  lines.splice(oldStart - 1, oldCount, ...replacement);
+  if (consumed !== oldCount || produced !== newCount) throw createRuntimeError({ code: "PATCH_INVALID", message: "Unified patch line count does not match its hunk header", retryable: false, effect: "none" });
+  lines.splice(spliceIndex, oldCount, ...replacement);
   return lines.join("\n");
 }
 
@@ -313,12 +328,11 @@ export class FileOperations {
         if (currentHash !== beforeHash || (current === undefined) !== (before === undefined)) {
           throw createRuntimeError({ code: "FILE_HASH_MISMATCH", message: `Refusing to overwrite ${input.path}; the file changed while preparing the patch`, retryable: false, effect: "none", details: { path: input.path, expectedHash: beforeHash, actualHash: currentHash } });
         }
-        atomicWrite(this.rootDir, outputPath, after, opened.mode);
+        atomicWrite(this.rootDir, outputPath, after, opened.mode, () => { writeApplied = true; });
         const written = readConfinedFile(this.rootDir, relativeFile(this.rootDir, outputPath), true).bytes;
         if (written === undefined || sha256(written) !== afterHash) {
           throw createRuntimeError({ code: "FILE_WRITE_RACE", message: `The file changed while applying ${input.path}`, retryable: false, effect: "unknown", details: { path: input.path, expectedHash: afterHash, actualHash: written === undefined ? undefined : sha256(written) } });
         }
-        writeApplied = true;
       });
       const data: FilePatchResult = { path: relativeFile(this.rootDir, outputPath), ...(before === undefined ? {} : { beforeHash: sha256(before) }), afterHash, changeset, changeSet: changeset };
       const refs = changeset.files.flatMap((file) => [file.beforeArtifactRef, file.afterArtifactRef].filter((ref): ref is ArtifactRef => ref !== undefined));
@@ -476,7 +490,8 @@ function walk(directory: string, root: string, files: string[]): void {
   }
 }
 
-function atomicWrite(rootDir: string, path: string, content: Uint8Array, mode?: number): void {
+function atomicWrite(rootDir: string, path: string, content: Uint8Array, mode?: number, onReplaced?: () => void): void {
+  if (platform !== "linux") throw createRuntimeError({ code: "FILE_CONFINEMENT_UNSUPPORTED", message: "Race-resistant semantic file mutation requires Linux /proc descriptor anchoring", retryable: false, effect: "none" });
   const parent = dirname(path);
   const confinedParent = resolveConfinedPath(rootDir, relative(rootDir, parent) || ".", false);
   if (confinedParent !== parent) throw createRuntimeError({ code: "FILE_PATH_ESCAPE", message: "Semantic file path parent changed outside the project root", retryable: false, effect: "none" });
@@ -490,6 +505,7 @@ function atomicWrite(rootDir: string, path: string, content: Uint8Array, mode?: 
     writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
     chmodSync(temporary, mode ?? 0o600);
     renameSync(temporary, destination);
+    onReplaced?.();
   } finally {
     if (existsSync(temporary)) unlinkSync(temporary);
     closeSync(directoryFd);

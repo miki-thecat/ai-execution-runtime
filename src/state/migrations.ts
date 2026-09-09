@@ -211,6 +211,38 @@ export const STATE_MIGRATIONS: readonly StateMigration[] = [
       CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at);
     `,
   },
+  {
+    version: 3,
+    sql: `
+      UPDATE processes
+      SET data_json = json_remove(
+        data_json,
+        '$.executable', '$.args', '$.command', '$.shell',
+        '$.env', '$.environment', '$.environmentValues'
+      )
+      WHERE json_valid(data_json);
+
+      UPDATE verifications
+      SET data_json = json_set(
+        data_json,
+        '$.evidence.checks',
+        COALESCE(
+          (
+            SELECT json_group_array(json(json_set(
+              json_remove(value, '$.command'),
+              '$.command', '[not persisted]',
+              '$.stdout', '',
+              '$.stderr', ''
+            )))
+            FROM json_each(data_json, '$.evidence.checks')
+          ),
+          json('[]')
+        )
+      )
+      WHERE json_valid(data_json)
+        AND json_type(data_json, '$.evidence.checks') = 'array';
+    `,
+  },
 ] as const;
 
 export const CURRENT_STATE_SCHEMA_VERSION = STATE_MIGRATIONS.at(-1)?.version ?? 0;

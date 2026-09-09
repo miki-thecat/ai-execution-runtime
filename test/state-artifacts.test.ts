@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
@@ -9,7 +10,7 @@ import { createOperationContext, createProjectId, createRuntimeError, createTask
 import { createRuntimeEvent } from "../src/observability/events.ts";
 import { Tracer } from "../src/observability/index.ts";
 import { OperationRegistry } from "../src/operations/index.ts";
-import { SqliteStateStore } from "../src/state/index.ts";
+import { CURRENT_STATE_SCHEMA_VERSION, STATE_MIGRATIONS, SqliteStateStore } from "../src/state/index.ts";
 import { TaskManager } from "../src/tasks/index.ts";
 
 function temporaryDirectory(): string {
@@ -27,7 +28,7 @@ test("SQLite state survives close and reopen with canonical run events", () => {
     first.close();
 
     const reopened = new SqliteStateStore(dbPath);
-    assert.equal(reopened.schemaVersion, 2);
+    assert.equal(reopened.schemaVersion, CURRENT_STATE_SCHEMA_VERSION);
     assert.deepEqual(reopened.listEvents({ runId: run.runId }).map((event) => event.type), [
       "run.started",
       "run.completed",
@@ -35,6 +36,49 @@ test("SQLite state survives close and reopen with canonical run events", () => {
     assert.deepEqual(reopened.getEvent(completed.eventId), completed);
     assert.equal(reopened.getRun(run.runId)?.status, "completed");
     reopened.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("state migration removes legacy raw process commands and verification output", () => {
+  const directory = temporaryDirectory();
+  const dbPath = join(directory, "aer.db");
+  const legacy = new DatabaseSync(dbPath);
+  try {
+    for (const migration of STATE_MIGRATIONS.filter(({ version }) => version < 3)) {
+      legacy.exec(migration.sql);
+      legacy.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(migration.version, new Date().toISOString());
+    }
+    const processSecret = "token=legacy-process-sentinel";
+    legacy.prepare("INSERT INTO processes (process_id, status, created_at, updated_at, data_json) VALUES (?, ?, ?, ?, ?)").run(
+      "process_legacy", "running", new Date().toISOString(), new Date().toISOString(), JSON.stringify({ executable: "sh", args: [processSecret], command: processSecret, argumentCount: 1 }),
+    );
+    const verificationSecret = "token=legacy-verification-sentinel";
+    legacy.prepare("INSERT INTO verifications (verification_id, status, created_at, updated_at, data_json) VALUES (?, ?, ?, ?, ?)").run(
+      "verification_legacy", "failed", new Date().toISOString(), new Date().toISOString(), JSON.stringify({ evidence: { checks: [{ command: verificationSecret, stdout: verificationSecret, stderr: verificationSecret }] } }),
+    );
+  } finally {
+    legacy.close();
+  }
+  try {
+    const migrated = new SqliteStateStore(dbPath);
+    try {
+      const processData = migrated.getEntity("processes", "process_legacy")?.data;
+      assert.equal("executable" in (processData ?? {}), false);
+      assert.equal("args" in (processData ?? {}), false);
+      const check = (migrated.getEntity("verifications", "verification_legacy")?.data?.evidence as { checks?: readonly Record<string, unknown>[] } | undefined)?.checks?.[0];
+      assert.deepEqual({ command: check?.command, stdout: check?.stdout, stderr: check?.stderr }, { command: "[not persisted]", stdout: "", stderr: "" });
+      const raw = new DatabaseSync(dbPath);
+      try {
+        assert.equal(String(raw.prepare("SELECT data_json FROM processes WHERE process_id = ?").get("process_legacy")?.data_json).includes("legacy-process-sentinel"), false);
+        assert.equal(String(raw.prepare("SELECT data_json FROM verifications WHERE verification_id = ?").get("verification_legacy")?.data_json).includes("legacy-verification-sentinel"), false);
+      } finally {
+        raw.close();
+      }
+    } finally {
+      migrated.close();
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -144,6 +188,32 @@ test("local state and artifacts are private and artifact sensitivity only escala
     assert.equal(statSync(join(artifacts.rootDir, "sha256", first.digest)).mode & 0o777, 0o600);
   } finally {
     state.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("concurrent artifact writers cannot overwrite stronger sensitivity metadata", async () => {
+  const directory = temporaryDirectory();
+  const moduleUrl = new URL("../src/artifacts/store.ts", import.meta.url).href;
+  const worker = `
+    import { FileArtifactStore } from ${JSON.stringify(moduleUrl)};
+    const store = new FileArtifactStore(process.argv[1]);
+    for (let index = 0; index < 100; index += 1) store.put("shared concurrent bytes", { sensitivity: process.argv[2] });
+  `;
+  const run = (sensitivity: "internal" | "secret") => new Promise<void>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", worker, directory, sensitivity], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr || `artifact worker exited ${code}`)));
+  });
+  try {
+    await Promise.all([run("secret"), run("internal")]);
+    const artifacts = new FileArtifactStore(directory);
+    const metadata = artifacts.put("shared concurrent bytes", { sensitivity: "public" });
+    assert.equal(metadata.sensitivity, "secret");
+    assert.equal(artifacts.metadata(metadata.ref)?.sensitivity, "secret");
+  } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 });
