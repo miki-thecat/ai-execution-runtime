@@ -81,6 +81,12 @@ interface PullRequestLookupOptions {
    * and raw reads before reporting an ambiguous effect.
    */
   readonly reconcileAfterEmpty?: boolean;
+  /**
+   * When publishing to a non-default remote, gh must be scoped explicitly so
+   * its structured/raw PR reads cannot accidentally use the current checkout
+   * repository instead of the selected remote repository.
+   */
+  readonly ghRepository?: GitHubRepository;
 }
 
 class ProviderMetrics {
@@ -511,6 +517,17 @@ function rawCommand(args: readonly string[]): string {
   return ["gh", ...args].map(shellQuote).join(" ");
 }
 
+function ghRepositoryArgs(repository: GitHubRepository | undefined): readonly string[] {
+  return repository === undefined ? [] : ["--repo", repository.nameWithOwner];
+}
+
+function pullRequestLookupOptions(ghRepository: GitHubRepository | undefined, reconcileAfterEmpty = false): PullRequestLookupOptions {
+  return {
+    ...(reconcileAfterEmpty ? { reconcileAfterEmpty: true } : {}),
+    ...(ghRepository === undefined ? {} : { ghRepository }),
+  };
+}
+
 function parseVersion(stdout: string): string | undefined {
   return /gh version\s+([^\s]+)/i.exec(stdout)?.[1];
 }
@@ -540,8 +557,11 @@ export class GitHubProvider {
   private readonly maxOutputBytes: number;
 
   constructor(options: GitHubProviderOptions = {}) {
-    this.direct = options.direct ?? new DirectExecutor();
-    this.tracer = options.tracer ?? this.direct.tracer;
+    // DirectExecutor emits process/artifact events through its own tracer.
+    // Construct it with the provider tracer so one GitHub operation keeps a
+    // single canonical trace sink.
+    this.direct = options.direct ?? new DirectExecutor(options.tracer === undefined ? {} : { tracer: options.tracer });
+    this.tracer = this.direct.tracer;
     this.maxOutputBytes = options.maxOutputBytes ?? GH_OUTPUT_LIMIT;
     this.runner = options.runner ?? new DirectGitHubCommandRunner(this.direct, this.maxOutputBytes);
     this.sleep = options.sleep ?? ((milliseconds, signal) => new Promise<void>((resolve, reject) => {
@@ -720,12 +740,13 @@ export class GitHubProvider {
     return this.runOperation("github.publish", "remote", context, async (metrics, operationContext) => {
       const cwd = input.cwd;
       const routes = new Set<GitHubProviderRoute>();
-      const repositoryAttempt = await this.readRepositoryAttempt(cwd, operationContext, metrics, routes);
+      const repositoryAttempt = await this.readRepositoryAttempt(cwd, operationContext, metrics, routes, input.remote);
       const repository = repositoryAttempt?.value;
       if (repository === undefined) {
         throw createRuntimeError({ code: "GITHUB_REPOSITORY_NOT_FOUND", message: "Current GitHub repository was not found", retryable: false, effect: "none" });
       }
       const remote = input.remote ?? "origin";
+      const ghRepository = input.remote === undefined ? undefined : repository;
       const branch = input.branch ?? await this.gitText(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd, operationContext, metrics);
       const localHead = await this.gitText(["rev-parse", "HEAD"], cwd, operationContext, metrics);
       if (branch === undefined || localHead === undefined) {
@@ -768,24 +789,24 @@ export class GitHubProvider {
         reconciled = true;
       }
 
-      let pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes))?.value;
+      let pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository)))?.value;
       let created = false;
       let pullRequestEffectState: EffectState = "none";
       if (pullRequest === undefined) {
         try {
-          const createResult = await this.createPullRequest(repository, branch, base, input.title, input.body ?? "", cwd, operationContext, metrics, routes);
+          const createResult = await this.createPullRequest(repository, branch, base, input.title, input.body ?? "", cwd, operationContext, metrics, routes, ghRepository);
           created = createResult.created;
           pullRequest = createResult.pullRequest;
           pullRequestEffectState = createResult.effectState ?? "none";
           if (!created) reconciled = true;
         } catch (cause) {
           // Never issue a blind second create after an ambiguous response.
-          pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, { reconcileAfterEmpty: true }))?.value;
+          pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, true)))?.value;
           if (pullRequest === undefined) throw errorFor(cause, "GITHUB_PR_CREATE_UNKNOWN", "unknown");
           pullRequestEffectState = "unknown";
           reconciled = true;
         }
-        pullRequest ??= (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes))?.value;
+        pullRequest ??= (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository)))?.value;
       }
       if (pullRequest === undefined) {
         throw createRuntimeError({ code: "GITHUB_PR_NOT_FOUND_AFTER_PUBLISH", message: "Pull request could not be read after publish", retryable: true, effect: pullRequestEffectState === "unknown" ? "unknown" : created || pushed ? "applied" : "none" });
@@ -795,7 +816,7 @@ export class GitHubProvider {
         : pushed || created
           ? "applied"
           : "none";
-      const freshPullRequest = (await this.readPullRequest(repository, pullRequest.number, cwd, operationContext, metrics, routes))?.value;
+      const freshPullRequest = (await this.readPullRequest(repository, pullRequest.number, cwd, operationContext, metrics, routes, ghRepository))?.value;
       if (freshPullRequest === undefined) {
         throw createRuntimeError({ code: "GITHUB_PR_FRESH_READ_FAILED", message: "Pull request could not be freshly reconciled after publish", retryable: true, effect: publishEffectState, details: { pullRequest: pullRequest.number } });
       }
@@ -983,7 +1004,11 @@ export class GitHubProvider {
     return (await this.readRepositoryAttempt(cwd, context, metrics, routes))?.value;
   }
 
-  private async readRepositoryAttempt(cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubRepository> | undefined> {
+  private async readRepositoryAttempt(cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, remote?: string): Promise<Attempt<GitHubRepository> | undefined> {
+    // An explicitly selected publish remote is authoritative. `gh repo view`
+    // without --repo describes the checkout's default repository and could
+    // therefore point PR reconciliation at a different remote.
+    if (remote !== undefined) return this.readRepositoryFromRemote(remote, cwd, context, metrics, routes);
     const structured = await this.jsonCommand(["repo", "view", "--json", REPO_JSON_FIELDS], cwd, context, metrics);
     if (structured !== undefined) {
       const repository = parseRepository(structured.value);
@@ -992,27 +1017,29 @@ export class GitHubProvider {
         return { value: repository, route: "gh-json" };
       }
     }
-    const remoteResult = await this.gitText(["remote", "get-url", "origin"], cwd, context, metrics);
+    return this.readRepositoryFromRemote("origin", cwd, context, metrics, routes);
+  }
+
+  private async readRepositoryFromRemote(remote: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubRepository> | undefined> {
+    const remoteResult = await this.gitText(["remote", "get-url", remote], cwd, context, metrics);
     const fromRemote = remoteResult === undefined ? undefined : parseRepositoryFromRemote(remoteResult);
-    if (fromRemote !== undefined) {
-      const api = await this.apiJson(`repos/${repositoryPath(fromRemote)}`, [], cwd, context, metrics);
-      if (api !== undefined) {
-        // REST uses html_url/default_branch/full_name, while gh --json uses
-        // url/defaultBranchRef/nameWithOwner. Normalize before parsing so the
-        // publish base branch remains the repository's actual default.
-        const repository = parseRepository(api.value) ?? {
-          ...fromRemote,
-          ...(stringValue(nested(api.value, "html_url")) === undefined ? {} : { url: stringValue(nested(api.value, "html_url")) as string }),
-          ...(stringValue(nested(api.value, "default_branch")) === undefined ? {} : { defaultBranch: stringValue(nested(api.value, "default_branch")) as string }),
-        };
-        routes.add(api.route);
-        return { value: repository, route: api.route };
-      }
-      // The git remote identifies the repository, but a failed API read must
-      // not advertise gh-api as an available provider route.
-      return { value: fromRemote, route: "unavailable" };
+    if (fromRemote === undefined) return undefined;
+    const api = await this.apiJson(`repos/${repositoryPath(fromRemote)}`, [], cwd, context, metrics);
+    if (api !== undefined) {
+      // REST uses html_url/default_branch/full_name, while gh --json uses
+      // url/defaultBranchRef/nameWithOwner. Normalize before parsing so the
+      // publish base branch remains the repository's actual default.
+      const repository = parseRepository(api.value) ?? {
+        ...fromRemote,
+        ...(stringValue(nested(api.value, "html_url")) === undefined ? {} : { url: stringValue(nested(api.value, "html_url")) as string }),
+        ...(stringValue(nested(api.value, "default_branch")) === undefined ? {} : { defaultBranch: stringValue(nested(api.value, "default_branch")) as string }),
+      };
+      routes.add(api.route);
+      return { value: repository, route: api.route };
     }
-    return undefined;
+    // The git remote identifies the repository, but a failed API read must
+    // not advertise gh-api as an available provider route.
+    return { value: fromRemote, route: "unavailable" };
   }
 
   private async jsonCommand(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<Attempt<unknown> | undefined> {
@@ -1096,8 +1123,8 @@ export class GitHubProvider {
     return undefined;
   }
 
-  private async readPullRequest(repository: GitHubRepository, number: number, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubPullRequest> | undefined> {
-    const structured = await this.jsonCommand(["pr", "view", String(number), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+  private async readPullRequest(repository: GitHubRepository, number: number, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, ghRepository?: GitHubRepository): Promise<Attempt<GitHubPullRequest> | undefined> {
+    const structured = await this.jsonCommand(["pr", "view", String(number), ...ghRepositoryArgs(ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
     if (structured !== undefined) {
       const value = parsePullRequest(structured.value);
       if (value !== undefined) {
@@ -1114,7 +1141,7 @@ export class GitHubProvider {
         return { value: enriched, route: api.route };
       }
     }
-    const raw = await this.rawJson(["pr", "view", String(number), "--json", PR_JSON_FIELDS], cwd, context, metrics);
+    const raw = await this.rawJson(["pr", "view", String(number), ...ghRepositoryArgs(ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
     if (raw !== undefined) {
       const value = parsePullRequest(raw.value);
       if (value !== undefined) {
@@ -1250,9 +1277,9 @@ export class GitHubProvider {
     // Older gh versions accepted only a bare branch for --head. Prefer the
     // owner-qualified form so a same-named fork cannot be selected, but keep a
     // compatibility retry when the installed CLI rejects that filter.
-    let structured = await this.jsonCommand(["pr", "list", "--head", head, "--state", "all", "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+    let structured = await this.jsonCommand(["pr", "list", "--head", head, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
     if (structured === undefined) {
-      structured = await this.jsonCommand(["pr", "list", "--head", branch, "--state", "all", "--json", PR_JSON_FIELDS], cwd, context, metrics);
+      structured = await this.jsonCommand(["pr", "list", "--head", branch, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
     }
     if (structured !== undefined) {
       const value = selectPullRequest(parsePullRequests(structured.value), branch, repository);
@@ -1272,9 +1299,9 @@ export class GitHubProvider {
         return { value, route: api.route };
       }
     }
-    let raw = await this.rawJson(["pr", "list", "--head", head, "--state", "all", "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
+    let raw = await this.rawJson(["pr", "list", "--head", head, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_LOOKUP_JSON_FIELDS], cwd, context, metrics);
     if (raw === undefined) {
-      raw = await this.rawJson(["pr", "list", "--head", branch, "--state", "all", "--json", PR_JSON_FIELDS], cwd, context, metrics);
+      raw = await this.rawJson(["pr", "list", "--head", branch, "--state", "all", ...ghRepositoryArgs(options.ghRepository), "--json", PR_JSON_FIELDS], cwd, context, metrics);
     }
     if (raw !== undefined) {
       const value = selectPullRequest(parsePullRequests(raw.value), branch, repository);
@@ -1286,14 +1313,14 @@ export class GitHubProvider {
     return undefined;
   }
 
-  private async createPullRequest(repository: GitHubRepository, branch: string, base: string, title: string, body: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<CreatePullRequestResult> {
-    const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls`, ["--method", "POST", "--field", `title=${title}`, "--field", `head=${branch}`, "--field", `base=${base}`, "--field", `body=${body}`], cwd, context, metrics, false);
+  private async createPullRequest(repository: GitHubRepository, branch: string, base: string, title: string, body: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, ghRepository?: GitHubRepository): Promise<CreatePullRequestResult> {
+    const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls`, ["--method", "POST", "--raw-field", `title=${title}`, "--raw-field", `head=${branch}`, "--raw-field", `base=${base}`, "--raw-field", `body=${body}`], cwd, context, metrics, false);
     const createdPullRequest = api === undefined ? undefined : parsePullRequest(api.value);
     if (createdPullRequest !== undefined) {
       if (api !== undefined) routes.add(api.route);
       return { created: true, pullRequest: createdPullRequest };
     }
-    const reconciled = await this.findPullRequest(repository, branch, cwd, context, metrics, routes, { reconcileAfterEmpty: true });
+    const reconciled = await this.findPullRequest(repository, branch, cwd, context, metrics, routes, pullRequestLookupOptions(ghRepository, true));
     if (reconciled !== undefined) return { created: false, pullRequest: reconciled.value, effectState: "unknown" };
     // The API create was an effectful attempt. An empty or stale read after
     // that attempt is ambiguous, so a raw `gh pr create` retry could create a
