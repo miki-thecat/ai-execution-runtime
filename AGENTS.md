@@ -1,55 +1,29 @@
 # AGENTS.md
 
-## Product goal
-Build AI Execution Runtime: a persistent, AI-native execution layer that lets ChatGPT/AI clients operate a computer directly or delegate bounded work to specialized agents, with durable state, verification, rollback evidence, and observability.
+## Goal
+Build AI Execution Runtime (AER): a persistent execution layer for AI clients to operate a computer directly or delegate bounded work, with durable state, verification, rollback evidence, and observability.
 
-## Architecture authority
-During Product-complete Full Alpha, these files are canonical:
+## Authority and context
+Architecture authority is `docs/ARCHITECTURE.md`, `docs/OBSERVABILITY.md`, then `docs/FULL_ALPHA_PLAN.md`; the exact GitHub Issue defines the local scope and acceptance contract. Architecture wins on conflict. Do not redesign shared architecture inside an implementation Issue.
 
-1. `docs/ARCHITECTURE.md`
-2. `docs/OBSERVABILITY.md`
-3. `docs/FULL_ALPHA_PLAN.md`
-4. the exact GitHub Issue contract being implemented
+Use progressive disclosure: do not read canonical docs wholesale. Locate headings/terms first and read only sections relevant to the current Issue; when the Issue already restates the applicable contract, use it unless a concrete ambiguity requires the canonical doc.
 
-If implementation convenience conflicts with those documents, the documents win. Do not redesign architecture inside an implementation Issue.
+## Full Alpha delivery
+Work breadth-first toward a runnable product. Preserve contracts and dependency direction, complete the requested vertical capability, keep it observable, and add only contract/happy-path/critical workspace-or-effect safety tests. Defer exhaustive edge cases, compatibility polish, performance tuning, and speculative abstractions unless the Issue explicitly owns them.
 
-## Current delivery phase
-**PRODUCT-COMPLETE FULL ALPHA — breadth first.**
-
-Priority order:
-1. preserve canonical contracts and dependency direction;
-2. complete the requested vertical capability;
-3. keep the product path runnable and observable;
-4. add only tests required for the contract, happy path, and critical workspace/effect safety;
-5. defer exhaustive edge cases, compatibility polish, performance tuning, and speculative abstractions.
-
-## Non-negotiable architecture
-- ChatGPT/AI client is the planner/control brain; AER v0 has no second LLM planner.
-- Direct execution is first-class. Codex is an optional sibling executor, never a mandatory hop.
-- Project/runtime owns durable state; chat and agent sessions do not.
-- Every meaningful operation emits canonical structured observability.- Large/raw outputs become local artifacts; model-facing results stay bounded.
-- Long waits happen inside AER rather than through repeated model polling.
-- Semantic operations retain raw CLI fallback through direct execution.
-- Writes/effects expose effect state and are idempotent/reversible where the Issue contract requires it.
-- MCP/CLI/App/remote are adapters over one internal runtime, not separate implementations.
-- Sandbox is a provider abstraction. Do not implement custom Firecracker infrastructure in Full Alpha.
-
-## Issue discipline
-- Work only on the exact Issue scope and owned paths.
-- Do not expand into deferred subsystems just because they are nearby.
-- Do not silently change shared core interfaces from a downstream Issue. If the contract is insufficient, stop and report the blocker.
-- Do not create another planner/router/agent framework inside AER.
-- Do not mutate GitHub task authority from the worker unless the controller explicitly owns that effect.
+## Non-negotiable invariants
+- ChatGPT/AI client plans; AER v0 has no second LLM planner.
+- Direct execution is first-class; Codex is an optional sibling executor, never runtime authority.
+- Project/runtime owns durable state; chat/agent sessions do not.
+- Meaningful operations emit canonical structured observability; large/raw output becomes bounded artifact evidence.
+- Long waits stay inside AER rather than model polling.
+- Semantic operations retain raw CLI fallback through Direct.
+- Effects stay truthful and follow Issue-required idempotency/reversibility.
+- MCP/CLI/App/remote are adapters over one runtime. Sandbox is a provider abstraction; no custom Firecracker stack in Full Alpha.
+- Workers do not mutate GitHub task authority unless the controller explicitly owns that effect.
 
 ## Engineering baseline
-- TypeScript / Node.js 24+, pnpm, strict types.
-- Official MCP TypeScript SDK v2 for MCP work.
-- Local-first SQLite state behind an interface.
-- `git` and `gh` are providers/sources of truth, not things to reimplement.
-- Prefer structured `gh --json` / API / GraphQL and compact semantic snapshots.
-- Never persist secrets or full sensitive content in telemetry by default.
+TypeScript, Node.js 24+, pnpm, strict types; local-first SQLite behind an interface; official MCP TypeScript SDK v2 for MCP work. Prefer structured `gh --json`/API/GraphQL over parsing prose. Never persist secrets or full sensitive content in telemetry by default.
 
-## Full Alpha testing rule
-Each implemented capability needs one happy path, required downstream contract tests, critical workspace/effect safety tests where relevant, and evidence that observability is emitted.
-
-Do not spend an Issue on exhaustive test matrices unless the Issue explicitly asks for hardening.
+## Verification
+For each capability, prove one happy path, required downstream contracts, critical workspace/effect safety where relevant, and observability. During iteration use focused checks; run broad verification after the final relevant edit. Do not create exhaustive matrices unless the Issue is hardening scope.
