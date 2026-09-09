@@ -47,6 +47,13 @@ const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_PAGINATION_PAGES = 100;
 const MAX_RATE_LIMIT_RETRIES = 2;
 const BASE_RATE_LIMIT_BACKOFF_MS = 1_000;
+/**
+ * A server supplied reset hint can be arbitrarily far in the future. Keep a
+ * provider operation bounded even when its caller did not supply a deadline;
+ * hints beyond this bound terminate with a first-class rate-limit error rather
+ * than retrying before GitHub says it is safe.
+ */
+const MAX_RATE_LIMIT_DELAY_MS = 30_000;
 const PR_JSON_FIELDS = [
   "number", "title", "state", "url", "isDraft", "headRefName", "headRefOid",
   "baseRefName", "baseRefOid", "statusCheckRollup", "reviewDecision", "reviews",
@@ -366,6 +373,17 @@ function rateLimitError(info: RateLimitInfo, attempts: number): RuntimeError {
       secondary: info.secondary,
     },
   });
+}
+
+function rateLimitDelay(info: RateLimitInfo, retryNumber: number, nowMs: number): number | undefined {
+  const exponential = BASE_RATE_LIMIT_BACKOFF_MS * (2 ** retryNumber);
+  const resetDelay = info.resetAtMs === undefined ? 0 : Math.max(0, info.resetAtMs - nowMs);
+  const requestedDelay = Math.max(exponential, info.retryAfterMs ?? 0, resetDelay);
+  // Do not retry while an unreasonably long server hint is active. Returning
+  // undefined lets the caller surface a bounded terminal rate-limit result
+  // without either sleeping indefinitely or issuing an early duplicate call.
+  if (requestedDelay > MAX_RATE_LIMIT_DELAY_MS) return undefined;
+  return Math.max(1, requestedDelay);
 }
 
 function repositoryPath(repository: GitHubRepository): string {
@@ -1032,16 +1050,15 @@ export class GitHubProvider {
         metrics,
         routes,
         remote,
-        input.remote === undefined,
       );
       const repository = repositoryAttempt?.value;
       if (repository === undefined) {
         throw createRuntimeError({ code: "GITHUB_REPOSITORY_NOT_FOUND", message: "Current GitHub repository was not found", retryable: false, effect: "none" });
       }
-      // The same repository identified by the push remote scopes every PR
-      // read/create. An unscoped gh command can otherwise silently describe a
-      // different checkout repository.
-      const ghRepository = repositoryAttempt?.route === "gh-json" && input.remote === undefined ? undefined : repository;
+      // The same repository identified by the selected push remote scopes
+      // every PR read/create. An unscoped gh command can otherwise silently
+      // describe a different checkout repository.
+      const ghRepository = repository;
       const branch = input.branch ?? await this.gitText(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd, operationContext, metrics);
       const localHead = await this.gitText(["rev-parse", "HEAD"], cwd, operationContext, metrics);
       if (branch === undefined || localHead === undefined) {
@@ -1093,7 +1110,7 @@ export class GitHubProvider {
         reconciled = true;
       }
 
-      const allowUnscopedCompatibility = input.remote === undefined && ghRepository !== undefined;
+      const allowUnscopedCompatibility = false;
       let pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, false, allowUnscopedCompatibility)))?.value;
       let created = false;
       let pullRequestEffectState: EffectState = "none";
@@ -1258,26 +1275,7 @@ export class GitHubProvider {
       const limited = rateLimitInfo(result, this.nowMs());
       if (limited === undefined) return result;
       if (!retryable || retryNumber >= MAX_RATE_LIMIT_RETRIES) throw rateLimitError(limited, retryNumber + 1);
-      const exponential = BASE_RATE_LIMIT_BACKOFF_MS * (2 ** retryNumber);
-      const resetDelay = limited.resetAtMs === undefined ? undefined : Math.max(0, limited.resetAtMs - this.nowMs());
-      const requestedDelay = Math.max(exponential, limited.retryAfterMs ?? 0, resetDelay ?? 0);
-      // GitHub's Retry-After/reset hint is authoritative. The retry count is
-      // bounded below; an arbitrary 30-second cap would retry while GitHub is
-      // still asking the client to wait. The operation deadline remains the
-      // upper bound for the actual sleep.
-      const delay = Math.max(1, requestedDelay);
-      const remaining = contextDeadline(context) - this.nowMs();
-      if (Number.isFinite(remaining) && remaining <= 0) throw rateLimitError(limited, retryNumber + 1);
-      metrics.retries += 1;
-      try {
-        await this.sleep(Number.isFinite(remaining) ? Math.min(delay, Math.max(1, remaining)) : delay, context.signal);
-      } catch (cause) {
-        if (context.signal.aborted) throw cause;
-        throw rateLimitError(limited, retryNumber + 1);
-      }
-      if (Number.isFinite(contextDeadline(context)) && this.nowMs() >= contextDeadline(context)) {
-        throw rateLimitError(limited, retryNumber + 1);
-      }
+      await this.waitForRateLimit(limited, retryNumber, context, metrics);
       retryNumber += 1;
     }
   }
@@ -1297,22 +1295,25 @@ export class GitHubProvider {
       const limited = rateLimitInfo(result, this.nowMs());
       if (limited === undefined) return result;
       if (retryNumber >= MAX_RATE_LIMIT_RETRIES) throw rateLimitError(limited, retryNumber + 1);
-      const exponential = BASE_RATE_LIMIT_BACKOFF_MS * (2 ** retryNumber);
-      const resetDelay = limited.resetAtMs === undefined ? undefined : Math.max(0, limited.resetAtMs - this.nowMs());
-      const delay = Math.max(1, Math.max(exponential, limited.retryAfterMs ?? 0, resetDelay ?? 0));
-      const remaining = contextDeadline(context) - this.nowMs();
-      if (Number.isFinite(remaining) && remaining <= 0) throw rateLimitError(limited, retryNumber + 1);
-      metrics.retries += 1;
-      try {
-        await this.sleep(Number.isFinite(remaining) ? Math.min(delay, Math.max(1, remaining)) : delay, context.signal);
-      } catch (cause) {
-        if (context.signal.aborted) throw cause;
-        throw rateLimitError(limited, retryNumber + 1);
-      }
-      if (Number.isFinite(contextDeadline(context)) && this.nowMs() >= contextDeadline(context)) {
-        throw rateLimitError(limited, retryNumber + 1);
-      }
+      await this.waitForRateLimit(limited, retryNumber, context, metrics);
       retryNumber += 1;
+    }
+  }
+
+  private async waitForRateLimit(info: RateLimitInfo, retryNumber: number, context: OperationContext, metrics: ProviderMetrics): Promise<void> {
+    const delay = rateLimitDelay(info, retryNumber, this.nowMs());
+    if (delay === undefined) throw rateLimitError(info, retryNumber + 1);
+    const remaining = contextDeadline(context) - this.nowMs();
+    if (Number.isFinite(remaining) && remaining <= 0) throw rateLimitError(info, retryNumber + 1);
+    metrics.retries += 1;
+    try {
+      await this.sleep(Number.isFinite(remaining) ? Math.min(delay, Math.max(1, remaining)) : delay, context.signal);
+    } catch (cause) {
+      if (context.signal.aborted) throw cause;
+      throw rateLimitError(info, retryNumber + 1);
+    }
+    if (Number.isFinite(contextDeadline(context)) && this.nowMs() >= contextDeadline(context)) {
+      throw rateLimitError(info, retryNumber + 1);
     }
   }
 
@@ -1377,17 +1378,16 @@ export class GitHubProvider {
     return (await this.readRepositoryAttempt(cwd, context, metrics, routes))?.value;
   }
 
-  private async readRepositoryAttempt(cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, remote?: string, allowCurrentRepositoryFallback = false): Promise<Attempt<GitHubRepository> | undefined> {
+  private async readRepositoryAttempt(cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, remote?: string): Promise<Attempt<GitHubRepository> | undefined> {
     // An explicitly selected publish remote is authoritative. `gh repo view`
     // without --repo describes the checkout's default repository and could
     // therefore point PR reconciliation at a different remote.
     if (remote !== undefined) {
       const selected = await this.readRepositoryFromRemote(remote, cwd, context, metrics, routes);
-      if (selected.attempt !== undefined || selected.identityKnown || !allowCurrentRepositoryFallback) return selected.attempt;
-      // Compatibility for callers using an older checkout fixture without a
-      // readable remote URL. A successfully returned but unparseable URL is
-      // not compatible: falling back to `gh repo view` in that case would
-      // combine an unverified repository with a push to the selected remote.
+      // A selected publish remote is authoritative. If it cannot be resolved,
+      // leave the repository unavailable instead of combining an unscoped
+      // checkout repository with an effect against another remote.
+      return selected.attempt;
     }
     const structured = await this.jsonCommand(["repo", "view", "--json", REPO_JSON_FIELDS], cwd, context, metrics);
     if (structured !== undefined) {
