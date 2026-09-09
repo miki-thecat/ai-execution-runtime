@@ -220,3 +220,115 @@ test("github.publish reconciles an ambiguous push before reusing a PR", async ()
   assert.equal(result.data.effectState, "applied");
   assert.equal(runner.executableCalls.filter((call) => call[0] === "git" && call[1] === "push").length, 1);
 });
+
+test("github.wait treats error, stale, cancel, and fail outcomes as terminal failures", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], json([
+      { name: "error", state: "ERROR" },
+      { name: "stale", state: "STALE" },
+      { name: "cancel", state: "COMPLETED", bucket: "CANCEL" },
+      { name: "fail", state: "COMPLETED", bucket: "FAIL" },
+      { name: "pass", state: "COMPLETED", bucket: "PASS" },
+    ]));
+  const provider = new GitHubProvider({ runner, sleep: async () => undefined });
+
+  const result = await provider.wait({ pullRequest: 7, condition: "checks_passed", intervalMs: 0, maxPolls: 3 });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.terminal, true);
+  assert.equal(result.data.passed, false);
+  assert.equal(result.data.checksSummary.failed, 4);
+  assert.equal(result.data.pollCountInternal, 1);
+});
+
+test("github capabilities select the active authenticated host", async () => {
+  const runner = new FixtureRunner()
+    .when(["--version"], { stdout: "gh version 2.60.0\n", stderr: "", exitCode: 0 })
+    .when(["auth", "status", "--json", "hosts"], json({ hosts: {
+      "github.com": [
+        { login: "inactive", active: false, state: "authenticated" },
+        { login: "current", active: true, state: "authenticated" },
+      ],
+    } }))
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.capabilities();
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.authenticated, true);
+  assert.equal(result.data.account, "current");
+});
+
+test("github.publish never retries an ambiguous API create with raw gh create", async () => {
+  const branch = "feature/ambiguous-pr";
+  const pullRequest = {
+    number: 12,
+    state: "OPEN",
+    headRefName: branch,
+    headRefOid: "fed123",
+    baseRefName: "main",
+  };
+  const listArgs = ["pr", "list", "--head", branch, "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"];
+  const freshArgs = ["pr", "view", "12", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"];
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "fed123\n", stderr: "", exitCode: 0 })
+    .when(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], { stdout: "fed123\trefs/heads/" + branch + "\n", stderr: "", exitCode: 0 })
+    .when(listArgs, [json([]), json([])])
+    .when(["api", "repos/miki-thecat/runtime/pulls", "--method", "POST", "--field", "title=ambiguous", "--field", `head=${branch}`, "--field", "base=main", "--field", "body="], { stdout: "", stderr: "transport closed", exitCode: 1 })
+    .when(["api", "repos/miki-thecat/runtime/pulls?head=miki-thecat%3Afeature%2Fambiguous-pr&state=all&per_page=100"], json([pullRequest]))
+    .when(freshArgs, json(pullRequest));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.publish({ branch, title: "ambiguous" });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.created, false);
+  assert.equal(result.data.reused, true);
+  assert.equal(result.data.effectState, "unknown");
+  assert.equal(runner.shellCalls.some((command) => command.includes("pr' 'create")), false);
+});
+
+test("github.publish does not return a stale PR when the required fresh read fails", async () => {
+  const branch = "feature/stale-pr";
+  const listArgs = ["pr", "list", "--head", branch, "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"];
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "stale123\n", stderr: "", exitCode: 0 })
+    .when(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], { stdout: "stale123\trefs/heads/" + branch + "\n", stderr: "", exitCode: 0 })
+    .when(listArgs, json([{ number: 13, state: "OPEN", headRefName: branch, headRefOid: "stale123", baseRefName: "main" }]));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.publish({ branch, title: "stale" });
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.code, "GITHUB_PR_FRESH_READ_FAILED");
+});
+
+test("github.publish preserves applied effect when post-push reconciliation cannot be read", async () => {
+  const branch = "feature/post-push-read";
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "applied123\n", stderr: "", exitCode: 0 })
+    .when(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], [
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "", stderr: "remote read failed", exitCode: 1 },
+    ])
+    .when(["push", "origin", `HEAD:refs/heads/${branch}`], { stdout: "", stderr: "", exitCode: 0 });
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.publish({ branch, title: "post-push" });
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.error.effect, "applied");
+});

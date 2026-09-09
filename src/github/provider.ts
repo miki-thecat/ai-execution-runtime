@@ -69,6 +69,16 @@ interface Attempt<T> {
 interface CreatePullRequestResult {
   readonly created: boolean;
   readonly pullRequest?: GitHubPullRequest;
+  readonly effectState?: EffectState;
+}
+
+interface PullRequestLookupOptions {
+  /**
+   * After an effectful create attempt, a structured empty list is not enough
+   * to conclude absence: the provider must try the lower-priority fresh API
+   * and raw reads before reporting an ambiguous effect.
+   */
+  readonly reconcileAfterEmpty?: boolean;
 }
 
 class ProviderMetrics {
@@ -210,6 +220,18 @@ function errorFor(cause: unknown, code: string, effect: EffectState = "none"): R
   });
 }
 
+function errorWithEffect(cause: unknown, code: string, effect: EffectState): RuntimeError {
+  const error = errorFor(cause, code, effect);
+  if (error.effect === effect) return error;
+  return createRuntimeError({
+    code: error.code,
+    message: error.message,
+    retryable: error.retryable,
+    effect,
+    ...(error.details === undefined ? {} : { details: error.details }),
+  });
+}
+
 function repositoryPath(repository: GitHubRepository): string {
   return repository.nameWithOwner;
 }
@@ -248,11 +270,17 @@ function normalizeStatus(value: unknown): string {
   return (stringValue(value) ?? "").toLowerCase();
 }
 
+function authenticatedHostState(value: unknown): boolean {
+  const state = normalizeStatus(value);
+  return state === "" || ["authenticated", "authorized", "active", "logged_in", "logged-in"].includes(state);
+}
+
 function parseCheck(value: unknown): GitHubCheck | undefined {
   if (!isObject(value)) return undefined;
   const name = stringValue(value.name) ?? stringValue(value.context) ?? "check";
   const status = normalizeStatus(value.status ?? value.state ?? value.bucket);
-  const conclusion = stringValue(value.conclusion) ?? stringValue(value.bucket);
+  const rawConclusion = stringValue(value.conclusion) ?? stringValue(value.bucket);
+  const conclusion = rawConclusion === undefined ? undefined : normalizeStatus(rawConclusion);
   const url = stringValue(value.detailsUrl) ?? stringValue(value.url) ?? stringValue(value.target_url);
   return {
     name,
@@ -268,8 +296,13 @@ function isPendingCheck(check: GitHubCheck): boolean {
 }
 
 function isFailedCheck(check: GitHubCheck): boolean {
-  return ["failure", "failed", "cancelled", "canceled", "timed_out", "timed-out", "action_required", "startup_failure"].includes(check.status) ||
-    ["failure", "failed", "cancelled", "canceled", "timed_out", "timed-out", "action_required", "startup_failure"].includes(check.conclusion ?? "");
+  return [
+    "failure", "failed", "fail", "error", "errored", "cancel", "cancelled", "canceled", "stale",
+    "timed_out", "timed-out", "action_required", "action-required", "startup_failure", "startup-failure",
+  ].includes(check.status) || [
+    "failure", "failed", "fail", "error", "errored", "cancel", "cancelled", "canceled", "stale",
+    "timed_out", "timed-out", "action_required", "action-required", "startup_failure", "startup-failure",
+  ].includes(check.conclusion ?? "");
 }
 
 function checksSummary(checks: readonly GitHubCheck[]): GitHubChecksSummary {
@@ -577,8 +610,10 @@ export class GitHubProvider {
         const summary = checksSummary(lastChecks);
         const terminal = summary.pending === 0;
         const passed = terminal && summary.failed === 0;
-        const wantsPassed = input.condition === "checks_passed";
-        if (terminal && (!wantsPassed || passed)) {
+        // A terminal failure is final even for checks_passed: return it to the
+        // caller instead of polling until the deadline can only produce a
+        // misleading timeout.
+        if (terminal) {
           return {
             data: {
               pullRequest: pullRequestNumber,
@@ -654,10 +689,16 @@ export class GitHubProvider {
             pushed = true;
             reconciled = true;
           } else {
-            throw errorFor(cause, "GITHUB_PUSH_UNKNOWN", "unknown");
+            throw errorWithEffect(cause, "GITHUB_PUSH_UNKNOWN", "unknown");
           }
         }
-        remoteHead = await this.remoteHead(remote, branch, cwd, operationContext, metrics);
+        try {
+          remoteHead = await this.remoteHead(remote, branch, cwd, operationContext, metrics);
+        } catch (cause) {
+          // The push completed, so a failed post-push read is applied but not
+          // reconciled. Preserve that effect state for the operation result.
+          throw errorWithEffect(cause, "GITHUB_REMOTE_HEAD_UNKNOWN", "applied");
+        }
         if (remoteHead !== localHead) {
           throw createRuntimeError({ code: "GITHUB_REMOTE_HEAD_MISMATCH", message: "Remote branch does not match the local HEAD after push", retryable: true, effect: pushed ? "applied" : "unknown", details: { branch, localHead, remoteHead } });
         }
@@ -666,29 +707,40 @@ export class GitHubProvider {
 
       let pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes))?.value;
       let created = false;
+      let pullRequestEffectState: EffectState = "none";
       if (pullRequest === undefined) {
         try {
           const createResult = await this.createPullRequest(repository, branch, base, input.title, input.body ?? "", cwd, operationContext, metrics, routes);
           created = createResult.created;
           pullRequest = createResult.pullRequest;
+          pullRequestEffectState = createResult.effectState ?? "none";
           if (!created) reconciled = true;
         } catch (cause) {
           // Never issue a blind second create after an ambiguous response.
-          pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes))?.value;
+          pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, { reconcileAfterEmpty: true }))?.value;
           if (pullRequest === undefined) throw errorFor(cause, "GITHUB_PR_CREATE_UNKNOWN", "unknown");
+          pullRequestEffectState = "unknown";
           reconciled = true;
         }
         pullRequest ??= (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes))?.value;
       }
       if (pullRequest === undefined) {
-        throw createRuntimeError({ code: "GITHUB_PR_NOT_FOUND_AFTER_PUBLISH", message: "Pull request could not be read after publish", retryable: true, effect: created || pushed ? "applied" : "none" });
+        throw createRuntimeError({ code: "GITHUB_PR_NOT_FOUND_AFTER_PUBLISH", message: "Pull request could not be read after publish", retryable: true, effect: pullRequestEffectState === "unknown" ? "unknown" : created || pushed ? "applied" : "none" });
       }
-      const freshPullRequest = (await this.readPullRequest(repository, pullRequest.number, cwd, operationContext, metrics, routes))?.value ?? pullRequest;
-      if (freshPullRequest.headRefOid !== undefined && freshPullRequest.headRefOid !== localHead) {
-        throw createRuntimeError({ code: "GITHUB_PR_HEAD_MISMATCH", message: "Pull request head does not match the reconciled remote HEAD", retryable: true, effect: created || pushed ? "applied" : "unknown", details: { pullRequest: freshPullRequest.number, localHead, pullRequestHead: freshPullRequest.headRefOid } });
+      const publishEffectState: EffectState = pullRequestEffectState === "unknown"
+        ? "unknown"
+        : pushed || created
+          ? "applied"
+          : "none";
+      const freshPullRequest = (await this.readPullRequest(repository, pullRequest.number, cwd, operationContext, metrics, routes))?.value;
+      if (freshPullRequest === undefined) {
+        throw createRuntimeError({ code: "GITHUB_PR_FRESH_READ_FAILED", message: "Pull request could not be freshly reconciled after publish", retryable: true, effect: publishEffectState, details: { pullRequest: pullRequest.number } });
+      }
+      if (freshPullRequest.headRefOid !== localHead) {
+        throw createRuntimeError({ code: "GITHUB_PR_HEAD_MISMATCH", message: "Pull request head does not match the reconciled remote HEAD", retryable: true, effect: publishEffectState, details: { pullRequest: freshPullRequest.number, localHead, pullRequestHead: freshPullRequest.headRefOid } });
       }
       if (freshPullRequest.baseRefName !== undefined && freshPullRequest.baseRefName !== base) {
-        throw createRuntimeError({ code: "GITHUB_PR_BASE_MISMATCH", message: "Existing pull request targets a different base branch", retryable: false, effect: created || pushed ? "applied" : "none", details: { expected: base, actual: freshPullRequest.baseRefName } });
+        throw createRuntimeError({ code: "GITHUB_PR_BASE_MISMATCH", message: "Existing pull request targets a different base branch", retryable: false, effect: publishEffectState, details: { expected: base, actual: freshPullRequest.baseRefName } });
       }
       return {
         data: {
@@ -702,9 +754,9 @@ export class GitHubProvider {
           created,
           reused: !created,
           reconciled: reconciled || remoteHead === localHead,
-          effectState: pushed || created ? "applied" : "none",
+          effectState: publishEffectState,
         },
-        effectState: pushed || created ? "applied" : "none",
+        effectState: publishEffectState,
         summary: created ? "Branch published and pull request created" : pushed ? "Branch published and pull request reused" : "Remote branch and pull request already reconciled",
       };
     }, options);
@@ -839,10 +891,14 @@ export class GitHubProvider {
         const parsed = parseJson(result.stdout);
         const hosts = nested(parsed, "hosts");
         const githubHosts = Array.isArray(hosts) ? hosts : nested(hosts, "github.com");
-        const first = Array.isArray(githubHosts) ? githubHosts.find(isObject) : undefined;
-        const account = stringValue(first?.login) ?? stringValue(first?.user);
         routes.add("gh-json");
-        return { authenticated: true, ...(account === undefined ? {} : { account }) };
+        const active = Array.isArray(githubHosts)
+          ? githubHosts.find((host) => isObject(host) && booleanValue(host.active) === true && authenticatedHostState(host.state))
+          : undefined;
+        if (active !== undefined) {
+          const account = stringValue(active.login) ?? stringValue(active.user);
+          return { authenticated: true, ...(account === undefined ? {} : { account }) };
+        }
       }
     } catch {
       // Fall through to the authenticated API identity check.
@@ -1084,7 +1140,7 @@ export class GitHubProvider {
     return line.split(/\s+/)[0] || undefined;
   }
 
-  private async findPullRequest(repository: GitHubRepository, branch: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubPullRequest> | undefined> {
+  private async findPullRequest(repository: GitHubRepository, branch: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, options: PullRequestLookupOptions = {}): Promise<Attempt<GitHubPullRequest> | undefined> {
     const structured = await this.jsonCommand(["pr", "list", "--head", branch, "--state", "all", "--json", PR_JSON_FIELDS], cwd, context, metrics);
     if (structured !== undefined) {
       const value = selectPullRequest(parsePullRequests(structured.value), branch);
@@ -1094,7 +1150,7 @@ export class GitHubProvider {
       }
       // A valid structured empty list is authoritative: there is no PR to
       // reconcile, so do not perform lower-priority reads or raw fallbacks.
-      if (Array.isArray(structured.value)) return undefined;
+      if (Array.isArray(structured.value) && options.reconcileAfterEmpty !== true) return undefined;
     }
     const api = await this.apiJson(`repos/${repositoryPath(repository)}/pulls?head=${encodeURIComponent(repository.owner + ":" + branch)}&state=all&per_page=100`, [], cwd, context, metrics);
     if (api !== undefined) {
@@ -1122,16 +1178,13 @@ export class GitHubProvider {
       if (api !== undefined) routes.add(api.route);
       return { created: true, pullRequest: createdPullRequest };
     }
-    const reconciled = await this.findPullRequest(repository, branch, cwd, context, metrics, routes);
-    if (reconciled !== undefined) return { created: false, pullRequest: reconciled.value };
-    try {
-      const raw = await this.shell(["pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body], cwd, context, metrics);
-      if ((raw.exitCode ?? 0) !== 0) throw createRuntimeError({ code: "GITHUB_PR_CREATE_FAILED", message: raw.stderr.trim() || "gh pr create failed", retryable: true, effect: "unknown" });
-      routes.add("raw-gh");
-      return { created: true };
-    } catch (cause) {
-      throw errorFor(cause, "GITHUB_PR_CREATE_UNKNOWN", "unknown");
-    }
+    const reconciled = await this.findPullRequest(repository, branch, cwd, context, metrics, routes, { reconcileAfterEmpty: true });
+    if (reconciled !== undefined) return { created: false, pullRequest: reconciled.value, effectState: "unknown" };
+    // The API create was an effectful attempt. An empty or stale read after
+    // that attempt is ambiguous, so a raw `gh pr create` retry could create a
+    // duplicate PR. Leave raw shell available as the direct escape hatch and
+    // require the caller to reconcile this operation before retrying.
+    throw createRuntimeError({ code: "GITHUB_PR_CREATE_UNKNOWN", message: "Pull request creation was ambiguous and no existing pull request could be reconciled", retryable: true, effect: "unknown", details: { branch, base } });
   }
 }
 
