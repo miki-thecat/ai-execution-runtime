@@ -333,14 +333,13 @@ function rateLimitInfo(result: GitHubCommandResult, nowMs = Date.now()): RateLim
   const primaryExhausted = remaining === 0 && rateLimitStatus;
   const responseRateMessage = (status === undefined || rateLimitStatus) && (secondaryMessage || rateMessage);
   const ordinaryForbiddenMessage = /forbidden|unauthorized|permission denied|bad credentials|resource not accessible|insufficient permission/i.test(output);
-  const noSafeSecondaryHint = retryAfterMs === undefined &&
-    (resetAtMs === undefined || resetAtMs - nowMs > MAX_RATE_LIMIT_DELAY_MS);
   // GitHub uses 403 for secondary limits, including responses without a
-  // Retry-After/reset hint. A bare 403 is therefore treated as secondary only
-  // when it has no primary-exhaustion signal or known permission failure; a
-  // reset-bearing or explicitly forbidden 403 remains an ordinary failure.
+  // Retry-After hint. A reset value is usable for a secondary limit only when
+  // primary quota is exhausted; a short reset alongside nonzero/unknown
+  // primary remaining must not turn the response into an ordinary failure or
+  // permit an immediate shell fallback.
   const hintlessSecondaryStatus = status === 403 && !primaryExhausted &&
-    !secondaryMessage && !rateMessage && !ordinaryForbiddenMessage && noSafeSecondaryHint;
+    !secondaryMessage && !rateMessage && !ordinaryForbiddenMessage;
   const looksLimited = status === 429 || responseRateMessage || primaryExhausted || hintlessSecondaryStatus ||
     (status === 403 && retryAfterMs !== undefined);
   if (!looksLimited) return undefined;
@@ -379,14 +378,14 @@ function isRateLimitError(value: unknown): value is RuntimeError {
   return isRuntimeError(value) && value.code === "GITHUB_RATE_LIMITED";
 }
 
-function rateLimitError(info: RateLimitInfo, attempts: number): RuntimeError {
+function rateLimitError(info: RateLimitInfo, attempts: number, effect: EffectState = "none"): RuntimeError {
   return createRuntimeError({
     code: "GITHUB_RATE_LIMITED",
     message: info.secondary
       ? "GitHub secondary rate limit remained active after bounded retries"
       : "GitHub rate limit remained active after bounded retries",
     retryable: true,
-    effect: "none",
+    effect,
     details: {
       ...(info.status === undefined ? {} : { status: info.status }),
       ...(info.retryAfterMs === undefined ? {} : { retryAfterMs: info.retryAfterMs }),
@@ -1145,27 +1144,38 @@ export class GitHubProvider {
       }
 
       const allowUnscopedCompatibility = false;
-      let pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, false, allowUnscopedCompatibility)))?.value;
+      let pullRequest: GitHubPullRequest | undefined;
       let created = false;
       let pullRequestEffectState: EffectState = "none";
-      if (pullRequest === undefined) {
-        try {
-          const createResult = await this.createPullRequest(repository, branch, base, input.title, input.body ?? "", cwd, operationContext, metrics, routes, ghRepository);
-          created = createResult.created;
-          pullRequest = createResult.pullRequest;
-          pullRequestEffectState = createResult.effectState ?? "none";
-          if (!created) reconciled = true;
-        } catch (cause) {
-          // A rate-limited effect must not immediately trigger a reconciliation
-          // read while GitHub has asked the client to stop making requests.
-          if (isRateLimitError(cause)) throw cause;
-          // Never issue a blind second create after an ambiguous response.
-          pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, true, allowUnscopedCompatibility)))?.value;
-          if (pullRequest === undefined) throw errorFor(cause, "GITHUB_PR_CREATE_UNKNOWN", "unknown");
-          pullRequestEffectState = "unknown";
-          reconciled = true;
+      try {
+        pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, false, allowUnscopedCompatibility)))?.value;
+        if (pullRequest === undefined) {
+          try {
+            const createResult = await this.createPullRequest(repository, branch, base, input.title, input.body ?? "", cwd, operationContext, metrics, routes, ghRepository);
+            created = createResult.created;
+            pullRequest = createResult.pullRequest;
+            pullRequestEffectState = createResult.effectState ?? "none";
+            if (!created) reconciled = true;
+          } catch (cause) {
+            // A rate-limited effect must not immediately trigger a reconciliation
+            // read while GitHub has asked the client to stop making requests.
+            if (isRateLimitError(cause)) throw cause;
+            // Never issue a blind second create after an ambiguous response.
+            pullRequest = (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, true, allowUnscopedCompatibility)))?.value;
+            if (pullRequest === undefined) throw errorFor(cause, "GITHUB_PR_CREATE_UNKNOWN", "unknown");
+            pullRequestEffectState = "unknown";
+            reconciled = true;
+          }
+          pullRequest ??= (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, false, allowUnscopedCompatibility)))?.value;
         }
-        pullRequest ??= (await this.findPullRequest(repository, branch, cwd, operationContext, metrics, routes, pullRequestLookupOptions(ghRepository, false, allowUnscopedCompatibility)))?.value;
+      } catch (cause) {
+        // A branch push is already an applied remote effect. Preserve that
+        // state if a later PR read/create is rate-limited; retry safety must
+        // not report the whole publish as effect-free.
+        if (isRateLimitError(cause)) {
+          throw errorWithEffect(cause, "GITHUB_RATE_LIMITED", pushed || created ? "applied" : "none");
+        }
+        throw cause;
       }
       if (pullRequest === undefined) {
         throw createRuntimeError({ code: "GITHUB_PR_NOT_FOUND_AFTER_PUBLISH", message: "Pull request could not be read after publish", retryable: true, effect: pullRequestEffectState === "unknown" ? "unknown" : created || pushed ? "applied" : "none" });
@@ -1175,7 +1185,15 @@ export class GitHubProvider {
         : pushed || created
           ? "applied"
           : "none";
-      const freshPullRequest = (await this.readPullRequest(repository, pullRequest.number, cwd, operationContext, metrics, routes, ghRepository, allowUnscopedCompatibility))?.value;
+      let freshPullRequest: GitHubPullRequest | undefined;
+      try {
+        freshPullRequest = (await this.readPullRequest(repository, pullRequest.number, cwd, operationContext, metrics, routes, ghRepository, allowUnscopedCompatibility))?.value;
+      } catch (cause) {
+        if (isRateLimitError(cause)) {
+          throw errorWithEffect(cause, "GITHUB_RATE_LIMITED", publishEffectState);
+        }
+        throw cause;
+      }
       if (freshPullRequest === undefined) {
         throw createRuntimeError({ code: "GITHUB_PR_FRESH_READ_FAILED", message: "Pull request could not be freshly reconciled after publish", retryable: true, effect: publishEffectState, details: { pullRequest: pullRequest.number } });
       }
@@ -1759,7 +1777,16 @@ export class GitHubProvider {
   }
 
   private async remoteHead(remote: string, branch: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<string | undefined> {
-    const result = await this.gitCommand(["ls-remote", "--heads", remote, `refs/heads/${branch}`], cwd, context, metrics);
+    // `git ls-remote <remote>` resolves the fetch URL. Publishing resolves
+    // the push URL, so validate the same endpoint that `git push <remote>`
+    // will use when a push URL is available. The remote-name fallback keeps
+    // compatibility with older command doubles/clients that cannot query it;
+    // normal Git remotes expose their effective push URL via --push.
+    const pushUrl = await this.remoteUrl(remote, true, cwd, context, metrics);
+    const pushTarget = pushUrl.succeeded
+      ? pushUrl.stdout.trim().split("\n")[0]?.trim() || remote
+      : remote;
+    const result = await this.gitCommand(["ls-remote", "--heads", pushTarget, `refs/heads/${branch}`], cwd, context, metrics);
     const line = result.stdout.trim().split("\n")[0] ?? "";
     return line.split(/\s+/)[0] || undefined;
   }
