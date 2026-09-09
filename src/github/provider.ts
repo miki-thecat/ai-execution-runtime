@@ -1303,7 +1303,22 @@ export class GitHubProvider {
       const result = await work(metrics, operationContext);
       const artifactRefs = result.artifactRefs ?? metrics.artifactRefs;
       const truncated = result.truncated ?? metrics.truncated;
-      metrics.setReturnedOutputBytes(byteLength(JSON.stringify(result.data) ?? ""));
+      const serializedResult = JSON.stringify(result.data) ?? "";
+      const returnedOutputBytes = byteLength(serializedResult);
+      // Command-level bounds do not bound the aggregate object assembled for
+      // the model. Do not expose an oversized snapshot merely because each
+      // individual gh call was below its own ceiling.
+      if (returnedOutputBytes > operationContext.budgets.maxReturnedOutputBytes) {
+        metrics.setReturnedOutputBytes(0);
+        throw createRuntimeError({
+          code: "GITHUB_OUTPUT_TOO_LARGE",
+          message: "GitHub model-facing result exceeds the runtime return budget",
+          retryable: false,
+          effect: "none",
+          details: { returnedOutputBytes, maxReturnedOutputBytes: operationContext.budgets.maxReturnedOutputBytes },
+        });
+      }
+      metrics.setReturnedOutputBytes(returnedOutputBytes);
       const snapshot = metrics.snapshot();
       span?.record(snapshot);
       const event = span?.complete({

@@ -42,6 +42,7 @@ const EXECUTOR = "agent" as const;
 const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024;
 const DEFAULT_MAX_INPUT_BYTES = 32 * 1024;
 const DEFAULT_CANCEL_GRACE_MS = 250;
+const DEFAULT_CAPABILITY_PROBE_TIMEOUT_MS = 2_000;
 const SAFE_BASELINE_KEYS = [
   "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR", "CI",
 ] as const;
@@ -279,8 +280,8 @@ export class CodexAgentExecutor implements AgentExecutor {
     if (!Number.isSafeInteger(this.cancelGraceMs) || this.cancelGraceMs < 0) throw new RangeError("cancelGraceMs must be a non-negative integer");
   }
 
-  capabilities(): Promise<AgentCapabilities> {
-    this.capabilityPromise ??= this.detectCapabilities();
+  capabilities(context?: OperationContext): Promise<AgentCapabilities> {
+    this.capabilityPromise ??= this.detectCapabilities(context);
     return this.capabilityPromise;
   }
 
@@ -328,20 +329,20 @@ export class CodexAgentExecutor implements AgentExecutor {
     await active.complete;
   }
 
-  private async detectCapabilities(): Promise<AgentCapabilities> {
+  private async detectCapabilities(context?: OperationContext): Promise<AgentCapabilities> {
     const detectedAt = this.tracer.now().toISOString();
     const environment = environmentFor(this.environmentOptions);
     let versionProbe: ProbeResult;
-    try { versionProbe = await this.probe(["--version"], environment.values); }
+    try { versionProbe = await this.probe(["--version"], environment.values, context); }
     catch { return this.capabilityResult(detectedAt, undefined, [], "unsupported", ["codex executable is unavailable"]); }
     const installedVersion = versionOf(versionProbe.stdout);
     let help: ProbeResult;
-    try { help = await this.probe(["exec", "--help"], environment.values); }
+    try { help = await this.probe(["exec", "--help"], environment.values, context); }
     catch { help = { code: null, signal: null, stdout: "" }; }
     const supportedFlags = flagsFromHelp(help.stdout);
     let appServer: CodexCapabilityProbe["appServer"] = "unsupported";
     try {
-      const appHelp = await this.probe(["app-server", "--help"], environment.values);
+      const appHelp = await this.probe(["app-server", "--help"], environment.values, context);
       appServer = appHelp.code === 0 ? "available" : "unsupported";
     } catch { appServer = "unsupported"; }
     const missing = REQUIRED_FLAGS.filter((flag) => !supportedFlags.includes(flag));
@@ -405,8 +406,7 @@ export class CodexAgentExecutor implements AgentExecutor {
   }
 
   private async prepare(task: AgentTask, context: OperationContext, project: ProjectIdentity, prompt: string, environment: BuiltEnvironment): Promise<PreparedExecution> {
-    const capabilities = await this.capabilities();
-    if (!capabilities.compatible) throw createRuntimeError({ code: "AGENT_INCOMPATIBLE", message: "Installed Codex cannot provide the required isolated non-interactive contract", retryable: false, effect: "none", details: { reasons: capabilities.incompatibilities } });
+    if (context.signal.aborted || isDeadlineExceeded(context)) throw createRuntimeError({ code: "AGENT_CANCELLED", message: "Agent execution was cancelled before capability probing", retryable: false, effect: "none" });
     const readDecision = effectDecision(context.effectPolicy, "read");
     if (readDecision === "deny") throw createRuntimeError({ code: "AGENT_EFFECT_DENIED", message: "AER policy does not allow the agent to read the project", retryable: false, effect: "none" });
     if (readDecision === "approval_required") throw createRuntimeError({ code: "AGENT_APPROVAL_REQUIRED_NONINTERACTIVE", message: "Project reads require approval and Codex execution is unattended", retryable: false, effect: "none" });
@@ -414,6 +414,12 @@ export class CodexAgentExecutor implements AgentExecutor {
     const canNetwork = effectDecision(context.effectPolicy, "network") === "allow";
     if (effectDecision(context.effectPolicy, "workspace_write") === "approval_required") throw createRuntimeError({ code: "AGENT_APPROVAL_REQUIRED_NONINTERACTIVE", message: "Workspace writes require approval and Codex execution is unattended", retryable: false, effect: "none" });
     if (this.grantNetwork && !canNetwork) throw createRuntimeError({ code: "AGENT_NETWORK_POLICY_DENIED", message: "Network access was requested but denied by AER policy", retryable: false, effect: "none" });
+    // Policy and the caller's bounded context are checked before any provider
+    // executable is probed. A broken/unresponsive installation cannot turn a
+    // denied or expired agent operation into an unbounded preflight.
+    const capabilities = await this.capabilities(context);
+    if (context.signal.aborted || isDeadlineExceeded(context)) throw createRuntimeError({ code: "AGENT_CANCELLED", message: "Agent execution was cancelled during capability probing", retryable: false, effect: "none" });
+    if (!capabilities.compatible) throw createRuntimeError({ code: "AGENT_INCOMPATIBLE", message: "Installed Codex cannot provide the required isolated non-interactive contract", retryable: false, effect: "none", details: { reasons: capabilities.incompatibilities } });
     const sandbox = canWrite ? "workspace-write" : "read-only";
     const network = this.grantNetwork && canNetwork;
     if (network && !capabilities.supportedAutomationFlags.includes("--config")) throw createRuntimeError({ code: "AGENT_NETWORK_UNSUPPORTED", message: "The installed Codex cannot express the requested network posture", retryable: false, effect: "none" });
@@ -668,14 +674,43 @@ export class CodexAgentExecutor implements AgentExecutor {
     if (this.state !== undefined && this.state.getEvent(event.eventId) === undefined) this.state.append(event);
   }
 
-  private async probe(args: readonly string[], environment: Readonly<Record<string, string | undefined>>): Promise<ProbeResult> {
+  private async probe(args: readonly string[], environment: Readonly<Record<string, string | undefined>>, context?: OperationContext): Promise<ProbeResult> {
     const child = this.spawnProcess(this.executable, args, { cwd: tmpdir(), env: environment, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let settled = false;
+    const configuredDeadline = context?.deadline;
+    const deadline = configuredDeadline === undefined || !Number.isFinite(configuredDeadline)
+      ? Date.now() + DEFAULT_CAPABILITY_PROBE_TIMEOUT_MS
+      : configuredDeadline;
     return await new Promise<ProbeResult>((resolveProbe, rejectProbe) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        if (killTimer !== undefined) clearTimeout(killTimer);
+        context?.signal.removeEventListener("abort", abort);
+      };
+      const rejectBounded = (message: string): void => {
+        if (settled) return;
+        settled = true;
+        try { child.kill("SIGTERM"); } catch { /* best effort */ }
+        killTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* best effort */ } }, 25);
+        cleanup();
+        rejectProbe(createRuntimeError({ code: "AGENT_CAPABILITY_PROBE_TIMEOUT", message, retryable: true, effect: "none" }));
+      };
+      const abort = (): void => rejectBounded("Codex capability probing was cancelled or exceeded its runtime budget");
       child.stdout.on("data", (chunk) => { stdout = bounded(`${stdout}${typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk)}`, 32 * 1024); });
-      child.on("error", (error) => { if (!settled) { settled = true; rejectProbe(error); } });
-      child.on("close", (code, signal) => { if (!settled) { settled = true; resolveProbe({ code, signal, stdout }); } });
+      // Drain stderr so a noisy executable cannot block before the bounded
+      // probe timer fires. Its contents are deliberately not model-facing.
+      child.stderr.on("data", () => undefined);
+      child.on("error", (error) => { if (!settled) { settled = true; cleanup(); rejectProbe(error); } });
+      child.on("close", (code, signal) => { if (!settled) { settled = true; cleanup(); resolveProbe({ code, signal, stdout }); } });
+      if (context?.signal.aborted) abort();
+      else {
+        context?.signal.addEventListener("abort", abort, { once: true });
+        const remaining = Math.max(0, deadline - Date.now());
+        timer = setTimeout(() => rejectBounded("Codex capability probing exceeded its bounded deadline"), remaining);
+      }
     });
   }
 }

@@ -43,7 +43,14 @@ export interface OperationContextInit extends Omit<OperationContext, "actor" | "
 export function createOperationContext(init: OperationContextInit): OperationContext {
   const budgets = resolveRuntimeBudgets(init.budgets);
   const budgetDeadline = Date.now() + budgets.maxExecutionMs;
-  const deadline = init.deadline === undefined ? budgetDeadline : Math.min(init.deadline, budgetDeadline);
+  if (init.deadline !== undefined && Number.isNaN(init.deadline)) {
+    throw new RangeError("deadline must not be NaN");
+  }
+  // Infinity means that the caller did not add a narrower deadline. It must
+  // still be clamped to the runtime-owned execution ceiling.
+  const deadline = init.deadline === undefined || init.deadline === Number.POSITIVE_INFINITY
+    ? budgetDeadline
+    : Math.min(init.deadline, budgetDeadline);
   return {
     traceId: init.traceId,
     runId: init.runId,
@@ -63,5 +70,10 @@ export function createOperationContext(init: OperationContextInit): OperationCon
 }
 
 export function isDeadlineExceeded(context: OperationContext, now = Date.now()): boolean {
-  return context.deadline !== undefined && now >= context.deadline;
+  if (context.deadline === undefined) return false;
+  // A forged non-finite context must fail closed. createOperationContext
+  // rejects NaN and clamps positive infinity, but this also protects callers
+  // constructing an OperationContext at an adapter boundary.
+  if (!Number.isFinite(context.deadline)) return context.deadline !== Number.POSITIVE_INFINITY;
+  return now >= context.deadline;
 }

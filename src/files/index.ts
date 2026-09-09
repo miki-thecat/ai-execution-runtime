@@ -237,7 +237,7 @@ export class FileOperations {
       const requestBytes = inputBytes(input);
       if (requestBytes > operationContext.budgets.maxInputBytes) throw createRuntimeError({ code: "FILE_INPUT_TOO_LARGE", message: "File read input exceeds the runtime budget", retryable: false, effect: "none", details: { inputBytes: requestBytes, maxInputBytes: operationContext.budgets.maxInputBytes } });
       const maxBytes = validLimit(narrowBudget(input.maxBytes ?? this.maxReadBytes, operationContext.budgets.maxFileReadBytes, "maxBytes"), this.maxReadBytes, "maxBytes");
-      const opened = readConfinedFile(this.rootDir, input.path);
+      const opened = readConfinedFile(this.rootDir, input.path, false, operationContext.budgets.maxFileReadBytes);
       const path = opened.path;
       const bytes = opened.bytes!;
       const fullText = new TextDecoder().decode(bytes);
@@ -293,7 +293,7 @@ export class FileOperations {
       if (input.query === "") throw createRuntimeError({ code: "SEARCH_QUERY_INVALID", message: "Search query cannot be empty", retryable: false, effect: "none" });
       const searchRoot = input.path === undefined ? this.rootDir : resolveConfinedPath(this.rootDir, input.path);
       const rg = this.searchWithRg(input, searchRoot, maxResults, operationContext.budgets.maxRawOutputBytes);
-      const computation = rg ?? this.searchFallback(input, searchRoot, maxResults);
+      const computation = rg ?? this.searchFallback(input, searchRoot, maxResults, operationContext.budgets.maxFileReadBytes);
       const result = computation.result;
       const boundedByBytes = boundSearchBytes(result, narrowBudget(input.maxBytes, Math.min(DEFAULT_MAX_FILE_READ_BYTES, operationContext.budgets.maxReturnedOutputBytes), "maxBytes"));
       const searchArtifact = new TextEncoder().encode(JSON.stringify(result.matches));
@@ -318,7 +318,7 @@ export class FileOperations {
       const requestBytes = inputBytes(input);
       if (requestBytes > operationContext.budgets.maxInputBytes) throw createRuntimeError({ code: "FILE_INPUT_TOO_LARGE", message: "File patch input exceeds the runtime budget", retryable: false, effect: "none", details: { inputBytes: requestBytes, maxInputBytes: operationContext.budgets.maxInputBytes } });
       if ((input.content === undefined) === (input.patch === undefined)) throw createRuntimeError({ code: "PATCH_INPUT_INVALID", message: "Provide exactly one of content or patch", retryable: false, effect: "none" });
-      const opened = readConfinedFile(this.rootDir, input.path, true);
+      const opened = readConfinedFile(this.rootDir, input.path, true, operationContext.budgets.maxFileReadBytes);
       const path = opened.path;
       const before = opened.bytes;
       const expectedHash = input.expectedHash ?? input.baseHash;
@@ -331,6 +331,8 @@ export class FileOperations {
       const source = before === undefined ? "" : new TextDecoder().decode(before);
       const replacement = input.content !== undefined ? input.content : unifiedPatch(source, input.patch!);
       const after = typeof replacement === "string" ? new TextEncoder().encode(replacement) : replacement;
+      const changeContentBytes = (before?.byteLength ?? 0) + after.byteLength;
+      if (changeContentBytes > operationContext.budgets.maxArtifactBytes) throw createRuntimeError({ code: "CHANGESET_CONTENT_TOO_LARGE", message: "File change evidence exceeds the runtime artifact budget", retryable: false, effect: "none", details: { path: input.path, contentBytes: changeContentBytes, maxArtifactBytes: operationContext.budgets.maxArtifactBytes } });
       const beforeHash = before === undefined ? undefined : sha256(before);
       const outputPath = path;
       const parent = dirname(outputPath);
@@ -416,14 +418,24 @@ export class FileOperations {
     return { result: { query: input.query, matches: boundedMatches, resultCount: boundedMatches.length, hasMore, truncated: hasMore, backend: "rg", artifactRefs: [] }, rawOutputBytes: byteLength(String(processResult.stdout)) };
   }
 
-  private searchFallback(input: FileSearchInput, searchRoot: string, maxResults: number): SearchComputation {
+  private searchFallback(input: FileSearchInput, searchRoot: string, maxResults: number, maxFileReadBytes: number): SearchComputation {
     const files: string[] = [];
     walk(searchRoot, this.rootDir, files);
     files.sort();
     const matches: FileSearchMatch[] = [];
+    let skippedOversize = false;
     const expression = input.regex ? new RegExp(input.query) : undefined;
     for (const file of files) {
-      const bytes = readConfinedFile(this.rootDir, relative(this.rootDir, file)).bytes!;
+      let bytes: Uint8Array;
+      try {
+        bytes = readConfinedFile(this.rootDir, relative(this.rootDir, file), false, maxFileReadBytes).bytes!;
+      } catch (cause) {
+        if (cause !== null && typeof cause === "object" && "code" in cause && cause.code === "FILE_READ_TOO_LARGE") {
+          skippedOversize = true;
+          continue;
+        }
+        throw cause;
+      }
       if (bytes.includes(0)) continue;
       const lines = new TextDecoder().decode(bytes).split("\n");
       for (let index = 0; index < lines.length; index += 1) {
@@ -437,7 +449,7 @@ export class FileOperations {
         }
       }
     }
-    return { result: { query: input.query, matches, resultCount: matches.length, hasMore: false, truncated: false, backend: "fallback", artifactRefs: [] }, rawOutputBytes: matches.reduce((total, match) => total + byteLength(JSON.stringify(match)), 0) };
+    return { result: { query: input.query, matches, resultCount: matches.length, hasMore: skippedOversize, truncated: skippedOversize, backend: "fallback", artifactRefs: [] }, rawOutputBytes: matches.reduce((total, match) => total + byteLength(JSON.stringify(match)), 0) };
   }
 
   private putArtifact(content: Uint8Array, origin: string, context: OperationContext): readonly ArtifactRef[] {

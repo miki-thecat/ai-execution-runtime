@@ -237,8 +237,17 @@ export class OperationRegistry {
 }
 
 async function executeWithinDeadline<T>(work: () => T | Promise<T>, context: OperationContext, controller: AbortController): Promise<T> {
-  const deadline = context.deadline;
-  if (deadline === undefined || !Number.isFinite(deadline)) return work();
+  // OperationContext normally contains a finite, already-clamped deadline.
+  // Keep the dispatcher fail-closed for adapters that provide a structurally
+  // valid but non-finite context, so NaN/infinity cannot disable the runtime
+  // execution ceiling.
+  const deadline = context.deadline === undefined
+    ? Date.now() + context.budgets.maxExecutionMs
+    : Number.isFinite(context.deadline)
+      ? context.deadline
+      : context.deadline === Number.POSITIVE_INFINITY
+        ? Date.now() + context.budgets.maxExecutionMs
+        : Date.now();
   const remaining = deadline - Date.now();
   if (remaining <= 0) {
     controller.abort();

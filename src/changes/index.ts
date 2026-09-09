@@ -195,7 +195,10 @@ export interface ConfinedFileRead {
 }
 
 /** Open first, then validate the opened descriptor so symlink swaps cannot redirect bytes. */
-export function readConfinedFile(rootDir: string, filePath: string, allowMissing = false): ConfinedFileRead {
+export function readConfinedFile(rootDir: string, filePath: string, allowMissing = false, maxBytes?: number): ConfinedFileRead {
+  if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 1)) {
+    throw createRuntimeError({ code: "FILE_LIMIT_INVALID", message: "maxBytes must be a positive integer", retryable: false, effect: "none" });
+  }
   const root = realpathSync(resolve(rootDir));
   const candidate = resolve(root, filePath);
   assertInside(root, candidate);
@@ -213,6 +216,15 @@ export function readConfinedFile(rootDir: string, filePath: string, allowMissing
   try {
     const stat = fstatSync(file);
     if (!stat.isFile()) throw createRuntimeError({ code: "FILE_NOT_REGULAR", message: `Not a regular file: ${filePath}`, retryable: false, effect: "none" });
+    if (maxBytes !== undefined && stat.size > maxBytes) {
+      throw createRuntimeError({
+        code: "FILE_READ_TOO_LARGE",
+        message: `File exceeds the runtime materialization budget: ${filePath}`,
+        retryable: false,
+        effect: "none",
+        details: { path: filePath, fileBytes: stat.size, maxBytes },
+      });
+    }
     const physical = realpathSync(`/proc/self/fd/${file}`);
     assertInside(root, physical);
     const bytes = new Uint8Array(stat.size);
@@ -229,12 +241,12 @@ export function readConfinedFile(rootDir: string, filePath: string, allowMissing
   }
 }
 
-function currentBytes(rootDir: string, path: string): Uint8Array | undefined {
-  return readConfinedFile(rootDir, relative(rootDir, path), true).bytes;
+function currentBytes(rootDir: string, path: string, maxBytes?: number): Uint8Array | undefined {
+  return readConfinedFile(rootDir, relative(rootDir, path), true, maxBytes).bytes;
 }
 
-function assertCurrent(rootDir: string, path: string, expectedHash: string | undefined, expectedExists: boolean): void {
-  const current = currentBytes(rootDir, path);
+function assertCurrent(rootDir: string, path: string, expectedHash: string | undefined, expectedExists: boolean, maxBytes?: number): void {
+  const current = currentBytes(rootDir, path, maxBytes);
   const actualHash = current === undefined ? undefined : sha256(current);
   if ((current !== undefined) !== expectedExists || actualHash !== expectedHash) {
     throw createRuntimeError({
@@ -247,9 +259,9 @@ function assertCurrent(rootDir: string, path: string, expectedHash: string | und
   }
 }
 
-function atomicReplace(rootDir: string, path: string, content: Uint8Array, expectedHash: string | undefined, expectedExists: boolean, replacementMode?: number, onReplaced?: () => void): void {
+function atomicReplace(rootDir: string, path: string, content: Uint8Array, expectedHash: string | undefined, expectedExists: boolean, replacementMode?: number, onReplaced?: () => void, maxBytes?: number): void {
   if (platform !== "linux") throw createRuntimeError({ code: "FILE_CONFINEMENT_UNSUPPORTED", message: "Race-resistant semantic file mutation requires Linux /proc descriptor anchoring", retryable: false, effect: "none" });
-  const current = readConfinedFile(rootDir, relative(rootDir, path), true);
+  const current = readConfinedFile(rootDir, relative(rootDir, path), true, maxBytes);
   const actualHash = current.bytes === undefined ? undefined : sha256(current.bytes);
   if ((current.bytes !== undefined) !== expectedExists || actualHash !== expectedHash) {
     throw createRuntimeError({ code: "FILE_HASH_MISMATCH", message: "The file changed while applying the guarded change", retryable: false, effect: "none", details: { path, expectedHash, actualHash } });
@@ -267,7 +279,7 @@ function atomicReplace(rootDir: string, path: string, content: Uint8Array, expec
     chmodSync(temporary, replacementMode ?? current.mode ?? 0o600);
     renameSync(temporary, destination);
     onReplaced?.();
-    const actual = currentBytes(rootDir, path);
+    const actual = currentBytes(rootDir, path, maxBytes);
     if (actual === undefined || sha256(actual) !== sha256(content)) {
       throw createRuntimeError({ code: "FILE_WRITE_RACE", message: "The file changed while applying the guarded change", retryable: false, effect: "unknown", details: { path } });
     }
@@ -320,6 +332,16 @@ export class ChangeSetManager {
   /** Persist evidence before a physical file mutation takes place. */
   prepare(input: ChangeSetInput): ChangeSet {
     if (input.files.length === 0) throw new Error("A ChangeSet must contain at least one file");
+    const requestedContentBytes = input.files.reduce((total, file) => total + (file.before?.byteLength ?? 0) + ((file.afterExists ?? true) ? file.after.byteLength : 0), 0);
+    if (requestedContentBytes > input.context.budgets.maxArtifactBytes) {
+      throw createRuntimeError({
+        code: "CHANGESET_CONTENT_TOO_LARGE",
+        message: "ChangeSet evidence exceeds the runtime artifact budget",
+        retryable: false,
+        effect: "none",
+        details: { contentBytes: requestedContentBytes, maxArtifactBytes: input.context.budgets.maxArtifactBytes },
+      });
+    }
     const now = this.clock().toISOString();
     const files: ChangeSetFile[] = [];
     const snapshots: Snapshot[] = [];
@@ -327,6 +349,16 @@ export class ChangeSetManager {
       const beforeExists = file.beforeExists ?? file.before !== undefined;
       const afterExists = file.afterExists ?? true;
       const stats = lineStats(file.beforeExists === false ? undefined : file.before, file.after);
+      const contentBytes = (file.before?.byteLength ?? 0) + (afterExists ? file.after.byteLength : 0);
+      if (contentBytes > input.context.budgets.maxArtifactBytes) {
+        throw createRuntimeError({
+          code: "CHANGESET_CONTENT_TOO_LARGE",
+          message: "ChangeSet evidence exceeds the runtime artifact budget",
+          retryable: false,
+          effect: "none",
+          details: { path: file.path, contentBytes, maxArtifactBytes: input.context.budgets.maxArtifactBytes },
+        });
+      }
       const beforeArtifact = beforeExists && file.before !== undefined
         ? this.artifacts?.put(file.before, { mediaType: "text/plain", origin: "changeset.before" })
         : undefined;
@@ -443,10 +475,10 @@ export class ChangeSetManager {
       return this.withMutationLock(() => {
         const snapshots = this.snapshots.get(changeset.id);
         const planned = changeset.files.map((file, index) => ({ file, snapshot: snapshots?.[index] }));
-        const beforeContent = planned.map(({ file, snapshot }) => ({ file, content: this.contentForRollback(changeset.id, file, snapshot) }));
+        const beforeContent = planned.map(({ file, snapshot }) => ({ file, content: this.contentForRollback(changeset.id, file, snapshot, context.budgets.maxFileReadBytes) }));
         const currentStates = planned.map(({ file }) => {
           const path = resolveConfinedPath(this.rootDir, file.path, true);
-          const current = currentBytes(this.rootDir, path);
+          const current = currentBytes(this.rootDir, path, context.budgets.maxFileReadBytes);
           return { file, path, currentHash: current === undefined ? undefined : sha256(current) };
         });
 
@@ -471,9 +503,9 @@ export class ChangeSetManager {
           if (currentHash === file.beforeHash || (!file.beforeExists && currentHash === undefined)) continue;
           const content = beforeContent.find((entry) => entry.file === file)?.content;
           if (file.beforeExists && content !== undefined) {
-            atomicReplace(this.rootDir, path, content, file.afterHash, true, file.beforeMode, () => { writeApplied = true; });
+            atomicReplace(this.rootDir, path, content, file.afterHash, true, file.beforeMode, () => { writeApplied = true; }, context.budgets.maxFileReadBytes);
           } else if (!file.beforeExists) {
-            assertCurrent(this.rootDir, path, file.afterHash, true);
+            assertCurrent(this.rootDir, path, file.afterHash, true, context.budgets.maxFileReadBytes);
             unlinkSync(path);
             writeApplied = true;
             if (existsSync(path)) throw createRuntimeError({ code: "FILE_WRITE_RACE", message: `Could not remove ${file.path} safely`, retryable: false, effect: "unknown" });
@@ -493,14 +525,18 @@ export class ChangeSetManager {
     }
   }
 
-  private contentForRollback(changesetId: ChangesetId, file: ChangeSetFile, snapshot: Snapshot | undefined): Uint8Array | undefined {
+  private contentForRollback(changesetId: ChangesetId, file: ChangeSetFile, snapshot: Snapshot | undefined, maxBytes: number): Uint8Array | undefined {
     if (!file.beforeExists) return undefined;
     let content: Uint8Array | undefined;
-    if (snapshot?.before !== undefined) content = snapshot.before;
+    if (snapshot?.before !== undefined) {
+      if (snapshot.before.byteLength > maxBytes) throw createRuntimeError({ code: "CHANGESET_CONTENT_TOO_LARGE", message: `Rollback evidence exceeds the runtime file budget for ${file.path}`, retryable: false, effect: "none", details: { path: file.path, contentBytes: snapshot.before.byteLength, maxFileReadBytes: maxBytes } });
+      content = snapshot.before;
+    }
     else if (file.beforeArtifactRef !== undefined && this.artifacts !== undefined) {
       try {
         const metadata = this.artifacts.metadata(file.beforeArtifactRef);
         if (metadata === undefined) throw new Error("missing metadata");
+        if (metadata.size > maxBytes) throw createRuntimeError({ code: "CHANGESET_CONTENT_TOO_LARGE", message: `Rollback evidence exceeds the runtime file budget for ${file.path}`, retryable: false, effect: "none", details: { path: file.path, contentBytes: metadata.size, maxFileReadBytes: maxBytes } });
         const chunks: Uint8Array[] = [];
         let offset = 0;
         while (offset < metadata.size) {
@@ -517,7 +553,7 @@ export class ChangeSetManager {
     }
     const persisted = this.state?.getEntity("changeset_files", `${changesetId}:${file.path}`);
     const value = persisted?.data?.rollbackBeforeBytes;
-    if (content === undefined && Array.isArray(value) && value.every((byte): byte is number => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+    if (content === undefined && Array.isArray(value) && value.length <= maxBytes && value.every((byte): byte is number => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
       content = Uint8Array.from(value);
     }
     if (content !== undefined && file.beforeHash === sha256(content) && content.byteLength === file.beforeSize) return content;

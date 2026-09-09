@@ -195,16 +195,19 @@ export class DockerSandboxProvider implements SandboxProvider {
       isolationType: "container",
       workspaceMode: "host",
       workspaceModes: ["host", "private_clone"],
-      persistence: "checkpointed",
+      // The standalone CLI is only used here for bounded execution. Until
+      // lifecycle commands are implemented, do not advertise persistence or
+      // checkpoint/snapshot/fork/clone semantics that AER cannot exercise.
+      persistence: "unknown",
       pauseResume: false,
-      checkpoint: true,
-      snapshot: true,
-      fork: true,
-      clone: true,
-      networkControl: "allow_deny",
-      resourceLimits: true,
-      credentialSupport: "named_grants",
-      features: { pauseResume: false, checkpoint: true, snapshot: true, fork: true, clone: true, resourceLimits: true },
+      checkpoint: false,
+      snapshot: false,
+      fork: false,
+      clone: false,
+      networkControl: "unsupported",
+      resourceLimits: false,
+      credentialSupport: "unsupported",
+      features: { pauseResume: false, checkpoint: false, snapshot: false, fork: false, clone: false, resourceLimits: false },
     });
   }
 }
