@@ -4,6 +4,9 @@
   "private": true,
   "description": "AI Execution Runtime foundation",
   "type": "module",
+  "bin": {
+    "aer": "src/cli/index.ts"
+  },
   "engines": {
     "node": ">=24"
   },
@@ -11,9 +14,14 @@
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit",
     "lint": "tsc --project tsconfig.json --noEmit",
-    "test": "node --experimental-strip-types --test test/**/*.test.ts"
+    "test": "node --experimental-strip-types --test test/**/*.test.ts",
+    "aer": "node --experimental-strip-types src/cli/index.ts"
   },
   "devDependencies": {
     "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.5.4"
   }
 }

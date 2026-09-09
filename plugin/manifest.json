@@ -1,0 +1,21 @@
+{
+  "schema_version": "v1",
+  "name_for_human": "AER local MCP",
+  "name_for_model": "aer_local_mcp",
+  "description_for_human": "A local-first AI Execution Runtime MCP surface.",
+  "description_for_model": "Use AER tools for bounded project inspection, file reads, verification, GitHub snapshots, and policy-governed execution.",
+  "mcp": {
+    "transport": "streamable-http",
+    "url": "http://127.0.0.1:8787/mcp",
+    "protocol_version": "2026-07-28"
+  },
+  "auth": {
+    "type": "local-loopback",
+    "required": false
+  },
+  "tunnel": {
+    "optional": true,
+    "client": "capability-detected",
+    "entitlement": "unverified"
+  }
+}
