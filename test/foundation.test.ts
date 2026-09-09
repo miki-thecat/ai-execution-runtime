@@ -9,6 +9,7 @@ import {
   effectDecision,
   InMemoryEventSink,
   POLICY_DECISIONS,
+  permissiveEffectPolicy,
   Redactor,
   Tracer,
   runtimeFailure,
@@ -22,6 +23,7 @@ function contextFor(run: ReturnType<Tracer["startRun"]>) {
     runId: run.runId,
     spanId: run.spanId,
     actor: "model",
+    effectPolicy: permissiveEffectPolicy(),
   });
 }
 

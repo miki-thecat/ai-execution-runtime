@@ -4,14 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { FileArtifactStore, type ArtifactStore } from "../src/artifacts/index.ts";
-import { createOperationContext, createRunId, createTraceId } from "../src/core/index.ts";
+import { createOperationContext, createRunId, createTraceId, permissiveEffectPolicy } from "../src/core/index.ts";
 import { DirectExecutor } from "../src/direct/index.ts";
 import { InMemoryEventSink, Tracer } from "../src/observability/index.ts";
 import { SqliteStateStore } from "../src/state/index.ts";
 
 function contextFor(tracer: Tracer) {
   const run = tracer.startRun({ traceId: createTraceId(), runId: createRunId(), actor: "model" });
-  return { run, context: createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "model" }) };
+  return { run, context: createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "model", effectPolicy: permissiveEffectPolicy() }) };
 }
 
 function temporaryDirectory(): string {
@@ -122,8 +122,8 @@ test("environment values are usable by the child but absent from telemetry", asy
   const secret = "do-not-log-this-value";
   const executor = new DirectExecutor({ tracer });
   const result = await executor.runShell({
-    command: "printf \"$AER_TEST_SECRET\"",
-    env: { AER_TEST_SECRET: secret },
+    command: "printf \"$AER_TEST_VALUE\"",
+    env: { AER_TEST_VALUE: secret },
   }, context);
 
   assert.equal(result.ok, true);

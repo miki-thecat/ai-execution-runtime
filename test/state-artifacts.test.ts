@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { FileArtifactStore, MAX_ARTIFACT_READ_BYTES } from "../src/artifacts/index.ts";
-import { createOperationContext, createProjectId, createRuntimeError, createTaskId, createTraceId } from "../src/core/index.ts";
+import { createOperationContext, createProjectId, createRuntimeError, createTaskId, createTraceId, permissiveEffectPolicy } from "../src/core/index.ts";
 import { createRuntimeEvent } from "../src/observability/events.ts";
 import { Tracer } from "../src/observability/index.ts";
 import { OperationRegistry } from "../src/operations/index.ts";
@@ -98,7 +98,7 @@ test("an ambiguous top-level operation terminates its durable run as unknown", a
         throw createRuntimeError({ code: "PUBLISH_AMBIGUOUS", message: "transport response was lost", retryable: false, effect: "unknown" });
       },
     });
-    const result = await registry.execute("publish.ambiguous", undefined, createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "runtime" }));
+    const result = await registry.execute("publish.ambiguous", undefined, createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "runtime", effectPolicy: permissiveEffectPolicy() }));
     assert.equal(result.ok, false);
     if (result.ok) return;
     run.unknown(result.error);

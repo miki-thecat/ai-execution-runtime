@@ -135,7 +135,13 @@ export class DockerSandboxProvider implements SandboxProvider {
       const error = createRuntimeError({ code: "SANDBOX_WORKSPACE_UNSUPPORTED", message: `The ${this.name} provider does not support workspace mode ${request.workspaceMode}`, retryable: false, effect: "none", details: { provider: this.name, workspaceMode: request.workspaceMode } });
       return sandboxExecutionFailure(error, sandboxExecutionMeta(context, this.name, effectClass));
     }
-    const workspaceMode = request.workspaceMode ?? capabilities.workspaceMode;
+    // Agent-authored mutations should get the strongest workspace isolation
+    // this provider advertises unless the caller explicitly selected a mode.
+    const workspaceMode = request.workspaceMode ?? (
+      (effectClass === "workspace_write" || effectClass === "destructive") && capabilities.workspaceModes.includes("private_clone")
+        ? "private_clone"
+        : capabilities.workspaceMode
+    );
     const args = ["run", "--non-interactive", "--workspace-mode", workspaceMode, "--"];
     if (request.executable !== undefined) args.push(request.executable, ...(request.args ?? []));
     else args.push("sh", "-lc", request.command ?? "");
