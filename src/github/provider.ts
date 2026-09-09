@@ -238,17 +238,19 @@ function repositoryPath(repository: GitHubRepository): string {
 
 function parseRepository(value: unknown): GitHubRepository | undefined {
   if (!isObject(value)) return undefined;
+  const ownerName = stringValue(nested(value.owner, "login")) ?? stringValue(nested(value.owner, "name"));
   const nameWithOwner = stringValue(value.nameWithOwner) ??
-    (stringValue(nested(value.owner, "login")) !== undefined && stringValue(value.name) !== undefined
-      ? `${stringValue(nested(value.owner, "login"))}/${stringValue(value.name)}`
+    stringValue(value.full_name) ??
+    (ownerName !== undefined && stringValue(value.name) !== undefined
+      ? `${ownerName}/${stringValue(value.name)}`
       : undefined);
   if (nameWithOwner === undefined || !nameWithOwner.includes("/")) return undefined;
   const [owner, ...nameParts] = nameWithOwner.split("/");
   const name = stringValue(value.name) ?? nameParts.join("/");
   if (owner === undefined || name === "") return undefined;
   const repository: GitHubRepository = { owner, name, nameWithOwner };
-  const url = stringValue(value.url);
-  const defaultBranch = stringValue(nested(value.defaultBranchRef, "name"));
+  const url = stringValue(value.html_url) ?? stringValue(value.url);
+  const defaultBranch = stringValue(nested(value.defaultBranchRef, "name")) ?? stringValue(value.default_branch);
   return {
     ...repository,
     ...(url === undefined ? {} : { url }),
@@ -329,6 +331,33 @@ function parseChecks(value: unknown): GitHubCheck[] {
           ? value.check_runs
           : [];
   return source.map(parseCheck).filter((item): item is GitHubCheck => item !== undefined);
+}
+
+const RAW_CHECK_STATUSES = new Set([
+  "pass", "passed", "success", "fail", "failed", "failure", "error", "errored", "cancel", "cancelled", "canceled",
+  "pending", "queued", "requested", "waiting", "running", "in_progress", "in-progress", "stale", "timed_out", "timed-out",
+  "action_required", "action-required", "startup_failure", "startup-failure", "skipping", "skipped", "neutral",
+]);
+
+function parseRawChecks(stdout: string): GitHubCheck[] {
+  return stdout.split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !/^(all checks|no checks)/i.test(line))
+    .map((line) => {
+      const parts = line.split(/\s+/);
+      const urlIndex = parts.findIndex((part) => /^https?:\/\//i.test(part));
+      const tableParts = urlIndex < 0 ? parts : parts.slice(0, urlIndex);
+      const statusIndex = tableParts.reduce((last, part, index) => RAW_CHECK_STATUSES.has(normalizeStatus(part)) ? index : last, -1);
+      if (statusIndex < 0) {
+        return { name: tableParts.join(" ") || "check", status: "unknown" };
+      }
+      const nameParts = tableParts.slice(0, statusIndex);
+      if (/^[✓✔✗×⨯✕Xx○◯\-!]$/.test(nameParts[0] ?? "")) nameParts.shift();
+      return {
+        name: nameParts.join(" ") || "check",
+        status: normalizeStatus(tableParts[statusIndex]),
+      };
+    });
 }
 
 function parseReview(value: unknown): GitHubReview | undefined {
@@ -412,24 +441,19 @@ function parsePullRequests(value: unknown): GitHubPullRequest[] {
   return value.map(parsePullRequest).filter((item): item is GitHubPullRequest => item !== undefined);
 }
 
-function parseDependencies(value: unknown, issue: number, key: "blockedBy" | "blocking"): GitHubIssueDependencies {
-  const numbers = Array.isArray(value)
-    ? value.map((entry) => numberValue(nested(entry, "number")) ?? numberValue(entry)).filter((item): item is number => item !== undefined)
-    : [];
-  return {
-    issue,
-    blockedBy: key === "blockedBy" ? numbers : [],
-    blocking: key === "blocking" ? numbers : [],
-  };
+function parseDependencyNumbers(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.map((entry) => numberValue(nested(entry, "number")) ?? numberValue(entry)).filter((item): item is number => item !== undefined);
 }
 
 function mergeDependencies(issue: number, blockedBy: readonly number[], blocking: readonly number[]): GitHubIssueDependencies {
   return { issue, blockedBy: [...new Set(blockedBy)], blocking: [...new Set(blocking)] };
 }
 
-function labelStatus(issue: GitHubIssue, blockedBy: readonly number[]): GitHubWorkItem["status"] {
+function labelStatus(issue: GitHubIssue, dependencies: GitHubIssueDependencies): GitHubWorkItem["status"] {
   if ((issue.state ?? "").toLowerCase() === "closed") return "completed";
-  if (blockedBy.length > 0) return "blocked";
+  if (dependencies.state === "unknown") return "unknown";
+  if (dependencies.blockedBy.length > 0) return "blocked";
   const labels = (issue.labels ?? []).map((label) => label.toLowerCase().replaceAll("-", "_"));
   if (labels.some((label) => label.includes("in_progress") || label.includes("doing"))) return "in_progress";
   return "ready";
@@ -578,31 +602,35 @@ export class GitHubProvider {
   async wait(input: GitHubWaitInput = {}, context: OperationContext = defaultContext(), options: { readonly instrument?: boolean } = {}): Promise<GitHubOperationResult<GitHubWaitResult>> {
     return this.runOperation("github.wait", "network", context, async (metrics, operationContext) => {
       const routes = new Set<GitHubProviderRoute>();
+      const intervalMs = nonNegativeInteger(input.intervalMs, DEFAULT_WAIT_INTERVAL_MS);
+      const timeoutMs = nonNegativeInteger(input.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS);
+      const maxPolls = positiveInteger(input.maxPolls, DEFAULT_WAIT_MAX_POLLS);
+      const deadline = Math.min(Date.now() + timeoutMs, contextDeadline(operationContext));
+      // DirectExecutor applies the context deadline to every child process.
+      // This is important for the raw shell escape hatch, whose command must
+      // never be allowed to outlive this semantic wait operation.
+      const waitContext = withDeadline(operationContext, deadline);
       let repository: GitHubRepository | undefined;
       let pullRequestNumber = parsePullRequestNumber(input.pullRequest);
       if (pullRequestNumber === undefined) {
-        const repositoryAttempt = await this.readRepositoryAttempt(input.cwd, operationContext, metrics, routes);
+        const repositoryAttempt = await this.readRepositoryAttempt(input.cwd, waitContext, metrics, routes);
         repository = repositoryAttempt?.value;
-        const current = await this.readCurrentPullRequest(input.cwd, repository, operationContext, metrics, routes);
+        const current = await this.readCurrentPullRequest(input.cwd, repository, waitContext, metrics, routes);
         pullRequestNumber = current?.value.number;
       } else {
-        const repositoryAttempt = await this.readRepositoryAttempt(input.cwd, operationContext, metrics, routes);
+        const repositoryAttempt = await this.readRepositoryAttempt(input.cwd, waitContext, metrics, routes);
         repository = repositoryAttempt?.value;
       }
       if (pullRequestNumber === undefined) {
         throw createRuntimeError({ code: "GITHUB_PR_NOT_FOUND", message: "No current pull request was found", retryable: false, effect: "none" });
       }
 
-      const intervalMs = nonNegativeInteger(input.intervalMs, DEFAULT_WAIT_INTERVAL_MS);
-      const timeoutMs = nonNegativeInteger(input.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS);
-      const maxPolls = positiveInteger(input.maxPolls, DEFAULT_WAIT_MAX_POLLS);
-      const deadline = Math.min(Date.now() + timeoutMs, contextDeadline(operationContext));
       let lastChecks: readonly GitHubCheck[] = [];
       for (let poll = 0; poll < maxPolls; poll += 1) {
-        if (operationContext.signal.aborted) throw createRuntimeError({ code: "GITHUB_WAIT_CANCELLED", message: "GitHub wait was cancelled", retryable: false, effect: "none" });
+        if (waitContext.signal.aborted) throw createRuntimeError({ code: "GITHUB_WAIT_CANCELLED", message: "GitHub wait was cancelled", retryable: false, effect: "none" });
         if (Date.now() >= deadline) break;
         metrics.pollCountInternal += 1;
-        const checksAttempt = await this.readChecks(pullRequestNumber, repository, input.cwd, operationContext, metrics, routes);
+        const checksAttempt = await this.readChecks(pullRequestNumber, repository, input.cwd, waitContext, metrics, routes, deadline);
         if (checksAttempt === undefined) {
           throw createRuntimeError({ code: "GITHUB_CHECKS_UNAVAILABLE", message: "Pull request checks could not be read", retryable: true, effect: "none" });
         }
@@ -628,7 +656,10 @@ export class GitHubProvider {
             summary: "GitHub checks reached a terminal state",
           };
         }
-        if (poll + 1 < maxPolls && intervalMs > 0 && Date.now() < deadline) await this.sleep(intervalMs, operationContext.signal);
+        const remainingMs = deadline - Date.now();
+        if (poll + 1 < maxPolls && intervalMs > 0 && remainingMs > 0) {
+          await this.sleep(Math.min(intervalMs, remainingMs), waitContext.signal);
+        }
       }
       const summary = checksSummary(lastChecks);
       throw createRuntimeError({
@@ -847,10 +878,10 @@ export class GitHubProvider {
     return result;
   }
 
-  private async shell(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<GitHubCommandResult> {
+  private async shell(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, options: { readonly timeoutMs?: number } = {}): Promise<GitHubCommandResult> {
     const command = rawCommand(args);
     metrics.call({ shell: command, cwd });
-    const result = await this.runner.runShell({ command, ...(cwd === undefined ? {} : { cwd }), maxOutputBytes: this.maxOutputBytes }, context);
+    const result = await this.runner.runShell({ command, ...(cwd === undefined ? {} : { cwd }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), maxOutputBytes: this.maxOutputBytes }, context);
     metrics.observe(result);
     return result;
   }
@@ -928,18 +959,20 @@ export class GitHubProvider {
     if (fromRemote !== undefined) {
       const api = await this.apiJson(`repos/${repositoryPath(fromRemote)}`, [], cwd, context, metrics);
       if (api !== undefined) {
-        const apiUrl = stringValue(nested(api.value, "html_url"));
-        const apiDefaultBranch = stringValue(nested(api.value, "default_branch"));
+        // REST uses html_url/default_branch/full_name, while gh --json uses
+        // url/defaultBranchRef/nameWithOwner. Normalize before parsing so the
+        // publish base branch remains the repository's actual default.
         const repository = parseRepository(api.value) ?? {
           ...fromRemote,
-          ...(apiUrl === undefined ? {} : { url: apiUrl }),
-          ...(apiDefaultBranch === undefined ? {} : { defaultBranch: apiDefaultBranch }),
+          ...(stringValue(nested(api.value, "html_url")) === undefined ? {} : { url: stringValue(nested(api.value, "html_url")) as string }),
+          ...(stringValue(nested(api.value, "default_branch")) === undefined ? {} : { defaultBranch: stringValue(nested(api.value, "default_branch")) as string }),
         };
         routes.add(api.route);
         return { value: repository, route: api.route };
       }
-      routes.add("gh-api");
-      return { value: fromRemote, route: "gh-api" };
+      // The git remote identifies the repository, but a failed API read must
+      // not advertise gh-api as an available provider route.
+      return { value: fromRemote, route: "unavailable" };
     }
     return undefined;
   }
@@ -1085,11 +1118,12 @@ export class GitHubProvider {
     const blocking = await this.apiJson(`repos/${repositoryPath(repository)}/issues/${number}/dependencies/blocking`, [], cwd, context, metrics);
     if (blockedBy !== undefined) routes.add(blockedBy.route);
     if (blocking !== undefined) routes.add(blocking.route);
-    return mergeDependencies(
-      number,
-      blockedBy === undefined ? [] : parseDependencies(blockedBy.value, number, "blockedBy").blockedBy,
-      blocking === undefined ? [] : parseDependencies(blocking.value, number, "blocking").blocking,
-    );
+    const blockedByNumbers = parseDependencyNumbers(blockedBy?.value);
+    const blockingNumbers = parseDependencyNumbers(blocking?.value);
+    const dependencies = mergeDependencies(number, blockedByNumbers ?? [], blockingNumbers ?? []);
+    return blockedByNumbers !== undefined && blockingNumbers !== undefined
+      ? dependencies
+      : { ...dependencies, state: "unknown" };
   }
 
   private async readWork(repository: GitHubRepository, numbers: readonly number[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<GitHubWorkSnapshot> {
@@ -1100,12 +1134,12 @@ export class GitHubProvider {
       if (issue === undefined) continue;
       const dependency = await this.readIssueDependencies(repository, number, cwd, context, metrics, routes);
       dependencies.push(dependency);
-      items.push({ ...issue, status: labelStatus(issue, dependency.blockedBy), blockedBy: dependency.blockedBy });
+      items.push({ ...issue, status: labelStatus(issue, dependency), blockedBy: dependency.blockedBy });
     }
     return summarizeWork(items, dependencies);
   }
 
-  private async readChecks(number: number, repository: GitHubRepository | undefined, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubCheck[]> | undefined> {
+  private async readChecks(number: number, repository: GitHubRepository | undefined, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>, deadline?: number): Promise<Attempt<GitHubCheck[]> | undefined> {
     const structured = await this.jsonCommand(["pr", "checks", String(number), "--json", "name,state,bucket,link"], cwd, context, metrics);
     if (structured !== undefined) {
       routes.add("gh-json");
@@ -1122,13 +1156,20 @@ export class GitHubProvider {
         }
       }
     }
-    const raw = await this.shell(["pr", "checks", String(number), "--watch"], cwd, context, metrics);
+    const timeoutMs = deadline === undefined || !Number.isFinite(deadline) ? undefined : Math.max(1, deadline - Date.now());
+    // Keep raw gh as an escape hatch, but leave polling to AER. The --watch
+    // mode owns an unbounded loop and can therefore exceed the operation's
+    // timeout; the per-command timeout is the final safety boundary.
+    const raw = await this.shell(
+      ["pr", "checks", String(number)],
+      cwd,
+      context,
+      metrics,
+      timeoutMs === undefined ? {} : { timeoutMs },
+    );
     if ((raw.exitCode ?? 0) === 0) {
       routes.add("raw-gh");
-      const checks = raw.stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "" && !line.toLowerCase().includes("all checks")).map((line) => {
-        const parts = line.split(/\s+/);
-        return { name: parts.slice(0, -1).join(" ") || "check", status: normalizeStatus(parts.at(-1)) || "success" };
-      });
+      const checks = parseRawChecks(raw.stdout);
       return { value: checks, route: "raw-gh" };
     }
     return undefined;
@@ -1210,6 +1251,11 @@ function positiveInteger(value: number | undefined, fallback: number): number {
 
 function contextDeadline(context: OperationContext): number {
   return context.deadline === undefined ? Number.POSITIVE_INFINITY : context.deadline;
+}
+
+function withDeadline(context: OperationContext, deadline: number): OperationContext {
+  if (!Number.isFinite(deadline) || context.deadline === deadline) return context;
+  return createOperationContext({ ...context, deadline });
 }
 
 function routeList(routes: Set<GitHubProviderRoute>, includeRaw: boolean): GitHubProviderRoute[] {

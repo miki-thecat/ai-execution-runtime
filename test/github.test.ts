@@ -9,6 +9,7 @@ type Fixture = GitHubCommandResult | (() => GitHubCommandResult);
 class FixtureRunner implements GitHubCommandRunner {
   readonly executableCalls: string[][] = [];
   readonly shellCalls: string[] = [];
+  readonly shellInputs: Array<{ readonly command: string; readonly timeoutMs?: number }> = [];
   private readonly fixtures = new Map<string, Fixture | Fixture[]>();
   private readonly shellFixtures = new Map<string, Fixture | Fixture[]>();
 
@@ -28,8 +29,9 @@ class FixtureRunner implements GitHubCommandRunner {
     return this.consume(args);
   }
 
-  async runShell(input: { readonly command: string }): Promise<GitHubCommandResult> {
+  async runShell(input: { readonly command: string; readonly timeoutMs?: number }): Promise<GitHubCommandResult> {
     this.shellCalls.push(input.command);
+    this.shellInputs.push(input.timeoutMs === undefined ? { command: input.command } : { command: input.command, timeoutMs: input.timeoutMs });
     const fixture = this.shellFixtures.get(input.command);
     if (fixture !== undefined) {
       if (Array.isArray(fixture)) {
@@ -331,4 +333,63 @@ test("github.publish preserves applied effect when post-push reconciliation cann
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.error.effect, "applied");
+});
+
+test("github.wait bounds the raw check fallback and parses tabular status", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], { stdout: "", stderr: "unsupported", exitCode: 1 })
+    .when(["remote", "get-url", "origin"], { stdout: "", stderr: "not a git repository", exitCode: 1 })
+    .whenShell("'gh' 'pr' 'checks' '7'", { stdout: "✓ build pass 2s https://github.com/miki-thecat/runtime/actions/runs/1\n", stderr: "", exitCode: 0 });
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.wait({ pullRequest: 7, timeoutMs: 100, maxPolls: 1, intervalMs: 0 });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.checks[0]?.name, "build");
+  assert.equal(result.data.checks[0]?.status, "pass");
+  assert.equal(result.data.checksSummary.state, "success");
+  assert.equal(runner.shellCalls.includes("'gh' 'pr' 'checks' '7'"), true);
+  assert.equal(runner.shellCalls.some((command) => command.includes("--watch")), false);
+  assert.ok((runner.shellInputs[runner.shellInputs.length - 1]?.timeoutMs ?? 0) > 0);
+});
+
+test("github.publish preserves a REST repository default branch", async () => {
+  const branch = "feature/rest-repository";
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], { stdout: "", stderr: "unsupported", exitCode: 1 })
+    .when(["remote", "get-url", "origin"], { stdout: "git@github.com:miki-thecat/runtime.git\n", stderr: "", exitCode: 0 })
+    .when(["api", "repos/miki-thecat/runtime"], json({ name: "runtime", full_name: "miki-thecat/runtime", html_url: "https://github.com/miki-thecat/runtime", default_branch: "develop", owner: { login: "miki-thecat" } }))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "rest123\n", stderr: "", exitCode: 0 })
+    .when(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], { stdout: "rest123\trefs/heads/" + branch + "\n", stderr: "", exitCode: 0 })
+    .when(["pr", "list", "--head", branch, "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json([]))
+    .when(["api", "repos/miki-thecat/runtime/pulls", "--method", "POST", "--field", "title=REST branch", "--field", `head=${branch}`, "--field", "base=develop", "--field", "body="], json({ number: 21, title: "REST branch", state: "OPEN", head: { ref: branch, sha: "rest123" }, base: { ref: "develop" } }))
+    .when(["pr", "view", "21", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 21, title: "REST branch", state: "OPEN", headRefName: branch, headRefOid: "rest123", baseRefName: "develop" }));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.publish({ branch, title: "REST branch" });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.repository.defaultBranch, "develop");
+  assert.equal(result.data.pullRequest.baseRefName, "develop");
+  assert.equal(runner.executableCalls.some((args) => args.includes("base=develop")), true);
+});
+
+test("github.work marks incomplete native dependency reads as unknown", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["issue", "view", "7", "--json", "number,title,state,url,labels,assignees"], json({ number: 7, title: "FA-05", state: "OPEN", labels: [{ name: "ready" }] }))
+    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocked_by"], { stdout: "", stderr: "dependency endpoint unavailable", exitCode: 1 })
+    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocking"], { stdout: "", stderr: "dependency endpoint unavailable", exitCode: 1 });
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.work({ issueNumbers: [7] });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.items[0]?.status, "unknown");
+  assert.deepEqual(result.data.ready, []);
+  assert.equal(result.data.dependencies[0]?.state, "unknown");
 });

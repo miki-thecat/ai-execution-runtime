@@ -109,6 +109,8 @@ export interface GitHubIssueDependencies {
   readonly issue: number;
   readonly blockedBy: readonly number[];
   readonly blocking: readonly number[];
+  /** Present when one or more native dependency endpoint reads failed. */
+  readonly state?: "unknown";
 }
 
 export interface GitHubWorkItem extends GitHubIssue {
