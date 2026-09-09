@@ -39,13 +39,24 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
     git(root, ["add", ".aer/project.json"]);
     git(root, ["commit", "-qm", "configure aer"]);
 
-    const inspected = await runtime.inspect(project);
+    const inspectRun = tracer.startRun({ projectId: project.projectId, actor: "runtime" });
+    const inspected = await runtime.inspect(project, createOperationContext({
+      traceId: inspectRun.traceId,
+      runId: inspectRun.runId,
+      projectId: project.projectId,
+      actor: "runtime",
+      effectPolicy: { allowedClasses: ["read"] },
+    }));
     assert.equal(inspected.ok, true);
     if (!inspected.ok) return;
     assert.equal(inspected.data.projectId, project.projectId);
     assert.equal(inspected.data.git.available, true);
     assert.equal(inspected.data.git.branch, "main");
     assert.equal(inspected.data.git.dirty, false);
+    const inspectProcesses = sink.events.filter((event) => event.runId === inspectRun.runId && event.type.startsWith("process."));
+    assert.ok(inspectProcesses.length > 0);
+    assert.equal(inspectProcesses.every((event) => event.effectClass === "read"), true);
+    inspectRun.complete();
 
     const tasks = new TaskManager({ state, tracer });
     const task = tasks.create({ projectId: project.projectId, title: "verify runtime" });
@@ -58,6 +69,11 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
     assert.equal(reopenedTasks.get(task.taskId)?.status, "completed");
     const unknownTask = tasks.create({ projectId: project.projectId, title: "reconcile unknown effect" });
     tasks.markUnknown(unknownTask.taskId, { reason: "process ownership was lost" });
+    const unknownLifecycle = state.listEvents({ runId: unknownTask.runId });
+    assert.equal(unknownLifecycle.some((event) => event.type === "task.failed" || event.type === "run.failed"), false);
+    assert.equal(unknownLifecycle.some((event) => event.type === "task.unknown"), true);
+    assert.equal(unknownLifecycle.some((event) => event.type === "run.unknown"), true);
+    assert.equal(state.getRun(unknownTask.runId)?.status, "unknown");
 
     const run = tracer.startRun({ projectId: project.projectId, actor: "runtime" });
     const context = createOperationContext({ traceId: run.traceId, runId: run.runId, projectId: project.projectId, actor: "runtime" });
@@ -71,10 +87,13 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
     assert.equal(checked.ok, true);
     if (!checked.ok) return;
     assert.equal(checked.data.passed, true);
+    assert.equal(checked.meta.effectClass, "workspace_write");
+    assert.equal(checked.meta.effectState, "applied");
     assert.equal(checked.data.checks[0]?.status, "passed");
     assert.ok(state.getEntity("verifications", checked.data.verificationId));
     assert.ok(state.listEvents({ type: "process.started" }).length > 0);
     assert.ok(state.listEvents({ type: "process.completed" }).length > 0);
+    assert.equal(state.listEvents({ runId: run.runId }).filter((event) => event.type.startsWith("process.")).every((event) => event.effectClass === "workspace_write"), true);
     run.complete();
 
     const resumed = await runtime.resume(project, undefined, { eventLimit: 8, itemLimit: 8 });
@@ -96,6 +115,21 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
     assert.ok(eventTypes.has("process.started"));
     assert.ok(eventTypes.has("process.completed"));
 
+    const deniedRun = tracer.startRun({ projectId: project.projectId, actor: "runtime" });
+    const processCount = sink.events.filter((event) => event.type === "process.started").length;
+    const deniedVerification = await verification.runConfigured(project, createOperationContext({
+      traceId: deniedRun.traceId,
+      runId: deniedRun.runId,
+      projectId: project.projectId,
+      actor: "runtime",
+      effectPolicy: { allowedClasses: ["read"] },
+    }));
+    assert.equal(deniedVerification.ok, false);
+    if (deniedVerification.ok) return;
+    assert.equal(deniedVerification.meta.effectClass, "workspace_write");
+    assert.equal(deniedVerification.meta.effectState, "none");
+    assert.equal(sink.events.filter((event) => event.type === "process.started").length, processCount);
+
     state.close();
     const reopenedState = new SqliteStateStore(dbPath);
     try {
@@ -104,6 +138,8 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
       assert.equal(reopenedProject?.projectId, project.projectId);
       const reopenedEvidence = reopenedState.getEntity("verifications", checked.data.verificationId);
       assert.equal(reopenedEvidence?.status, "completed");
+      assert.equal(reopenedState.getTask(unknownTask.taskId)?.status, "unknown");
+      assert.equal(reopenedState.getRun(unknownTask.runId)?.status, "unknown");
     } finally {
       reopenedState.close();
     }

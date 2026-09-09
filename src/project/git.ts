@@ -148,7 +148,7 @@ export class LocalGitSnapshot {
       args,
       cwd: rootDir,
       maxOutputBytes: GIT_OUTPUT_LIMIT,
-    }, context, { instrument: false });
+    }, context, { instrument: false, effectClass: "read" });
     if (!result.ok) {
       if (metrics !== undefined) {
         metrics.rawOutputBytes += result.meta.metrics.rawOutputBytes;

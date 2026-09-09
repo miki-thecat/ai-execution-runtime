@@ -90,7 +90,7 @@ export class OperationRegistry {
     context: OperationContext,
   ): Promise<RuntimeResult<Output>> {
     const registered = this.operations.get(name);
-    const effectClass = registered?.effectClass ?? "none";
+    const effectClass = registered?.effectClass ?? "read";
     const parentSpanId = context.spanId ?? context.parentSpanId;
     const startOptions = {
       traceId: context.traceId,
@@ -125,7 +125,7 @@ export class OperationRegistry {
         context: operationContext,
         operation: name,
         status: "failed",
-        effectClass: "none",
+        effectClass: "read",
         effectState: "none",
         startedAt: span.startedAt,
         completedAt: event.timestamp,
@@ -149,11 +149,12 @@ export class OperationRegistry {
         };
       }
 
-      const event = finishFailure(span, result.error, result.meta);
+      const status = result.error.effect === "unknown" ? "unknown" : result.meta.status;
+      const event = finishFailure(span, result.error, result.meta, status);
       return {
         ok: false,
         error: result.error,
-        meta: normalizedMeta(result.meta, operationContext, registered, result.meta.status, span, event),
+        meta: normalizedMeta(result.meta, operationContext, registered, status, span, event),
       };
     } catch (cause: unknown) {
       const error: RuntimeError = isRuntimeError(cause)
@@ -164,11 +165,12 @@ export class OperationRegistry {
             retryable: false,
             effect: "unknown",
           });
-      const event = span.fail(error);
+      const unknown = error.effect === "unknown";
+      const event = unknown ? span.unknown(error) : span.fail(error);
       return runtimeFailure(error, createOperationMeta({
         context: operationContext,
         operation: name,
-        status: "failed",
+        status: unknown ? "unknown" : "failed",
         effectClass: registered.effectClass,
         effectState: error.effect,
         startedAt: span.startedAt,
@@ -233,6 +235,7 @@ function finishFailure(
   span: OperationSpan,
   error: RuntimeError,
   meta: OperationMeta,
+  status: OperationMeta["status"],
 ): RuntimeEvent {
   const options = {
     effectState: error.effect,
@@ -240,7 +243,7 @@ function finishFailure(
     ...(meta.summary === undefined ? {} : { summary: meta.summary }),
   };
 
-  switch (meta.status) {
+  switch (status) {
     case "cancelled":
       return span.cancel(options);
     case "unknown":

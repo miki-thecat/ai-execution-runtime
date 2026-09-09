@@ -203,12 +203,12 @@ export class TaskManager {
       ...(transitionInput.reason === undefined ? {} : { reason: transitionInput.reason }),
       ...(transitionInput.metadata === undefined ? {} : { metadata: transitionInput.metadata }),
     };
-    const eventType = status === "completed" ? "task.completed" : status === "failed" ? "task.failed" : status === "cancelled" ? "task.cancelled" : status === "unknown" ? "task.failed" : status === "blocked" || isWaiting(status) ? "task.blocked" : "task.started";
+    const eventType = status === "completed" ? "task.completed" : status === "failed" ? "task.failed" : status === "cancelled" ? "task.cancelled" : status === "unknown" ? "task.unknown" : status === "blocked" || isWaiting(status) ? "task.blocked" : "task.started";
     this.emitTaskEvent(task, eventType, status, context?.actor ?? "runtime", {
       summary: transitionInput.reason ?? `Task ${status}`,
       metadata: { from: current.status, to: status, ...(transitionInput.metadata ?? {}) },
     }, context?.spanId);
-    this.syncTaskRun(task);
+    this.syncTaskRun(task, context?.actor ?? "runtime", context?.spanId);
     this.persist(task);
     this.memory.set(taskId, task);
     return task;
@@ -291,22 +291,36 @@ export class TaskManager {
     });
   }
 
-  private syncTaskRun(task: TaskRecord): void {
-    if (this.state === undefined) return;
-    const run = this.state.getEntity("runs", task.runId);
-    if (run?.data?.taskId !== task.taskId) return;
-    const terminalStatus: Readonly<Record<string, TaskStatus>> = {
-      completed: "completed",
-      failed: "failed",
-      cancelled: "cancelled",
-      unknown: "unknown",
-    };
-    this.state.saveEntity({
-      ...run,
-      status: terminalStatus[task.status] ?? task.status,
-      updatedAt: task.updatedAt,
-      data: { ...(run.data ?? {}), summary: task.reason ?? task.title },
+  private syncTaskRun(task: TaskRecord, actor: string, parentSpanId?: SpanId): void {
+    const run = this.state?.getEntity("runs", task.runId);
+    if (run !== undefined && run.data?.taskId !== task.taskId) return;
+    const type = task.status === "running"
+      ? "run.started"
+      : task.status === "completed"
+        ? "run.completed"
+        : task.status === "failed"
+          ? "run.failed"
+          : task.status === "cancelled"
+            ? "run.cancelled"
+            : task.status === "unknown"
+              ? "run.unknown"
+              : undefined;
+    if (type === undefined) return;
+    const event = this.tracer.emit({
+      traceId: task.traceId,
+      runId: task.runId,
+      taskId: task.taskId,
+      spanId: createSpanId(),
+      ...(parentSpanId === undefined ? {} : { parentSpanId }),
+      type,
+      actor,
+      ...(task.projectId === undefined ? {} : { projectId: task.projectId }),
+      status: task.status,
+      summary: task.reason ?? `Task-owned run ${task.status}`,
+      ...(task.status === "unknown" ? { effectState: "unknown" as const } : {}),
+      metadata: { source: "task", taskId: task.taskId },
     });
+    this.persistEvent(event);
   }
 
   private emitTaskEvent(
@@ -331,6 +345,10 @@ export class TaskManager {
       ...(status === "unknown" ? { effectState: "unknown" as const } : {}),
       ...(options.metadata === undefined ? {} : { metadata: options.metadata }),
     });
+    this.persistEvent(event);
+  }
+
+  private persistEvent(event: RuntimeEvent): void {
     if (this.state !== undefined && this.tracer.sink !== this.state && this.state.getEvent(event.eventId) === undefined) this.state.append(event);
   }
 }

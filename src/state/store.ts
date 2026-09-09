@@ -167,6 +167,7 @@ function taskStatusForEvent(type: RuntimeEvent["type"]): RuntimeStatus | undefin
     case "task.completed": return "completed";
     case "task.failed": return "failed";
     case "task.cancelled": return "cancelled";
+    case "task.unknown": return "unknown";
     default: return undefined;
   }
 }
@@ -480,8 +481,10 @@ export class SqliteStateStore implements StateStore {
     const terminalRunStatus: Readonly<Record<string, RuntimeStatus>> = {
       "run.completed": "completed",
       "run.failed": "failed",
+      "run.cancelled": "cancelled",
+      "run.unknown": "unknown",
     };
-    if (event.type === "run.started" || event.type === "run.completed" || event.type === "run.failed") {
+    if (event.type === "run.started" || event.type === "run.completed" || event.type === "run.failed" || event.type === "run.cancelled" || event.type === "run.unknown") {
       const existing = this.getRun(event.runId);
       const status = terminalRunStatus[event.type] ?? event.status ?? existing?.status ?? "running";
       const projectId = event.projectId ?? existing?.projectId;
@@ -490,7 +493,7 @@ export class SqliteStateStore implements StateStore {
         INSERT INTO runs (run_id, trace_id, project_id, status, actor, created_at, started_at, completed_at, updated_at, data_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')
         ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, project_id=excluded.project_id, actor=excluded.actor, completed_at=excluded.completed_at, updated_at=excluded.updated_at
-      `).run(event.runId, event.traceId, nullable(projectId), status, event.actor, startedAt, startedAt, status === "completed" || status === "failed" ? event.timestamp : null, event.timestamp);
+      `).run(event.runId, event.traceId, nullable(projectId), status, event.actor, startedAt, startedAt, status === "completed" || status === "failed" || status === "cancelled" || status === "unknown" ? event.timestamp : null, event.timestamp);
     }
     if (event.taskId !== undefined && (event.type.startsWith("task.") || event.type === "run.started")) {
       const existing = this.getTask(event.taskId);

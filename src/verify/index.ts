@@ -1,5 +1,6 @@
 import { createOperationContext, createRunId, createRuntimeError, createTraceId, createVerificationId, runtimeFailure, runtimeSuccess, type OperationContext, type ProjectId, type RuntimeError, type RuntimeResult } from "../core/index.ts";
 import type { ArtifactRef, VerificationId } from "../core/ids.ts";
+import type { EffectState } from "../core/effects.ts";
 import { createOperationMeta, type OperationMeta, type RuntimeStatus } from "../core/result.ts";
 import { DirectExecutor } from "../direct/index.ts";
 import type { ExecutableCommand, ProcessResult, ShellRunInput } from "../direct/types.ts";
@@ -169,6 +170,12 @@ function refsFromChecks(checks: readonly VerificationCheckEvidence[]): ArtifactR
   return refs;
 }
 
+function mergeEffectState(current: EffectState, next: EffectState): EffectState {
+  if (current === "unknown" || next === "unknown") return "unknown";
+  if (current === "applied" || next === "applied") return "applied";
+  return "none";
+}
+
 /** Runs only project-configured checks through DirectExecutor and persists evidence. */
 export class VerificationRunner {
   readonly tracer: Tracer;
@@ -202,7 +209,7 @@ export class VerificationRunner {
       runId: operationContext.runId,
       actor: operationContext.actor,
       operation: "verify.run",
-      effectClass: "read",
+      effectClass: "workspace_write",
       ...(operationContext.spanId === undefined ? {} : { parentSpanId: operationContext.spanId }),
       ...(project === undefined ? {} : { projectId: project.projectId }),
       executor: "direct",
@@ -235,21 +242,25 @@ export class VerificationRunner {
       });
       this.persistPartial(verificationId, project, operationContextWithSpan, "verifying", startedAt, []);
       const evidence: VerificationCheckEvidence[] = [];
+      let effectState: EffectState = "none";
       for (const check of checks) {
         try {
           const result = check.shell
-            ? await this.direct.runShell({ command: check.command, cwd: project.rootDir, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ShellRunInput, operationContextWithSpan, { instrument: false })
-            : await this.direct.runExecutable({ executable: check.executable ?? "", args: check.args ?? [], cwd: project.rootDir, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ExecutableCommand, operationContextWithSpan, { instrument: false });
+            ? await this.direct.runShell({ command: check.command, cwd: project.rootDir, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ShellRunInput, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" })
+            : await this.direct.runExecutable({ executable: check.executable ?? "", args: check.args ?? [], cwd: project.rootDir, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ExecutableCommand, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" });
           if (result.ok) {
+            effectState = mergeEffectState(effectState, result.meta.effectState);
             evidence.push(processEvidence(check, result.data, undefined));
             span.record({ internalCalls: 1, rawOutputBytes: result.data.rawOutputBytes, returnedOutputBytes: result.data.returnedOutputBytes, artifactBytes: result.data.artifactBytes });
           } else {
+            effectState = mergeEffectState(effectState, result.meta.effectState);
             const checkStatus: VerificationCheckStatus = result.meta.status === "cancelled" ? "cancelled" : result.meta.status === "unknown" || result.error.effect === "unknown" ? "unknown" : "failed";
             evidence.push(processEvidence(check, undefined, result.error, checkStatus, result.meta));
             span.record({ internalCalls: 1, artifactBytes: result.meta.metrics.artifactBytes, rawOutputBytes: result.meta.metrics.rawOutputBytes, returnedOutputBytes: result.meta.metrics.returnedOutputBytes });
           }
         } catch (cause) {
           const error = errorFor(cause, "VERIFY_CHECK_FAILED", "unknown");
+          effectState = mergeEffectState(effectState, error.effect);
           evidence.push(processEvidence(check, undefined, error));
           span.record({ internalCalls: 1 });
         }
@@ -282,19 +293,20 @@ export class VerificationRunner {
         timestamp: completedAt,
         summary,
         artifactRefs: resultEvidence.artifactRefs,
-        effectState: status === "unknown" ? "unknown" : "none",
+        effectState,
       });
-      const error = status === "completed" ? undefined : createRuntimeError({ code: `VERIFY_${status.toUpperCase()}`, message: summary, retryable: false, effect: status === "unknown" ? "unknown" : "none" });
-      const operationEvent = status === "completed" ? span.complete({ summary, artifactRefs: resultEvidence.artifactRefs }) : status === "cancelled" ? span.cancel({ summary, artifactRefs: resultEvidence.artifactRefs }) : status === "unknown" ? span.unknown(error!, { summary, artifactRefs: resultEvidence.artifactRefs, effectState: "unknown" }) : span.fail(error!, { summary, artifactRefs: resultEvidence.artifactRefs });
+      const error = status === "completed" ? undefined : createRuntimeError({ code: `VERIFY_${status.toUpperCase()}`, message: summary, retryable: false, effect: effectState });
+      const operationEvent = status === "completed" ? span.complete({ summary, artifactRefs: resultEvidence.artifactRefs, effectState }) : status === "cancelled" ? span.cancel({ summary, artifactRefs: resultEvidence.artifactRefs, effectState }) : status === "unknown" ? span.unknown(error!, { summary, artifactRefs: resultEvidence.artifactRefs, effectState }) : span.fail(error!, { summary, artifactRefs: resultEvidence.artifactRefs, effectState });
       this.persistEvent(operationEvent);
-      const meta = createOperationMeta({ context: operationContextWithSpan, operation: "verify.run", status: status === "completed" ? "completed" : status, effectClass: "read", effectState: status === "unknown" ? "unknown" : "none", startedAt: span.startedAt, completedAt: operationEvent.timestamp, artifactRefs: resultEvidence.artifactRefs, metrics: operationEvent, summary, verificationId });
+      const meta = createOperationMeta({ context: operationContextWithSpan, operation: "verify.run", status: status === "completed" ? "completed" : status, effectClass: "workspace_write", effectState, startedAt: span.startedAt, completedAt: operationEvent.timestamp, artifactRefs: resultEvidence.artifactRefs, metrics: operationEvent, summary, verificationId });
       if (status === "completed") return runtimeSuccess(resultEvidence, meta);
       return runtimeFailure(error!, meta);
     } catch (cause) {
       const error = errorFor(cause, "VERIFY_RUN_FAILED");
-      const event = span.fail(error, verificationId === undefined ? {} : { summary: error.message });
+      const unknown = error.effect === "unknown";
+      const event = unknown ? span.unknown(error, verificationId === undefined ? {} : { summary: error.message }) : span.fail(error, verificationId === undefined ? {} : { summary: error.message });
       this.persistEvent(event);
-      return runtimeFailure(error, createOperationMeta({ context: operationContextWithSpan, operation: "verify.run", status: "failed", effectClass: "read", effectState: error.effect, startedAt: span.startedAt, completedAt: event.timestamp, metrics: event, ...(verificationId === undefined ? {} : { verificationId }), summary: error.message }));
+      return runtimeFailure(error, createOperationMeta({ context: operationContextWithSpan, operation: "verify.run", status: unknown ? "unknown" : "failed", effectClass: "workspace_write", effectState: error.effect, startedAt: span.startedAt, completedAt: event.timestamp, metrics: event, ...(verificationId === undefined ? {} : { verificationId }), summary: error.message }));
     }
   }
 
@@ -353,7 +365,7 @@ export class VerificationRunner {
     readonly timestamp: string;
     readonly summary: string;
     readonly artifactRefs?: readonly ArtifactRef[];
-    readonly effectState?: "none" | "unknown";
+    readonly effectState?: "none" | "unknown" | "applied";
   }): void {
     const event = this.tracer.emit({
       traceId: input.traceId,
@@ -381,7 +393,7 @@ export class VerificationRunner {
 export function createVerifyRunOperation(runner: VerificationRunner): Operation<ProjectOperationInput & VerificationRunOptions, VerificationEvidence> {
   return {
     name: "verify.run",
-    effectClass: "read",
+    effectClass: "workspace_write",
     executor: "direct",
     provider: "node:child_process",
     execute(input, context) { return runner.run(input, context); },

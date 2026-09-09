@@ -74,10 +74,13 @@ Minimum Full Alpha events:
 
 ```text
 run.started          run.completed        run.failed
+run.cancelled        run.unknown
 task.created         task.started          task.blocked
 task.completed       task.failed           task.cancelled
+task.unknown
 operation.started    operation.completed   operation.failed
-operation.cancelled  process.started       process.completed
+operation.cancelled  operation.unknown     process.started
+process.completed
 process.cancelled    process.unknown
 artifact.created
 changeset.created    changeset.applied     changeset.rolled_back

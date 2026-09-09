@@ -91,6 +91,25 @@ test("semantic file operations reject symlink escapes", () => {
   }
 });
 
+test("workspace patches are rejected when policy grants only read", () => {
+  const root = fixture();
+  try {
+    writeFileSync(join(root, "guarded.txt"), "before\n");
+    const tracer = new Tracer();
+    const run = tracer.startRun({ actor: "model" });
+    const context = createOperationContext({ traceId: run.traceId, runId: run.runId, actor: "model", effectPolicy: { allowedClasses: ["read"] } });
+    const result = new FileOperations({ rootDir: root }).patch({ path: "guarded.txt", content: "after\n" }, context);
+
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.equal(result.error.code, "EFFECT_NOT_ALLOWED");
+    assert.equal(result.meta.effectClass, "workspace_write");
+    assert.equal(readFileSync(join(root, "guarded.txt"), "utf8"), "before\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("guarded patch records evidence and rollback refuses stale files", () => {
   const root = fixture();
   const state = new SqliteStateStore(":memory:");

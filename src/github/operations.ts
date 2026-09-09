@@ -17,7 +17,7 @@ import { GitHubProvider } from "./provider.ts";
 export function createGitHubCapabilitiesOperation(provider: GitHubProvider): Operation<GitHubCapabilityInput, GitHubCapabilities> {
   return {
     name: "github.capabilities",
-    effectClass: "read",
+    effectClass: "network",
     executor: "direct",
     provider: "github",
     execute(input, context): Promise<GitHubOperationResult<GitHubCapabilities>> {
@@ -53,7 +53,7 @@ export function createGitHubWaitOperation(provider: GitHubProvider): Operation<G
 export function createGitHubPublishOperation(provider: GitHubProvider): Operation<GitHubPublishInput, GitHubEffectReceipt> {
   return {
     name: "github.publish",
-    effectClass: "remote",
+    effectClass: "remote_write",
     executor: "direct",
     provider: "github",
     execute(input, context): Promise<GitHubOperationResult<GitHubEffectReceipt>> {

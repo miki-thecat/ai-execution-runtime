@@ -1,5 +1,5 @@
 import { createOperationContext, type OperationContext } from "../core/context.ts";
-import { isEffectAllowed, permissiveEffectPolicy, requiresApproval, type EffectClass, type EffectState } from "../core/effects.ts";
+import { isEffectAllowed, requiresApproval, type EffectClass, type EffectState } from "../core/effects.ts";
 import {
   createOperationMeta,
   createRuntimeError,
@@ -192,20 +192,20 @@ class DirectGitHubCommandRunner implements GitHubCommandRunner {
     this.maxOutputBytes = maxOutputBytes;
   }
 
-  async runExecutable(command: ExecutableCommand, context: OperationContext): Promise<GitHubCommandResult> {
+  async runExecutable(command: ExecutableCommand, context: OperationContext, effectClass: EffectClass): Promise<GitHubCommandResult> {
     const result = await this.direct.runExecutable({
       ...command,
       maxOutputBytes: command.maxOutputBytes ?? this.maxOutputBytes,
-    }, internalContext(context), { instrument: false });
+    }, internalContext(context), { instrument: false, effectClass });
     if (!result.ok) throw result.error;
     return processResult(result.data);
   }
 
-  async runShell(input: ShellRunInput, context: OperationContext): Promise<GitHubCommandResult> {
+  async runShell(input: ShellRunInput, context: OperationContext, effectClass: EffectClass): Promise<GitHubCommandResult> {
     const result = await this.direct.runShell({
       ...input,
       maxOutputBytes: input.maxOutputBytes ?? this.maxOutputBytes,
-    }, internalContext(context), { instrument: false });
+    }, internalContext(context), { instrument: false, effectClass });
     if (!result.ok) throw result.error;
     return processResult(result.data);
   }
@@ -227,14 +227,9 @@ function processResult(result: { readonly stdout: string; readonly stderr: strin
 }
 
 function internalContext(context: OperationContext): OperationContext {
-  // DirectExecutor's universal raw primitive is intentionally classified as a
-  // destructive effect. The semantic provider has already applied its own
-  // read/network/remote policy, so internal provider plumbing must not require
-  // the caller to grant shell permissions separately.
   return createOperationContext({
     ...context,
     actor: "provider",
-    effectPolicy: permissiveEffectPolicy(),
   });
 }
 
@@ -888,6 +883,7 @@ export class GitHubProvider {
   private readonly clock: () => number;
   private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   private readonly maxOutputBytes: number;
+  private readonly commandEffectClasses = new WeakMap<OperationContext, EffectClass>();
 
   constructor(options: GitHubProviderOptions = {}) {
     // DirectExecutor emits process/artifact events through its own tracer.
@@ -922,7 +918,7 @@ export class GitHubProvider {
   }
 
   async capabilities(input: GitHubCapabilityInput = {}, context: OperationContext = defaultContext(), options: { readonly instrument?: boolean } = {}): Promise<GitHubOperationResult<GitHubCapabilities>> {
-    return this.runOperation("github.capabilities", "read", context, async (metrics, operationContext) => {
+    return this.runOperation("github.capabilities", "network", context, async (metrics, operationContext) => {
       const routes = new Set<GitHubProviderRoute>();
       const version = await this.tryVersion(input.cwd, operationContext, metrics);
       if (version === undefined) {
@@ -1009,6 +1005,7 @@ export class GitHubProvider {
       // This is important for the raw shell escape hatch, whose command must
       // never be allowed to outlive this semantic wait operation.
       const waitContext = withDeadline(operationContext, deadline);
+      this.commandEffectClasses.set(waitContext, this.commandEffectClass(operationContext));
       let repository: GitHubRepository | undefined;
       let pullRequestNumber = parsePullRequestNumber(input.pullRequest);
       if (pullRequestNumber === undefined) {
@@ -1089,7 +1086,7 @@ export class GitHubProvider {
   }
 
   async publish(input: GitHubPublishInput, context: OperationContext = defaultContext(), options: { readonly instrument?: boolean } = {}): Promise<GitHubOperationResult<GitHubEffectReceipt>> {
-    return this.runOperation("github.publish", "remote", context, async (metrics, operationContext) => {
+    return this.runOperation("github.publish", "remote_write", context, async (metrics, operationContext) => {
       const cwd = input.cwd;
       const routes = new Set<GitHubProviderRoute>();
       const remote = input.remote ?? "origin";
@@ -1261,11 +1258,12 @@ export class GitHubProvider {
       executor: "direct",
       provider: "github",
     });
-    const operationContext = span === undefined ? context : createOperationContext({
+    const operationContext = createOperationContext({
       ...context,
-      spanId: span.spanId,
-      ...(context.spanId === undefined ? {} : { parentSpanId: context.spanId }),
+      ...(span === undefined ? {} : { spanId: span.spanId }),
+      ...(span === undefined || context.spanId === undefined ? {} : { parentSpanId: context.spanId }),
     });
+    this.commandEffectClasses.set(operationContext, effectClass);
     const metrics = new ProviderMetrics();
     try {
       if (!isEffectAllowed(operationContext.effectPolicy, effectClass)) {
@@ -1300,7 +1298,7 @@ export class GitHubProvider {
         provider: "github",
       }));
     } catch (cause) {
-      const error = errorFor(cause, "GITHUB_OPERATION_FAILED", effectClass === "remote" ? "unknown" : "none");
+      const error = errorFor(cause, "GITHUB_OPERATION_FAILED", effectClass === "remote_write" ? "unknown" : "none");
       const snapshot = metrics.snapshot();
       span?.record(snapshot);
       const event = span === undefined
@@ -1325,7 +1323,7 @@ export class GitHubProvider {
 
   private async execute(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<GitHubCommandResult> {
     metrics.call({ executable: "gh", args, cwd });
-    const result = await this.runner.runExecutable({ executable: "gh", args: [...args], ...(cwd === undefined ? {} : { cwd }), maxOutputBytes: this.maxOutputBytes }, context);
+    const result = await this.runner.runExecutable({ executable: "gh", args: [...args], ...(cwd === undefined ? {} : { cwd }), maxOutputBytes: this.maxOutputBytes }, context, this.commandEffectClass(context));
     metrics.observe(result);
     return result;
   }
@@ -1351,7 +1349,7 @@ export class GitHubProvider {
   private async shell(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, options: { readonly timeoutMs?: number } = {}): Promise<GitHubCommandResult> {
     const command = rawCommand(args);
     metrics.call({ shell: command, cwd });
-    const result = await this.runner.runShell({ command, ...(cwd === undefined ? {} : { cwd }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), maxOutputBytes: this.maxOutputBytes }, context);
+    const result = await this.runner.runShell({ command, ...(cwd === undefined ? {} : { cwd }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), maxOutputBytes: this.maxOutputBytes }, context, this.commandEffectClass(context));
     metrics.observe(result);
     return result;
   }
@@ -1387,12 +1385,16 @@ export class GitHubProvider {
 
   private async gitCommand(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<GitHubCommandResult> {
     metrics.call({ executable: "git", args, cwd });
-    const result = await this.runner.runExecutable({ executable: "git", args: [...args], ...(cwd === undefined ? {} : { cwd }), maxOutputBytes: this.maxOutputBytes }, context);
+    const result = await this.runner.runExecutable({ executable: "git", args: [...args], ...(cwd === undefined ? {} : { cwd }), maxOutputBytes: this.maxOutputBytes }, context, this.commandEffectClass(context));
     metrics.observe(result);
     if ((result.exitCode ?? 0) !== 0) {
       throw createRuntimeError({ code: "GIT_COMMAND_FAILED", message: result.stderr.trim() || `git ${args.join(" ")} failed`, retryable: false, effect: "none", details: { args: [...args], exitCode: result.exitCode } });
     }
     return result;
+  }
+
+  private commandEffectClass(context: OperationContext): EffectClass {
+    return this.commandEffectClasses.get(context) ?? "destructive";
   }
 
   private async gitText(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<string | undefined> {
