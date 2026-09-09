@@ -50,6 +50,7 @@ export class OperationRegistry {
   readonly tracer: Tracer;
   readonly eventSink: InMemoryEventSink | undefined;
   private readonly policy: EffectPolicy | undefined;
+  private contextPolicyAuthoritative = false;
   private readonly operations = new Map<string, RegisteredOperation>();
 
   constructor(options: OperationRegistryOptions = {}) {
@@ -77,6 +78,16 @@ export class OperationRegistry {
     return this.operations.delete(name);
   }
 
+  /**
+   * Bind this registry to the runtime which owns dispatch. A registry may be
+   * configured with a standalone policy for direct use, but an AER daemon's
+   * canonical policy must not be overridden by an injected registry policy.
+   */
+  bindRuntimePolicy(): this {
+    this.contextPolicyAuthoritative = true;
+    return this;
+  }
+
   has(name: string): boolean {
     return this.operations.has(name);
   }
@@ -96,7 +107,7 @@ export class OperationRegistry {
   ): Promise<RuntimeResult<Output>> {
     const registered = this.operations.get(name);
     const effectClass = registered?.effectClass ?? "read";
-    const effectivePolicy = this.policy ?? context.effectPolicy;
+    const effectivePolicy = this.contextPolicyAuthoritative ? context.effectPolicy : this.policy ?? context.effectPolicy;
     const policyEvidence = policyDecisionEvidence(effectivePolicy, effectClass);
     const policyDecision = policyEvidence.decision;
     const parentSpanId = context.spanId ?? context.parentSpanId;

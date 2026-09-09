@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, hostname } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { pid } from "node:process";
+import { kill, pid, platform } from "node:process";
 import {
   capabilityMap,
   createDeviceId,
@@ -56,6 +56,7 @@ import type { RuntimeEventInput } from "../observability/events.ts";
 export const DEFAULT_AER_DATA_ROOT = join(homedir(), ".aer");
 export const DEFAULT_AER_RUNTIME_DIRECTORY = "runtime";
 export const DEFAULT_AER_SOCKET_NAME = "aer.sock";
+export const DEFAULT_AER_OWNER_LOCK_NAME = "daemon.owner";
 export const DEFAULT_DAEMON_MAX_REQUEST_BYTES = 256 * 1024;
 
 export interface EffectReceipt {
@@ -90,6 +91,14 @@ interface StoredReceiptData {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly result?: unknown;
+}
+
+interface DaemonOwnerRecord {
+  readonly pid: number;
+  readonly hostname: string;
+  readonly endpoint: string;
+  readonly nonce: string;
+  readonly processStartIdentity?: string;
 }
 
 export interface AERDaemonOptions {
@@ -157,10 +166,6 @@ function authorityFor(envelope: SemanticOperationEnvelope): { readonly principal
   return { principal, scope };
 }
 
-function asRecord(value: unknown): Readonly<Record<string, unknown>> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Readonly<Record<string, unknown>> : undefined;
-}
-
 function bytes(value: unknown): number {
   return new TextEncoder().encode(stable(value)).byteLength;
 }
@@ -186,7 +191,50 @@ function safeStoredValue(value: unknown): unknown {
 }
 
 function operationStatus(result: RuntimeResult<unknown>): Extract<RuntimeStatus, "completed" | "failed" | "unknown"> {
-  return result.ok ? "completed" : result.meta.status === "unknown" || result.error.effect === "unknown" ? "unknown" : "failed";
+  return reportedEffectState(result) === "unknown"
+    ? "unknown"
+    : result.ok ? "completed" : result.meta.status === "unknown" ? "unknown" : "failed";
+}
+
+function reportedEffectState(result: RuntimeResult<unknown>): "none" | "unknown" | "applied" {
+  const states = result.ok ? [result.meta.effectState] : [result.meta.effectState, result.error.effect];
+  if (states.includes("applied")) return "applied";
+  if (states.includes("unknown")) return "unknown";
+  return "none";
+}
+
+const ROOT_BEARING_KEYS = new Set(["rootDir", "workspaceRoot", "cwd", "workspace"]);
+
+function containsRootBearingField(value: unknown, seen = new Set<unknown>()): boolean {
+  if (value === null || typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const found = value.some((child) => containsRootBearingField(child, seen));
+    seen.delete(value);
+    return found;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (ROOT_BEARING_KEYS.has(key) || containsRootBearingField(child, seen)) {
+      seen.delete(value);
+      return true;
+    }
+  }
+  seen.delete(value);
+  return false;
+}
+
+/** Linux start time distinguishes a live owner from an unrelated reused PID. */
+function processStartIdentity(processId: number): string | undefined {
+  if (platform !== "linux") return undefined;
+  try {
+    const stat = new TextDecoder().decode(readFileSync(`/proc/${processId}/stat`));
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return undefined;
+    return stat.slice(commandEnd + 2).trim().split(/\s+/)[19];
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -211,19 +259,24 @@ export class AERDaemon {
 
   private readonly ownsState: boolean;
   private readonly devices = new Map<DeviceId, DeviceIdentity>();
+  private readonly persistedOnlineDevices = new Set<DeviceId>();
   private readonly localDeviceId: DeviceId;
   private readonly localDeviceName: string;
   private readonly localDeviceCapabilities: DeviceCapabilities;
   private readonly control: LocalControlServer;
+  private readonly ownerLockPath: string;
   private readonly tracerPersistsState: boolean;
   private queue: Promise<void> = Promise.resolve();
   private running = false;
+  private ownerLock: string | undefined;
 
   constructor(options: AERDaemonOptions = {}) {
-    this.dataRoot = options.dataRoot ?? DEFAULT_AER_DATA_ROOT;
+    const configuredDataRoot = resolve(options.dataRoot ?? DEFAULT_AER_DATA_ROOT);
+    this.dataRoot = existsSync(configuredDataRoot) ? realpathSync(configuredDataRoot) : configuredDataRoot;
     this.ownsState = options.state === undefined;
     this.state = options.state ?? new SqliteStateStore({ dataRoot: this.dataRoot });
     this.endpoint = options.endpoint ?? join(this.dataRoot, DEFAULT_AER_RUNTIME_DIRECTORY, DEFAULT_AER_SOCKET_NAME);
+    this.ownerLockPath = join(this.dataRoot, DEFAULT_AER_RUNTIME_DIRECTORY, DEFAULT_AER_OWNER_LOCK_NAME);
     this.policy = options.policy ?? fullAlphaDefaultPolicy();
     this.budgets = resolveRuntimeBudgets(options.budgets);
     this.maxRequestBytes = options.maxRequestBytes ?? DEFAULT_DAEMON_MAX_REQUEST_BYTES;
@@ -249,6 +302,7 @@ export class AERDaemon {
     this.artifacts = options.artifacts ?? new FileArtifactStore({ dataRoot: this.dataRoot, state: this.state });
     this.projects = options.projects ?? new ProjectRegistry({ state: this.state });
     this.operations = options.operations ?? options.operationRegistry ?? new OperationRegistry({ tracer: this.tracer, policy: this.policy });
+    this.operations.bindRuntimePolicy();
     this.direct = options.direct ?? new DirectExecutor({
       tracer: this.tracer,
       state: this.state,
@@ -315,20 +369,34 @@ export class AERDaemon {
 
   async start(): Promise<this> {
     if (this.running) return this;
+    const ownerParent = join(this.dataRoot, DEFAULT_AER_RUNTIME_DIRECTORY);
+    mkdirSync(ownerParent, { recursive: true, mode: 0o700 });
+    chmodSync(ownerParent, 0o700);
     const parent = this.endpoint.slice(0, Math.max(this.endpoint.lastIndexOf("/"), 0));
     if (parent !== "") { mkdirSync(parent, { recursive: true, mode: 0o700 }); chmodSync(parent, 0o700); }
-    await this.reconcileEndpoint();
-    try { await this.control.start(); }
-    catch (error) {
-      if (errorCode(error) !== "EADDRINUSE") throw error;
+    await this.acquireOwnerLock();
+    try {
       await this.reconcileEndpoint();
+      this.reconcileLoadedDevicePresence();
       try { await this.control.start(); }
-      catch { throw daemonError("DAEMON_ALREADY_RUNNING", "Another live AER daemon owns the local control endpoint"); }
+      catch (error) {
+        if (errorCode(error) !== "EADDRINUSE") throw error;
+        await this.reconcileEndpoint();
+        try { await this.control.start(); }
+        catch { throw daemonError("DAEMON_ALREADY_RUNNING", "Another live AER daemon owns the local control endpoint"); }
+      }
+      chmodSync(this.endpoint, 0o600);
+      this.running = true;
+      this.registerDevice({ deviceId: this.localDeviceId, name: this.localDeviceName, capabilities: this.localDeviceCapabilities, presence: "online" });
+      return this;
+    } catch (error) {
+      if (this.running) {
+        this.running = false;
+        try { await this.control.close(); } catch { /* Startup cleanup is best effort. */ }
+      }
+      this.releaseOwnerLock();
+      throw error;
     }
-    chmodSync(this.endpoint, 0o600);
-    this.running = true;
-    this.registerDevice({ deviceId: this.localDeviceId, name: this.localDeviceName, capabilities: this.localDeviceCapabilities, presence: "online" });
-    return this;
   }
 
   async stop(): Promise<void> {
@@ -340,13 +408,19 @@ export class AERDaemon {
     try {
       if (existsSync(this.endpoint) && lstatSync(this.endpoint).isSocket?.() === true) unlinkSync(this.endpoint);
     } catch { /* A replaced endpoint is not ours to remove. */ }
+    this.releaseOwnerLock();
     if (this.ownsState) this.state.close();
   }
 
   close(): Promise<void> { return this.stop(); }
 
   client(): LocalDaemonClient {
-    return new LocalDaemonClient({ endpoint: this.endpoint, timeoutMs: this.controlTimeoutMs, maxFrameBytes: this.maxResponseBytes });
+    return new LocalDaemonClient({
+      endpoint: this.endpoint,
+      timeoutMs: this.controlTimeoutMs,
+      maxFrameBytes: this.maxResponseBytes,
+      resolveEffectClass: (operation) => this.operations.get(operation)?.effectClass,
+    });
   }
 
   async execute<Input, Output>(envelope: SemanticOperationEnvelope<Input>): Promise<DaemonOperationResult<Output>> {
@@ -373,7 +447,7 @@ export class AERDaemon {
       actor: envelope.actor ?? "model",
       ...(envelope.idempotencyKey === undefined ? {} : { idempotencyKey: envelope.idempotencyKey }),
     });
-    const effectClass = envelope.effectClass ?? envelope.assertedEffectClass ?? "read";
+    const effectClass = this.operations.get<unknown, unknown>(envelope.operation)?.effectClass ?? "read";
     return runtimeFailure(error, createOperationMeta({ context, operation: envelope.operation ?? "unknown", status: error.effect === "unknown" ? "unknown" : "failed", effectClass, effectState: error.effect, summary: error.message }));
   }
 
@@ -388,6 +462,94 @@ export class AERDaemon {
     if (probe !== "stale" || !removeProvenStaleSocket(this.endpoint, probe)) {
       throw daemonError("DAEMON_ENDPOINT_UNCERTAIN", "The daemon endpoint exists but AER could not prove that its owner is dead");
     }
+  }
+
+  /** Claim the data root before opening the canonical daemon control endpoint. */
+  private async acquireOwnerLock(): Promise<void> {
+    const startIdentity = processStartIdentity(pid);
+    const owner: DaemonOwnerRecord = {
+      pid,
+      hostname: hostname(),
+      endpoint: this.endpoint,
+      nonce: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+      ...(startIdentity === undefined ? {} : { processStartIdentity: startIdentity }),
+    };
+    const encoded = JSON.stringify(owner);
+    const claimPath = join(this.dataRoot, DEFAULT_AER_RUNTIME_DIRECTORY, `.daemon-owner-claim-${pid}-${owner.nonce}`);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let collision = false;
+      try {
+        writeFileSync(claimPath, encoded, { flag: "wx", mode: 0o600 });
+        try {
+          linkSync(claimPath, this.ownerLockPath);
+          this.ownerLock = encoded;
+          chmodSync(this.ownerLockPath, 0o600);
+          return;
+        } catch (cause) {
+          if (errorCode(cause) !== "EEXIST") throw cause;
+          collision = true;
+        }
+      } catch (cause) {
+        if (errorCode(cause) !== "EEXIST") throw cause;
+      } finally {
+        try { unlinkSync(claimPath); } catch { /* The private claim may already be gone. */ }
+      }
+      if (!collision) throw daemonError("DAEMON_OWNER_UNCERTAIN", "The daemon owner claim could not be installed");
+
+      const existing = this.readOwnerRecord();
+      if (existing === undefined) throw daemonError("DAEMON_OWNER_UNCERTAIN", "The daemon owner record is invalid or cannot be inspected");
+      if (existing.hostname !== hostname() || existing.endpoint.trim() === "" || !Number.isSafeInteger(existing.pid) || existing.pid <= 0 || existing.nonce.trim() === "") {
+        throw daemonError("DAEMON_OWNER_UNCERTAIN", "The daemon owner record cannot prove ownership is stale");
+      }
+      let live = true;
+      try { kill(existing.pid, 0); }
+      catch (cause) {
+        if (errorCode(cause) === "ESRCH") live = false;
+        else throw daemonError("DAEMON_OWNER_UNCERTAIN", "The daemon owner process could not be checked");
+      }
+      if (live && existing.processStartIdentity !== undefined) {
+        const currentIdentity = processStartIdentity(existing.pid);
+        if (currentIdentity !== undefined && currentIdentity !== existing.processStartIdentity) live = false;
+      }
+      if (live) throw daemonError("DAEMON_ALREADY_RUNNING", "Another AER daemon owns this data root");
+
+      // A dead PID is not sufficient if a replacement/unmanaged daemon still
+      // answers on the recorded endpoint. Never remove that endpoint or lock.
+      const endpointState = await probeLocalEndpoint(existing.endpoint, 500);
+      if (endpointState === "live") throw daemonError("DAEMON_ALREADY_RUNNING", "Another live AER daemon owns the local control endpoint");
+      if (endpointState === "unavailable") throw daemonError("DAEMON_OWNER_UNCERTAIN", "The daemon endpoint could not be proven stale");
+      try {
+        const before = lstatSync(this.ownerLockPath);
+        const current = lstatSync(this.ownerLockPath);
+        if (before.ino !== current.ino || before.size !== current.size || before.mtimeMs !== current.mtimeMs) throw daemonError("DAEMON_OWNER_UNCERTAIN", "The daemon owner record changed during stale-owner reconciliation");
+        const currentRecord = this.readOwnerRecord();
+        if (currentRecord === undefined || stable(currentRecord) !== stable(existing)) throw daemonError("DAEMON_OWNER_UNCERTAIN", "The daemon owner record changed during stale-owner reconciliation");
+        unlinkSync(this.ownerLockPath);
+      } catch (cause) {
+        if (isRuntimeError(cause)) throw cause;
+        throw daemonError("DAEMON_OWNER_UNCERTAIN", "The daemon owner record could not be reconciled");
+      }
+    }
+    throw daemonError("DAEMON_ALREADY_RUNNING", "Another AER daemon won ownership of this data root");
+  }
+
+  private readOwnerRecord(): DaemonOwnerRecord | undefined {
+    try {
+      const parsed = JSON.parse(new TextDecoder().decode(readFileSync(this.ownerLockPath))) as Partial<DaemonOwnerRecord>;
+      if (typeof parsed.pid !== "number" || typeof parsed.hostname !== "string" || typeof parsed.endpoint !== "string" || typeof parsed.nonce !== "string") return undefined;
+      return parsed as DaemonOwnerRecord;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private releaseOwnerLock(): void {
+    const owner = this.ownerLock;
+    this.ownerLock = undefined;
+    if (owner === undefined) return;
+    try {
+      if (new TextDecoder().decode(readFileSync(this.ownerLockPath)) === owner) unlinkSync(this.ownerLockPath);
+    } catch { /* Never remove a replacement or unreadable owner record. */ }
   }
 
   private async executeOne<Input, Output>(raw: SemanticOperationEnvelope<Input>): Promise<DaemonOperationResult<Output>> {
@@ -605,13 +767,11 @@ export class AERDaemon {
 
   private confineInput(input: unknown, rootDir: string | undefined): unknown {
     if (rootDir === undefined) {
-      const record = asRecord(input);
-      const rootBearing = record !== undefined && Object.keys(record).some((key) => ["rootDir", "workspaceRoot", "cwd", "workspace"].includes(key));
-      if (rootBearing) throw daemonError("PROJECT_REQUIRED", "Root-bearing semantic input requires a canonical project target");
+      if (containsRootBearingField(input)) throw daemonError("PROJECT_REQUIRED", "Root-bearing semantic input requires a canonical project target");
       return input;
     }
     const visit = (value: unknown, key?: string): unknown => {
-      if (typeof value === "string" && key !== undefined && ["rootDir", "workspaceRoot", "cwd", "workspace"].includes(key)) {
+      if (typeof value === "string" && key !== undefined && ROOT_BEARING_KEYS.has(key)) {
         const candidate = isAbsolute(value) ? value : resolve(rootDir, value);
         if (!projectInside(rootDir, candidate)) throw daemonError("PROJECT_ROOT_ESCAPE", "Semantic input attempts to escape the canonical project root");
         try {
@@ -691,7 +851,11 @@ export class AERDaemon {
     }
     const outputBudget = Math.min(context.budgets.maxOutputBytes, context.budgets.maxReturnedOutputBytes);
     if (outputBytes <= outputBudget) return result;
-    const effect = result.ok && effectClass !== "read" ? "unknown" : "none";
+    // The provider's effect evidence remains authoritative even when the
+    // daemon cannot return the full result. In particular, an applied or
+    // ambiguous write must not be rewritten as a harmless failed read.
+    const reportedEffect = reportedEffectState(result);
+    const effect = reportedEffect === "none" && result.ok && effectClass !== "read" ? "unknown" : reportedEffect;
     const error = createRuntimeError({ code: "DAEMON_OUTPUT_TOO_LARGE", message: "Semantic operation output exceeds the server-owned response budget", retryable: false, effect, details: { outputBytes, maxOutputBytes: outputBudget } });
     return runtimeFailure(error, createOperationMeta({ context, operation: result.meta.operation, status: effect === "unknown" ? "unknown" : "failed", effectClass, effectState: effect, summary: error.message }));
   }
@@ -700,15 +864,25 @@ export class AERDaemon {
     for (const entity of this.state.listEntities("devices")) {
       const data = entity.data;
       if (data === undefined || typeof data.deviceId !== "string" || typeof data.name !== "string" || (data.presence !== "online" && data.presence !== "offline") || typeof data.lastSeenAt !== "string") continue;
-      this.devices.set(entity.id as DeviceId, {
+      const identity: DeviceIdentity = {
         deviceId: data.deviceId as DeviceId,
         name: data.name,
         capabilities: (data.capabilities as DeviceCapabilities | undefined) ?? {},
         presence: "offline",
         ...(typeof data.connectedAt === "string" ? { connectedAt: data.connectedAt } : {}),
         lastSeenAt: data.lastSeenAt,
-      });
+      };
+      this.devices.set(entity.id as DeviceId, identity);
+      if (data.presence === "online") this.persistedOnlineDevices.add(identity.deviceId);
     }
+  }
+
+  private reconcileLoadedDevicePresence(): void {
+    for (const deviceId of this.persistedOnlineDevices) {
+      const device = this.devices.get(deviceId);
+      if (device !== undefined) this.setPresence(device);
+    }
+    this.persistedOnlineDevices.clear();
   }
 
   private setPresence(device: DeviceIdentity): void {
@@ -732,9 +906,14 @@ export class AERDaemon {
 
 export class LocalDaemonClient {
   private readonly transport: LocalControlClient;
+  private readonly effectClassFor: ((operation: string) => EffectClass | undefined) | undefined;
 
-  constructor(options: { readonly endpoint: string; readonly timeoutMs?: number; readonly maxFrameBytes?: number } | string) {
-    this.transport = new LocalControlClient(options);
+  constructor(options: { readonly endpoint: string; readonly timeoutMs?: number; readonly maxFrameBytes?: number; readonly resolveEffectClass?: (operation: string) => EffectClass | undefined } | string) {
+    this.effectClassFor = typeof options === "string" ? undefined : options.resolveEffectClass;
+    const transportOptions = typeof options === "string"
+      ? options
+      : { endpoint: options.endpoint, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.maxFrameBytes === undefined ? {} : { maxFrameBytes: options.maxFrameBytes }) };
+    this.transport = new LocalControlClient(transportOptions);
   }
 
   ping(): Promise<unknown> { return this.transport.ping(); }
@@ -746,10 +925,14 @@ export class LocalDaemonClient {
     } catch (error) {
       const transportError = error instanceof LocalTransportError ? error : new LocalTransportError("CONTROL_UNAVAILABLE", error instanceof Error ? error.message : "Local daemon is unavailable");
       const unknown = transportError.code === "CONTROL_RESPONSE_UNKNOWN" || transportError.code === "CONTROL_TIMEOUT";
-      const effect = envelope.effectClass === "read" || envelope.assertedEffectClass === "read" ? "none" : "unknown";
+      // The client-declared effect is untrusted. A missing response is always
+      // an ambiguous daemon boundary outcome; only a daemon-owned resolver may
+      // provide the operation class for local diagnostics.
+      const effect = "unknown" as const;
+      const effectClass = this.effectClassFor?.(envelope.operation) ?? "read";
       const context = createOperationContext({ traceId: envelope.traceId, runId: envelope.runId, actor: envelope.actor ?? "model", effectPolicy: fullAlphaDefaultPolicy(), ...(envelope.idempotencyKey === undefined ? {} : { idempotencyKey: envelope.idempotencyKey }) });
       const runtimeError = createRuntimeError({ code: unknown ? "DAEMON_RESPONSE_UNKNOWN" : transportError.code, message: transportError.message, retryable: true, effect });
-      return runtimeFailure(runtimeError, createOperationMeta({ context, operation: envelope.operation, status: "unknown", effectClass: envelope.effectClass ?? envelope.assertedEffectClass ?? "read", effectState: effect === "unknown" ? "unknown" : "none", summary: "Local daemon response was not received" }));
+      return runtimeFailure(runtimeError, createOperationMeta({ context, operation: envelope.operation, status: "unknown", effectClass, effectState: "unknown", summary: "Local daemon response was not received" }));
     }
   }
 
