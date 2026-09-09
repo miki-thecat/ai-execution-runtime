@@ -2,14 +2,15 @@ import { createOperationContext, createRunId, createRuntimeError, createTraceId,
 import type { ArtifactRef, VerificationId } from "../core/ids.ts";
 import type { EffectState } from "../core/effects.ts";
 import { createOperationMeta, type OperationMeta, type RuntimeStatus } from "../core/result.ts";
+import { env as parentEnvironment } from "node:process";
 import { DirectExecutor } from "../direct/index.ts";
 import type { ExecutableCommand, ProcessResult, ShellRunInput } from "../direct/types.ts";
 import type { Operation } from "../operations/operation.ts";
 import { Tracer } from "../observability/index.ts";
 import { sanitizeDurableText } from "../observability/redaction.ts";
 import type { StateEntity, StateStore } from "../state/store.ts";
-import { configuredVerificationCommands, type ConfiguredVerification, type VerificationCommandConfig } from "../project/config.ts";
 import { ProjectRegistry } from "../project/registry.ts";
+import type { NormalizedVerificationCheck, VerificationExecutionPosture, VerificationPlanProvenance } from "../project/trust.ts";
 import { ensureTracerEventsPersisted } from "../project/events.ts";
 import type { ProjectIdentity, ProjectOperationInput, ProjectRef } from "../project/types.ts";
 
@@ -17,6 +18,7 @@ export type VerificationCheckStatus = "passed" | "failed" | "cancelled" | "unkno
 export type VerificationStatus = "completed" | "failed" | "cancelled" | "unknown";
 
 export interface VerificationCheckEvidence {
+  readonly checkId: string;
   readonly name: string;
   readonly command: string;
   readonly status: VerificationCheckStatus;
@@ -38,6 +40,17 @@ export interface VerificationEvidence {
   readonly runId: import("../core/ids.ts").RunId;
   readonly status: VerificationStatus;
   readonly passed: boolean;
+  /** Whether every selected check passed, including for partial iteration runs. */
+  readonly checksPassed: boolean;
+  /** True only for a passing exact full run of the current trusted plan. */
+  readonly canonicalPassed: boolean;
+  readonly coverage: "full" | "partial";
+  readonly executedCheckIds: readonly string[];
+  readonly trustedPlanDigest: string;
+  readonly trustedPlanProvenance: VerificationPlanProvenance;
+  readonly executionPosture: VerificationExecutionPosture;
+  /** Auditable exceptions contain key names only, never values. */
+  readonly allowedEnvironmentKeys: readonly string[];
   readonly startedAt: string;
   readonly completedAt: string;
   readonly summary: string;
@@ -61,25 +74,8 @@ export interface VerificationRunnerOptions {
   readonly direct?: DirectExecutor;
   readonly registry?: ProjectRegistry;
   readonly clock?: () => Date;
-}
-
-/** Normalized view of the repository-owned verification section. */
-export interface VerificationConfig {
-  readonly commands: readonly ConfiguredVerification[];
-}
-
-export function verificationConfig(project: ProjectIdentity): VerificationConfig {
-  return { commands: configuredVerificationCommands(project.config) };
-}
-
-interface NormalizedCheck {
-  readonly name: string;
-  readonly command: string;
-  readonly shell: boolean;
-  readonly executable?: string;
-  readonly args?: readonly string[];
-  readonly timeoutMs?: number;
-  readonly maxOutputBytes?: number;
+  /** Explicit exceptions to the credential-key sanitizer; evidence records names only. */
+  readonly allowedEnvironmentKeys?: readonly string[];
 }
 
 const defaultContext = (projectId: ProjectId): OperationContext => createOperationContext({
@@ -94,42 +90,18 @@ function errorFor(cause: unknown, code: string, effect: "none" | "unknown" = "no
   return createRuntimeError({ code, message: cause instanceof Error ? cause.message : "Verification failed", retryable: false, effect });
 }
 
-function commandName(command: ConfiguredVerification, index: number): string {
-  if (typeof command === "string") return command.trim().split(/\s+/)[0] ?? `check-${index + 1}`;
-  return command.name ?? command.command ?? command.executable ?? `check-${index + 1}`;
+function displayCommand(check: NormalizedVerificationCheck): string {
+  return check.kind === "shell" ? check.command ?? "" : [check.executable ?? "", ...check.args].join(" ");
 }
 
-function normalizeCommand(command: ConfiguredVerification, index: number): NormalizedCheck {
-  if (typeof command === "string") return { name: commandName(command, index), command, shell: true };
-  const config = command as VerificationCommandConfig;
-  if (config.command !== undefined) {
-    return {
-      name: commandName(command, index),
-      command: config.command,
-      shell: true,
-      ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
-      ...(config.maxOutputBytes === undefined ? {} : { maxOutputBytes: config.maxOutputBytes }),
-    };
-  }
-  const executable = config.executable ?? "";
-  return {
-    name: commandName(command, index),
-    command: [executable, ...(config.args ?? [])].join(" "),
-    shell: false,
-    executable,
-    args: config.args === undefined ? [] : [...config.args],
-    ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
-    ...(config.maxOutputBytes === undefined ? {} : { maxOutputBytes: config.maxOutputBytes }),
-  };
-}
-
-function processEvidence(check: NormalizedCheck, result: ProcessResult | undefined, error: RuntimeError | undefined, forcedStatus?: VerificationCheckStatus, failureMeta?: OperationMeta): VerificationCheckEvidence {
+function processEvidence(check: NormalizedVerificationCheck, result: ProcessResult | undefined, error: RuntimeError | undefined, forcedStatus?: VerificationCheckStatus, failureMeta?: OperationMeta): VerificationCheckEvidence {
   if (result === undefined) {
     const status: VerificationCheckStatus = forcedStatus ?? (error?.effect === "unknown" ? "unknown" : "failed");
     const metrics = failureMeta?.metrics;
     return {
+      checkId: check.checkId,
       name: check.name,
-      command: check.command,
+      command: displayCommand(check),
       status,
       ...(metrics?.exitCode === undefined ? {} : { exitCode: metrics.exitCode }),
       ...(metrics?.signal === undefined ? {} : { signal: metrics.signal }),
@@ -144,8 +116,9 @@ function processEvidence(check: NormalizedCheck, result: ProcessResult | undefin
   }
   const status: VerificationCheckStatus = forcedStatus ?? (result.cancelled ? (result.status === "unknown" ? "unknown" : "cancelled") : result.status === "unknown" ? "unknown" : result.exitCode === 0 ? "passed" : "failed");
   return {
+    checkId: check.checkId,
     name: check.name,
-    command: check.command,
+    command: displayCommand(check),
     status,
     ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
     ...(result.signal === undefined ? {} : { signal: result.signal }),
@@ -157,6 +130,22 @@ function processEvidence(check: NormalizedCheck, result: ProcessResult | undefin
     durationMs: result.durationMs,
     ...(result.error === undefined ? {} : { error: result.error }),
   };
+}
+
+const CREDENTIAL_KEY = /(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|API[_-]?KEY|ACCESS[_-]?KEY|AUTH(?:ORIZATION)?)/i;
+const PROVIDER_KEY = /^(?:GH|GITHUB|AWS|AZURE|GOOGLE|GCP|CLOUDFLARE|OPENAI|ANTHROPIC|LINEAR|JIRA|SLACK|STRIPE|SENTRY|DATADOG)_/i;
+
+function sanitizedEnvironment(exceptions: readonly string[]): { readonly env: Readonly<Record<string, string | undefined>>; readonly allowed: readonly string[] } {
+  const exceptionSet = new Set(exceptions);
+  const env: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(parentEnvironment)) {
+    const sensitive = CREDENTIAL_KEY.test(key) || PROVIDER_KEY.test(key) || key === "SSH_AUTH_SOCK";
+    if (!sensitive) env[key] = value;
+    else if (exceptionSet.has(key)) {
+      env[key] = value;
+    }
+  }
+  return { env, allowed: [...exceptionSet].sort() };
 }
 
 function statusFromChecks(checks: readonly VerificationCheckEvidence[]): VerificationStatus {
@@ -199,6 +188,7 @@ export class VerificationRunner {
   readonly registry: ProjectRegistry;
   private readonly state: StateStore | undefined;
   private readonly clock: () => Date;
+  private readonly allowedEnvironmentKeys: readonly string[];
   private readonly memory = new Map<VerificationId, VerificationEvidence>();
 
   constructor(options: VerificationRunnerOptions = {}) {
@@ -213,13 +203,16 @@ export class VerificationRunner {
       ...(options.artifacts === undefined ? {} : { artifacts: options.artifacts }),
     });
     this.clock = options.clock ?? (() => new Date());
+    this.allowedEnvironmentKeys = [...new Set(options.allowedEnvironmentKeys ?? [])].sort();
   }
 
   async run(input: VerifyRunInput | ProjectRef, context?: OperationContext): Promise<RuntimeResult<VerificationEvidence>> {
     const requestedProject = typeof input === "object" && input !== null && "project" in input ? (input as VerifyRunInput).project : input as ProjectRef;
     const options: VerificationRunOptions = typeof input === "object" && input !== null && "project" in input ? input as VerifyRunInput : {};
     const project = this.registry.get(requestedProject);
-    const operationContext = context ?? (project === undefined ? createOperationContext({ traceId: createTraceId(), runId: createRunId(), actor: "runtime" }) : defaultContext(project.projectId));
+    const requestedContext = context ?? (project === undefined ? createOperationContext({ traceId: createTraceId(), runId: createRunId(), actor: "runtime" }) : defaultContext(project.projectId));
+    const { projectId: _callerProjectId, ...contextWithoutProject } = requestedContext;
+    const operationContext = createOperationContext({ ...contextWithoutProject, ...(project === undefined ? {} : { projectId: project.projectId }) });
     const span = this.tracer.startOperation({
       traceId: operationContext.traceId,
       runId: operationContext.runId,
@@ -240,10 +233,17 @@ export class VerificationRunner {
     let verificationId: VerificationId | undefined;
     try {
       if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
-      const configured = verificationConfig(project).commands;
-      if (configured.length === 0) throw createRuntimeError({ code: "VERIFY_NOT_CONFIGURED", message: "No verification commands are configured in .aer/project.json", retryable: false, effect: "none" });
-      const checks = configured.map(normalizeCommand).filter((check) => options.checkNames === undefined || options.checkNames.includes(check.name));
+      if (project.boundary.root.status !== "trusted") throw createRuntimeError({ code: project.boundary.root.code ?? "PROJECT_ROOT_DRIFT", message: "Registered project root provenance is not trusted", retryable: false, effect: "none" });
+      if (project.boundary.identity.status !== "trusted") throw createRuntimeError({ code: project.boundary.identity.code ?? "PROJECT_IDENTITY_DRIFT", message: "Repository project identity does not match the durable registry", retryable: false, effect: "none" });
+      const trustedPlan = project.trustedVerificationPlan;
+      if (trustedPlan === undefined) throw createRuntimeError({ code: "TRUSTED_VERIFICATION_PLAN_MISSING", message: "No trusted verification plan is registered", retryable: false, effect: "none" });
+      if (project.boundary.verificationPlan.status !== "trusted") throw createRuntimeError({ code: project.boundary.verificationPlan.code ?? "VERIFICATION_PLAN_DRIFT", message: "Repository verification plan differs from the trusted plan; explicitly trust the update before execution", retryable: false, effect: "none" });
+      const configured = trustedPlan.plan.checks;
+      if (configured.length === 0) throw createRuntimeError({ code: "VERIFY_NOT_CONFIGURED", message: "No verification commands are configured", retryable: false, effect: "none" });
+      const checks = configured.filter((check) => options.checkNames === undefined || options.checkNames.includes(check.name));
       if (checks.length === 0) throw createRuntimeError({ code: "VERIFY_CHECK_NOT_FOUND", message: "No configured verification check matched checkNames", retryable: false, effect: "none" });
+      const coverage = checks.length === configured.length ? "full" as const : "partial" as const;
+      const verificationEnvironment = sanitizedEnvironment(this.allowedEnvironmentKeys);
       verificationId = createVerificationId();
       const startedAt = this.clock().toISOString();
       this.emitVerification({
@@ -256,14 +256,14 @@ export class VerificationRunner {
         timestamp: startedAt,
         summary: "Verification started",
       });
-      this.persistPartial(verificationId, project, operationContextWithSpan, "verifying", startedAt, []);
+      this.persistPartial(verificationId, project, operationContextWithSpan, "verifying", startedAt, [], coverage, checks.map((check) => check.checkId), verificationEnvironment.allowed);
       const evidence: VerificationCheckEvidence[] = [];
       let effectState: EffectState = "none";
       for (const check of checks) {
         try {
-          const result = check.shell
-            ? await this.direct.runShell({ command: check.command, cwd: project.rootDir, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ShellRunInput, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" })
-            : await this.direct.runExecutable({ executable: check.executable ?? "", args: check.args ?? [], cwd: project.rootDir, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ExecutableCommand, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" });
+          const result = check.kind === "shell"
+            ? await this.direct.runShell({ command: check.command ?? "", cwd: project.rootDir, env: verificationEnvironment.env, inheritEnvironment: false, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ShellRunInput, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" })
+            : await this.direct.runExecutable({ executable: check.executable ?? "", args: check.args, cwd: project.rootDir, env: verificationEnvironment.env, inheritEnvironment: false, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ExecutableCommand, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" });
           if (result.ok) {
             effectState = mergeEffectState(effectState, result.meta.effectState);
             evidence.push(processEvidence(check, result.data, undefined));
@@ -283,15 +283,24 @@ export class VerificationRunner {
       }
       const status = statusFromChecks(evidence);
       const completedAt = this.clock().toISOString();
-      const passed = status === "completed";
-      const summary = passed ? `Verification passed (${evidence.length} check${evidence.length === 1 ? "" : "s"})` : `Verification ${status} (${evidence.length} check${evidence.length === 1 ? "" : "s"})`;
+      const checksPassed = status === "completed";
+      const canonicalPassed = checksPassed && coverage === "full";
+      const summary = checksPassed ? `${coverage === "partial" ? "Partial verification" : "Verification"} passed (${evidence.length} check${evidence.length === 1 ? "" : "s"})` : `Verification ${status} (${evidence.length} check${evidence.length === 1 ? "" : "s"})`;
       const resultEvidence: VerificationEvidence = {
         verificationId,
         id: verificationId,
         projectId: project.projectId,
         runId: operationContextWithSpan.runId,
         status,
-        passed,
+        passed: canonicalPassed,
+        checksPassed,
+        canonicalPassed,
+        coverage,
+        executedCheckIds: checks.map((check) => check.checkId),
+        trustedPlanDigest: trustedPlan.digest,
+        trustedPlanProvenance: trustedPlan.provenance,
+        executionPosture: "host_unisolated",
+        allowedEnvironmentKeys: verificationEnvironment.allowed,
         startedAt,
         completedAt,
         summary,
@@ -342,8 +351,55 @@ export class VerificationRunner {
     return entity === undefined ? [...this.memory.values()].filter((evidence) => evidence.projectId === projectId).sort((a, b) => b.completedAt.localeCompare(a.completedAt))[0] : this.get(entity.id as VerificationId);
   }
 
-  private persistPartial(id: VerificationId, project: ProjectIdentity, context: OperationContext, status: string, timestamp: string, checks: readonly VerificationCheckEvidence[]): void {
-    const evidence = durableEvidence({ verificationId: id, id, projectId: project.projectId, runId: context.runId, status: "unknown", passed: false, startedAt: timestamp, completedAt: timestamp, summary: "Verification started", checks, artifactRefs: [] });
+  /** Canonical gate: ignore partial runs and only consider the newest full run of the current trusted plan. */
+  hasCanonicalFullPass(ref: ProjectRef): boolean {
+    const project = this.registry.get(ref);
+    if (project === undefined || project.boundary.root.status !== "trusted" || project.boundary.identity.status !== "trusted" || project.boundary.verificationPlan.status !== "trusted") return false;
+    const digest = project.trustedVerificationPlan?.digest;
+    if (digest === undefined) return false;
+    const durable = [...(this.state?.listEntities("verifications", { projectId: project.projectId, order: "desc" }) ?? [])]
+      .filter((entity) => entity.data?.coverage === "full" && entity.data?.trustedPlanDigest === digest)
+      .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""))[0];
+    if (durable !== undefined) return durable.data?.canonicalPassed === true;
+    const memory = [...this.memory.values()]
+      .filter((evidence) => evidence.projectId === project.projectId && evidence.coverage === "full" && evidence.trustedPlanDigest === digest)
+      .sort((a, b) => b.completedAt.localeCompare(a.completedAt))[0];
+    return memory?.canonicalPassed === true;
+  }
+
+  private persistPartial(
+    id: VerificationId,
+    project: ProjectIdentity,
+    context: OperationContext,
+    status: string,
+    timestamp: string,
+    checks: readonly VerificationCheckEvidence[],
+    coverage: "full" | "partial",
+    executedCheckIds: readonly string[],
+    allowedEnvironmentKeys: readonly string[],
+  ): void {
+    const trusted = project.trustedVerificationPlan!;
+    const evidence = durableEvidence({
+      verificationId: id,
+      id,
+      projectId: project.projectId,
+      runId: context.runId,
+      status: "unknown",
+      passed: false,
+      checksPassed: false,
+      canonicalPassed: false,
+      coverage,
+      executedCheckIds,
+      trustedPlanDigest: trusted.digest,
+      trustedPlanProvenance: trusted.provenance,
+      executionPosture: "host_unisolated",
+      allowedEnvironmentKeys,
+      startedAt: timestamp,
+      completedAt: timestamp,
+      summary: "Verification started",
+      checks,
+      artifactRefs: [],
+    });
     this.state?.saveEntity({
       kind: "verifications",
       id,
@@ -353,7 +409,16 @@ export class VerificationRunner {
       traceId: context.traceId,
       createdAt: timestamp,
       updatedAt: timestamp,
-      data: { verificationId: id, traceId: context.traceId, evidence: { ...evidence, status } },
+      data: {
+        verificationId: id,
+        traceId: context.traceId,
+        passed: false,
+        canonicalPassed: false,
+        coverage,
+        trustedPlanDigest: trusted.digest,
+        executionPosture: "host_unisolated",
+        evidence: { ...evidence, status },
+      },
     });
   }
 
@@ -369,7 +434,21 @@ export class VerificationRunner {
       traceId: context.traceId,
       createdAt: evidence.startedAt,
       updatedAt: evidence.completedAt,
-      data: { verificationId: persisted.verificationId, traceId: context.traceId, summary: persisted.summary, passed: persisted.passed, artifactRefs: persisted.artifactRefs, evidence: persisted },
+      data: {
+        verificationId: persisted.verificationId,
+        traceId: context.traceId,
+        summary: persisted.summary,
+        passed: persisted.canonicalPassed,
+        canonicalPassed: persisted.canonicalPassed,
+        coverage: persisted.coverage,
+        executedCheckIds: persisted.executedCheckIds,
+        trustedPlanDigest: persisted.trustedPlanDigest,
+        trustedPlanProvenance: persisted.trustedPlanProvenance,
+        executionPosture: persisted.executionPosture,
+        allowedEnvironmentKeys: persisted.allowedEnvironmentKeys,
+        artifactRefs: persisted.artifactRefs,
+        evidence: persisted,
+      },
     });
   }
 

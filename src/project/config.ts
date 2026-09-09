@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 /** The versioned, repository-owned part of an AER project. */
 export const PROJECT_CONFIG_VERSION = 1 as const;
@@ -40,6 +40,28 @@ export interface ProjectConfigInput {
 
 export function projectConfigPath(rootDir: string): string {
   return join(rootDir, PROJECT_CONFIG_DIRECTORY, PROJECT_CONFIG_FILENAME);
+}
+
+function assertWithinRoot(rootDir: string, candidate: string): void {
+  const pathFromRoot = relative(resolve(rootDir), resolve(candidate));
+  if (pathFromRoot.startsWith("..") || isAbsolute(pathFromRoot)) {
+    throw new Error("PROJECT_CONFIG_ESCAPE: .aer/project.json resolves outside the registered project root");
+  }
+}
+
+function confinedConfigPath(rootDir: string, forWrite: boolean): string {
+  const physicalRoot = realpathSync(rootDir);
+  const path = projectConfigPath(rootDir);
+  const directory = dirname(path);
+  if (forWrite) mkdirSync(directory, { recursive: true });
+  if (existsSync(directory)) assertWithinRoot(physicalRoot, realpathSync(directory));
+  let fileStat: ReturnType<typeof lstatSync> | undefined;
+  try { fileStat = lstatSync(path); } catch { /* missing is valid for reads and creation */ }
+  if (fileStat !== undefined) {
+    if (fileStat.isSymbolicLink()) throw new Error("PROJECT_CONFIG_SYMLINK: .aer/project.json must not be a symbolic link");
+    assertWithinRoot(physicalRoot, realpathSync(path));
+  }
+  return path;
 }
 
 function nonEmptyString(value: unknown, field: string): string | undefined {
@@ -115,7 +137,7 @@ export function parseProjectConfig(value: unknown): ProjectConfig {
 }
 
 export function readProjectConfig(rootDir: string): ProjectConfig | undefined {
-  const path = projectConfigPath(rootDir);
+  const path = confinedConfigPath(rootDir, false);
   if (!existsSync(path)) return undefined;
   let parsed: unknown;
   try {
@@ -133,8 +155,7 @@ export function createProjectConfig(input: ProjectConfigInput = {}): ProjectConf
 
 export function writeProjectConfig(rootDir: string, config: ProjectConfigInput): string {
   const normalized = createProjectConfig(config);
-  const path = projectConfigPath(rootDir);
-  mkdirSync(dirname(path), { recursive: true });
+  const path = confinedConfigPath(rootDir, true);
   writeFileSync(path, `${JSON.stringify(normalized, null, 2)}\n`);
   return path;
 }

@@ -52,6 +52,7 @@ function projectView(project: ProjectIdentity): ProjectIdentityView {
     root: project.root,
     configPath: project.configPath,
     ...(project.goal === undefined ? {} : { goal: boundedText(project.goal, 2_000) }),
+    boundary: project.boundary,
   };
 }
 
@@ -61,6 +62,21 @@ function isWithinProject(rootDir: string, cwd: unknown): boolean {
   const candidate = resolve(cwd);
   const pathFromRoot = relative(root, candidate);
   return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot));
+}
+
+function unavailableGit(root: string, error: string): GitSnapshot {
+  const diff = { filesChanged: 0, insertions: 0, deletions: 0, untrackedFiles: 0, summary: "Git inspection blocked" };
+  return {
+    available: false,
+    root,
+    dirty: false,
+    ahead: 0,
+    behind: 0,
+    upstreamDivergence: { ahead: 0, behind: 0 },
+    diff,
+    diffSummary: diff,
+    error,
+  };
 }
 
 function defaultContext(projectId?: ProjectId): OperationContext {
@@ -121,17 +137,26 @@ function taskSummary(entity: StateEntity): TaskSummary | undefined {
   };
 }
 
-function verificationSummary(entity: StateEntity | undefined): VerificationSummary | undefined {
+function verificationSummary(entity: StateEntity | undefined, currentTrustedDigest?: string): VerificationSummary | undefined {
   if (entity === undefined) return undefined;
   const passed = recordValue(entity, "passed");
   const summary = stringValue(entity, "summary");
+  const coverage = recordValue(entity, "coverage");
+  const recordedCanonicalPassed = recordValue(entity, "canonicalPassed");
+  const trustedPlanDigest = stringValue(entity, "trustedPlanDigest");
+  const executionPosture = recordValue(entity, "executionPosture");
+  const canonicalPassed = recordedCanonicalPassed === true && coverage === "full" && trustedPlanDigest !== undefined && trustedPlanDigest === currentTrustedDigest;
   return {
     verificationId: entity.id,
     status: (entity.status ?? "unknown") as VerificationSummary["status"],
-    ...(typeof passed === "boolean" ? { passed } : {}),
+    ...(typeof passed === "boolean" ? { passed: canonicalPassed } : {}),
     updatedAt: entity.updatedAt ?? entity.createdAt ?? "",
     ...(summary === undefined ? {} : { summary: boundedText(summary, 1_000) }),
     artifactRefs: artifactRefs(entity),
+    ...(coverage === "full" || coverage === "partial" ? { coverage } : {}),
+    ...(typeof recordedCanonicalPassed === "boolean" ? { canonicalPassed } : {}),
+    ...(trustedPlanDigest === undefined ? {} : { trustedPlanDigest }),
+    ...(executionPosture === "host_unisolated" ? { executionPosture } : {}),
   };
 }
 
@@ -215,6 +240,10 @@ export class ProjectRuntime {
     return this.registry.register(input);
   }
 
+  trustVerificationPlan(ref: ProjectRef): ProjectIdentity { return this.registry.trustVerificationPlan(ref); }
+  updateTrustedVerificationPlan(ref: ProjectRef): ProjectIdentity { return this.registry.trustVerificationPlan(ref); }
+  reconcileRoot(ref: ProjectRef, rootDir?: string): ProjectIdentity { return this.registry.reconcileRoot(ref, rootDir); }
+
   async inspect(ref: ProjectRef, context?: OperationContext): Promise<RuntimeResult<ProjectInspect>> {
     const project = this.registry.get(ref);
     const operationContext = context ?? defaultContext(project?.projectId);
@@ -238,7 +267,9 @@ export class ProjectRuntime {
     try {
       if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
       const gitMetrics: GitSnapshotMetrics = { internalCalls: 0, rawOutputBytes: 0, returnedOutputBytes: 0, artifactBytes: 0 };
-      const git = await this.git.snapshot(project.rootDir, spanContext, gitMetrics);
+      const git = project.boundary.root.status === "trusted"
+        ? await this.git.snapshot(project.rootDir, spanContext, gitMetrics)
+        : unavailableGit(project.rootDir, project.boundary.root.code ?? "PROJECT_ROOT_DRIFT");
       const result = this.inspectData(project, git);
       span.record(gitMetrics);
       const event = span.complete({ summary: "Project inspected" });
@@ -276,7 +307,9 @@ export class ProjectRuntime {
     try {
       if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
       const gitMetrics: GitSnapshotMetrics = { internalCalls: 0, rawOutputBytes: 0, returnedOutputBytes: 0, artifactBytes: 0 };
-      const git = await this.git.snapshot(project.rootDir, spanContext, gitMetrics);
+      const git = project.boundary.root.status === "trusted"
+        ? await this.git.snapshot(project.rootDir, spanContext, gitMetrics)
+        : unavailableGit(project.rootDir, project.boundary.root.code ?? "PROJECT_ROOT_DRIFT");
       const result = this.resumeData(project, git, options);
       span.record(gitMetrics);
       const event = span.complete({ summary: "Project resume pack created", artifactRefs: result.artifactRefs });
@@ -313,11 +346,11 @@ export class ProjectRuntime {
       ...(typeof recordValue(process, "operation") === "string" ? { operation: recordValue(process, "operation") as string } : {}),
       ...(typeof recordValue(process, "pid") === "number" ? { pid: recordValue(process, "pid") as number } : {}),
     })).slice(0, 50).reverse();
-    const latestVerification = verificationSummary(latest(verifications));
+    const latestVerification = verificationSummary(latest(verifications), project.trustedVerificationPlan?.digest);
     const capabilities = {
       direct: true,
       git: git.available,
-      verification: (project.config.verify?.length ?? 0) > 0,
+      verification: project.boundary.root.status === "trusted" && project.boundary.identity.status === "trusted" && project.boundary.verificationPlan.status === "trusted",
       resume: true,
     };
     return {
@@ -331,6 +364,7 @@ export class ProjectRuntime {
       activeProcesses,
       ...(latestVerification === undefined ? {} : { latestVerification }),
       capabilities,
+      boundary: project.boundary,
     };
   }
 
@@ -362,7 +396,7 @@ export class ProjectRuntime {
       if (task === undefined || task.status === undefined) continue;
       activeRuns.push({ runId: runId as import("../core/ids.ts").RunId, status: task.status as RuntimeStatus, updatedAt: task.updatedAt ?? task.createdAt ?? "", summary: boundedText(stringValue(task, "title") ?? "Task run", 1_000) });
     }
-    const latestVerification = verificationSummary(latest(verifications));
+    const latestVerification = verificationSummary(latest(verifications), project.trustedVerificationPlan?.digest);
     const lastAgentEntity = latest(agents);
     const lastAgent = lastAgentEntity === undefined ? undefined : compactData(lastAgentEntity);
     const events = recentProjectEvents(this.state, project.projectId, eventRunIds)
@@ -379,6 +413,9 @@ export class ProjectRuntime {
         artifactRefs: [...event.artifactRefs].slice(0, 20),
       }));
     const blockers: ResumeBlocker[] = [];
+    if (project.boundary.root.status !== "trusted") blockers.push({ source: "project:root", message: project.boundary.root.code ?? "Registered project root is not trusted", status: project.boundary.root.status });
+    if (project.boundary.identity.status !== "trusted") blockers.push({ source: "project:identity", message: project.boundary.identity.code ?? "Repository identity is not trusted", status: project.boundary.identity.status });
+    if (project.boundary.verificationPlan.status !== "trusted") blockers.push({ source: "project:verification-plan", message: project.boundary.verificationPlan.code ?? "Verification plan is not trusted", status: project.boundary.verificationPlan.status });
     for (const task of tasks.filter((candidate) => candidate.status === "blocked" || candidate.status === "waiting_user" || candidate.status === "waiting_approval" || candidate.status === "failed")) {
       blockers.push({ source: `task:${task.id}`, message: boundedText(stringValue(task, "reason") ?? `Task is ${task.status}`, 1_000), ...(task.status === undefined ? {} : { status: task.status }) });
     }
@@ -413,6 +450,7 @@ export class ProjectRuntime {
       blockers: blockers.slice(0, itemLimit),
       unknownEffects: unknownEffects.slice(0, itemLimit),
       artifactRefs: refs,
+      boundary: project.boundary,
     };
   }
 
