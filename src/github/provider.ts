@@ -1473,11 +1473,13 @@ export class GitHubProvider {
     // so PR lookup/create is bound to the repository that the effect targets,
     // not merely to the fetch URL returned by `git remote get-url <remote>`.
     const pushUrl = await this.remoteUrl(remote, true, cwd, context, metrics);
-    const selectedUrl = pushUrl.succeeded
-      ? pushUrl
-      : await this.remoteUrl(remote, false, cwd, context, metrics);
-    if (!selectedUrl.succeeded) return { identityKnown: false };
-    const fromRemote = parseRepositoryFromRemote(selectedUrl.stdout);
+    // A failed push-URL lookup is not evidence that the fetch URL is also the
+    // effect target. In particular, a configured pushurl can differ from the
+    // fetch URL; falling back here would scope PR reads/creates to the wrong
+    // repository. Keep publish fail-closed until the selected push endpoint is
+    // known.
+    if (!pushUrl.succeeded) return { identityKnown: false };
+    const fromRemote = parseRepositoryFromRemote(pushUrl.stdout);
     if (fromRemote === undefined) return { identityKnown: true };
     const api = await this.apiJson(`repos/${repositoryPath(fromRemote)}`, [], cwd, context, metrics);
     if (api !== undefined) {
@@ -1793,15 +1795,31 @@ export class GitHubProvider {
   }
 
   private async remoteHead(remote: string, branch: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<string | undefined> {
-    // `git ls-remote <remote>` resolves the fetch URL. Publishing resolves
-    // the push URL, so validate the same endpoint that `git push <remote>`
-    // will use when a push URL is available. The remote-name fallback keeps
-    // compatibility with older command doubles/clients that cannot query it;
-    // normal Git remotes expose their effective push URL via --push.
+    // `git ls-remote <remote>` normally resolves the fetch URL. Publishing
+    // resolves the push URL, so validate the same endpoint that
+    // `git push <remote>` will use. If that lookup fails, do not silently
+    // switch endpoints: a configured pushurl may point at a different
+    // repository than the fetch URL.
     const pushUrl = await this.remoteUrl(remote, true, cwd, context, metrics);
-    const pushTarget = pushUrl.succeeded
-      ? pushUrl.stdout.trim().split("\n")[0]?.trim() || remote
-      : remote;
+    if (!pushUrl.succeeded) {
+      throw createRuntimeError({
+        code: "GITHUB_PUSH_REMOTE_UNAVAILABLE",
+        message: "The selected remote push URL could not be resolved",
+        retryable: true,
+        effect: "none",
+        details: { remote },
+      });
+    }
+    const pushTarget = pushUrl.stdout.trim().split("\n")[0]?.trim();
+    if (pushTarget === undefined || pushTarget === "") {
+      throw createRuntimeError({
+        code: "GITHUB_PUSH_REMOTE_UNAVAILABLE",
+        message: "The selected remote returned an empty push URL",
+        retryable: true,
+        effect: "none",
+        details: { remote },
+      });
+    }
     const result = await this.gitCommand(["ls-remote", "--heads", pushTarget, `refs/heads/${branch}`], cwd, context, metrics);
     const line = result.stdout.trim().split("\n")[0] ?? "";
     return line.split(/\s+/)[0] || undefined;
