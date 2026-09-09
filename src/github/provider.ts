@@ -46,7 +46,6 @@ const DEFAULT_WAIT_INTERVAL_MS = 2_000;
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_PAGINATION_PAGES = 100;
 const MAX_RATE_LIMIT_RETRIES = 2;
-const MAX_RATE_LIMIT_BACKOFF_MS = 30_000;
 const BASE_RATE_LIMIT_BACKOFF_MS = 1_000;
 const PR_JSON_FIELDS = [
   "number", "title", "state", "url", "isDraft", "headRefName", "headRefOid",
@@ -70,6 +69,12 @@ interface Attempt<T> {
   readonly value: T;
   readonly route: GitHubProviderRoute;
   readonly complete?: boolean;
+}
+
+interface RemoteRepositoryResolution {
+  readonly attempt?: Attempt<GitHubRepository>;
+  /** True when the selected remote returned a URL, even if it was malformed. */
+  readonly identityKnown: boolean;
 }
 
 type CheckSource = "check-run" | "status" | "unknown";
@@ -276,15 +281,15 @@ function nonNegativeNumber(value: string | undefined): number | undefined {
   return Number.isFinite(result) && result >= 0 ? result : undefined;
 }
 
-function retryAfterMilliseconds(value: string | undefined): number | undefined {
+function retryAfterMilliseconds(value: string | undefined, nowMs = Date.now()): number | undefined {
   const seconds = nonNegativeNumber(value);
   if (seconds !== undefined) return Math.max(1, Math.round(seconds * 1_000));
   if (value === undefined) return undefined;
   const date = Date.parse(value.trim());
-  return Number.isFinite(date) ? Math.max(1, date - Date.now()) : undefined;
+  return Number.isFinite(date) ? Math.max(1, date - nowMs) : undefined;
 }
 
-function rateLimitInfo(result: GitHubCommandResult): RateLimitInfo | undefined {
+function rateLimitInfo(result: GitHubCommandResult, nowMs = Date.now()): RateLimitInfo | undefined {
   const output = `${result.stdout}\n${result.stderr}`;
   const statusText = result.httpStatus === undefined
     ? /\bHTTP(?:\/\d(?:\.\d)?)?\s*[:/]?\s*(403|429)\b/i.exec(output)?.[1]
@@ -293,7 +298,7 @@ function rateLimitInfo(result: GitHubCommandResult): RateLimitInfo | undefined {
   const retryAfterText = numericHeader(result.headers, "retry-after") ??
     /(?:^|\n)\s*retry-after\s*:\s*([^\r\n]+)/i.exec(output)?.[1] ??
     /retry-after\s*[=:]\s*([0-9]+(?:\.[0-9]+)?)/i.exec(output)?.[1];
-  const retryAfterMs = retryAfterMilliseconds(retryAfterText);
+  const retryAfterMs = retryAfterMilliseconds(retryAfterText, nowMs);
   const resetText = numericHeader(result.headers, "x-ratelimit-reset") ??
     /(?:^|\n)\s*x-ratelimit-reset\s*:\s*([^\r\n]+)/i.exec(output)?.[1] ??
     /x-ratelimit-reset\s*[=:]\s*([0-9]+)/i.exec(output)?.[1];
@@ -304,7 +309,13 @@ function rateLimitInfo(result: GitHubCommandResult): RateLimitInfo | undefined {
   const remaining = nonNegativeNumber(remainingText);
   const secondary = /secondary rate limit|abuse detection|please wait|too many requests/i.test(output);
   const rateMessage = /api rate limit exceeded|rate limit exceeded|rate[- ]limited/i.test(output);
-  const looksLimited = status === 429 || rateMessage || secondary || remaining === 0 || (status === 403 && (retryAfterMs !== undefined || resetAtMs !== undefined));
+  // A successful response may legitimately consume the last request in the
+  // current budget. Do not turn a valid 200 with x-ratelimit-remaining: 0
+  // into a retry/error, especially when its JSON body is the useful result.
+  const successful = (result.exitCode ?? 0) === 0 &&
+    (status === undefined || (status >= 200 && status < 300));
+  const exhausted = remaining === 0 && !successful;
+  const looksLimited = status === 429 || rateMessage || secondary || exhausted || (status === 403 && (retryAfterMs !== undefined || resetAtMs !== undefined));
   if (!looksLimited) return undefined;
   let info: RateLimitInfo = { secondary };
   if (typeof status === "number" && Number.isSafeInteger(status)) info = { ...info, status };
@@ -1244,13 +1255,17 @@ export class GitHubProvider {
         if (isRateLimitError(cause)) throw cause;
         throw cause;
       }
-      const limited = rateLimitInfo(result);
+      const limited = rateLimitInfo(result, this.nowMs());
       if (limited === undefined) return result;
       if (!retryable || retryNumber >= MAX_RATE_LIMIT_RETRIES) throw rateLimitError(limited, retryNumber + 1);
       const exponential = BASE_RATE_LIMIT_BACKOFF_MS * (2 ** retryNumber);
       const resetDelay = limited.resetAtMs === undefined ? undefined : Math.max(0, limited.resetAtMs - this.nowMs());
       const requestedDelay = Math.max(exponential, limited.retryAfterMs ?? 0, resetDelay ?? 0);
-      const delay = Math.max(1, Math.min(MAX_RATE_LIMIT_BACKOFF_MS, requestedDelay));
+      // GitHub's Retry-After/reset hint is authoritative. The retry count is
+      // bounded below; an arbitrary 30-second cap would retry while GitHub is
+      // still asking the client to wait. The operation deadline remains the
+      // upper bound for the actual sleep.
+      const delay = Math.max(1, requestedDelay);
       const remaining = contextDeadline(context) - this.nowMs();
       if (Number.isFinite(remaining) && remaining <= 0) throw rateLimitError(limited, retryNumber + 1);
       metrics.retries += 1;
@@ -1279,12 +1294,12 @@ export class GitHubProvider {
     let retryNumber = 0;
     while (true) {
       const result = await this.shell(args, cwd, context, metrics, options);
-      const limited = rateLimitInfo(result);
+      const limited = rateLimitInfo(result, this.nowMs());
       if (limited === undefined) return result;
       if (retryNumber >= MAX_RATE_LIMIT_RETRIES) throw rateLimitError(limited, retryNumber + 1);
       const exponential = BASE_RATE_LIMIT_BACKOFF_MS * (2 ** retryNumber);
       const resetDelay = limited.resetAtMs === undefined ? undefined : Math.max(0, limited.resetAtMs - this.nowMs());
-      const delay = Math.max(1, Math.min(MAX_RATE_LIMIT_BACKOFF_MS, Math.max(exponential, limited.retryAfterMs ?? 0, resetDelay ?? 0)));
+      const delay = Math.max(1, Math.max(exponential, limited.retryAfterMs ?? 0, resetDelay ?? 0));
       const remaining = contextDeadline(context) - this.nowMs();
       if (Number.isFinite(remaining) && remaining <= 0) throw rateLimitError(limited, retryNumber + 1);
       metrics.retries += 1;
@@ -1368,11 +1383,11 @@ export class GitHubProvider {
     // therefore point PR reconciliation at a different remote.
     if (remote !== undefined) {
       const selected = await this.readRepositoryFromRemote(remote, cwd, context, metrics, routes);
-      if (selected !== undefined || !allowCurrentRepositoryFallback) return selected;
+      if (selected.attempt !== undefined || selected.identityKnown || !allowCurrentRepositoryFallback) return selected.attempt;
       // Compatibility for callers using an older checkout fixture without a
-      // readable remote URL. Any later git push/read still has to prove that
-      // the selected remote works; this fallback is never used when a remote
-      // URL identifies another repository.
+      // readable remote URL. A successfully returned but unparseable URL is
+      // not compatible: falling back to `gh repo view` in that case would
+      // combine an unverified repository with a push to the selected remote.
     }
     const structured = await this.jsonCommand(["repo", "view", "--json", REPO_JSON_FIELDS], cwd, context, metrics);
     if (structured !== undefined) {
@@ -1382,13 +1397,20 @@ export class GitHubProvider {
         return { value: repository, route: "gh-json" };
       }
     }
-    return this.readRepositoryFromRemote("origin", cwd, context, metrics, routes);
+    return (await this.readRepositoryFromRemote("origin", cwd, context, metrics, routes)).attempt;
   }
 
-  private async readRepositoryFromRemote(remote: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<Attempt<GitHubRepository> | undefined> {
-    const remoteResult = await this.gitText(["remote", "get-url", remote], cwd, context, metrics);
-    const fromRemote = remoteResult === undefined ? undefined : parseRepositoryFromRemote(remoteResult);
-    if (fromRemote === undefined) return undefined;
+  private async readRepositoryFromRemote(remote: string, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<RemoteRepositoryResolution> {
+    // `git push <remote>` honors remote.<name>.pushurl. Resolve that URL first
+    // so PR lookup/create is bound to the repository that the effect targets,
+    // not merely to the fetch URL returned by `git remote get-url <remote>`.
+    const pushUrl = await this.remoteUrl(remote, true, cwd, context, metrics);
+    const selectedUrl = pushUrl.succeeded
+      ? pushUrl
+      : await this.remoteUrl(remote, false, cwd, context, metrics);
+    if (!selectedUrl.succeeded) return { identityKnown: false };
+    const fromRemote = parseRepositoryFromRemote(selectedUrl.stdout);
+    if (fromRemote === undefined) return { identityKnown: true };
     const api = await this.apiJson(`repos/${repositoryPath(fromRemote)}`, [], cwd, context, metrics);
     if (api !== undefined) {
       // REST uses html_url/default_branch/full_name, while gh --json uses
@@ -1400,11 +1422,20 @@ export class GitHubProvider {
         ...(stringValue(nested(api.value, "default_branch")) === undefined ? {} : { defaultBranch: stringValue(nested(api.value, "default_branch")) as string }),
       };
       routes.add(api.route);
-      return { value: repository, route: api.route };
+      return { attempt: { value: repository, route: api.route }, identityKnown: true };
     }
     // The git remote identifies the repository, but a failed API read must
     // not advertise gh-api as an available provider route.
-    return { value: fromRemote, route: "unavailable" };
+    return { attempt: { value: fromRemote, route: "unavailable" }, identityKnown: true };
+  }
+
+  private async remoteUrl(remote: string, push: boolean, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<{ readonly succeeded: boolean; readonly stdout: string }> {
+    try {
+      const result = await this.gitCommand(["remote", "get-url", ...(push ? ["--push"] : []), remote], cwd, context, metrics);
+      return { succeeded: true, stdout: result.stdout };
+    } catch {
+      return { succeeded: false, stdout: "" };
+    }
   }
 
   private async jsonCommand(args: readonly string[], cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<Attempt<unknown> | undefined> {
@@ -1550,9 +1581,12 @@ export class GitHubProvider {
 
   private async unscopedRepositoryIsSafe(repository: GitHubRepository, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics): Promise<boolean> {
     const current = await this.jsonCommand(["repo", "view", "--json", REPO_JSON_FIELDS], cwd, context, metrics);
-    if (current === undefined) return true;
+    // An unavailable or unparseable current-repository read is not proof of
+    // identity. Unscoped compatibility is safe only after an explicit match;
+    // otherwise a fallback PR read could silently target another checkout.
+    if (current === undefined) return false;
     const currentRepository = parseRepository(current.value);
-    return currentRepository === undefined || currentRepository.nameWithOwner.toLowerCase() === repository.nameWithOwner.toLowerCase();
+    return currentRepository !== undefined && currentRepository.nameWithOwner.toLowerCase() === repository.nameWithOwner.toLowerCase();
   }
 
   private async enrichApiPullRequest(repository: GitHubRepository, pullRequest: GitHubPullRequest, cwd: string | undefined, context: OperationContext, metrics: ProviderMetrics, routes: Set<GitHubProviderRoute>): Promise<GitHubPullRequest> {
@@ -1648,7 +1682,7 @@ export class GitHubProvider {
     const structured = await this.jsonCommand(["pr", "checks", String(number), "--json", "name,state,bucket,link"], cwd, context, metrics);
     if (structured !== undefined) {
       routes.add("gh-json");
-      return { value: parseChecks(structured.value), route: "gh-json" };
+      return { value: parseChecks(structured.value), route: "gh-json", complete: structured.complete !== false };
     }
     if (repository !== undefined) {
       const pr = await this.apiJson(`repos/${repositoryPath(repository)}/pulls/${number}`, [], cwd, context, metrics);
@@ -1685,7 +1719,7 @@ export class GitHubProvider {
     const checks = parseRawChecks(`${raw.stdout}\n${raw.stderr}`);
     if ((raw.exitCode ?? 0) === 0 || checks.length > 0 || /some checks were not successful/i.test(`${raw.stdout}\n${raw.stderr}`)) {
       routes.add("raw-gh");
-      return { value: checks, route: "raw-gh" };
+      return { value: checks, route: "raw-gh", complete: raw.truncated !== true };
     }
     return undefined;
   }

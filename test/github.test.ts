@@ -398,9 +398,9 @@ test("github.publish preserves a REST repository default branch", async () => {
     .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
     .when(["rev-parse", "HEAD"], { stdout: "rest123\n", stderr: "", exitCode: 0 })
     .when(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], { stdout: "rest123\trefs/heads/" + branch + "\n", stderr: "", exitCode: 0 })
-    .when(["pr", "list", "--head", branch, "--state", "all", "--json", prLookupFields], json([]))
+    .when(["pr", "list", "--head", "miki-thecat:" + branch, "--state", "all", "--repo", "miki-thecat/runtime", "--json", prLookupFields], json([]))
     .when(["api", "repos/miki-thecat/runtime/pulls", "--method", "POST", "--raw-field", "title=REST branch", "--raw-field", `head=${branch}`, "--raw-field", "base=develop", "--raw-field", "body="], json({ number: 21, title: "REST branch", state: "OPEN", head: { ref: branch, sha: "rest123" }, base: { ref: "develop" } }))
-    .when(["pr", "view", "21", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 21, title: "REST branch", state: "OPEN", headRefName: branch, headRefOid: "rest123", baseRefName: "develop" }));
+    .when(["pr", "view", "21", "--repo", "miki-thecat/runtime", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 21, title: "REST branch", state: "OPEN", headRefName: branch, headRefOid: "rest123", baseRefName: "develop" }));
   const provider = new GitHubProvider({ runner });
 
   const result = await provider.publish({ branch, title: "REST branch" });
