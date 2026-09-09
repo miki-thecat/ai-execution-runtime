@@ -603,3 +603,118 @@ test("github.work recognizes the canonical agent:running lifecycle label", async
   assert.deepEqual(result.data.inProgress, [7]);
   assert.deepEqual(result.data.ready, []);
 });
+
+test("github REST enrichment paginates reviews and merges check runs with legacy statuses", async () => {
+  const branch = "feature/rest-paginated";
+  const reviews = [
+    { user: { login: "same-reviewer" }, state: "APPROVED", submitted_at: "2026-09-09T00:00:00Z" },
+    { user: { login: "same-reviewer" }, state: "CHANGES_REQUESTED", submitted_at: "2026-09-09T01:00:00Z" },
+    ...Array.from({ length: 30 }, (_, index) => ({ user: { login: `reviewer-${index}` }, state: "APPROVED", submitted_at: `2026-09-08T${String(index % 24).padStart(2, "0")}:00:00Z` })),
+  ];
+  const checkRuns = Array.from({ length: 31 }, (_, index) => ({ name: `check-${index}`, status: "completed", conclusion: "success" }));
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], { stdout: "", stderr: "unsupported", exitCode: 1 })
+    .when(["remote", "get-url", "origin"], { stdout: "git@github.com:miki-thecat/runtime.git\n", stderr: "", exitCode: 0 })
+    .when(["api", "repos/miki-thecat/runtime"], json({ name: "runtime", full_name: "miki-thecat/runtime", default_branch: "main", owner: { login: "miki-thecat" } }))
+    .when(["branch", "--show-current"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "rest-paginated-sha\n", stderr: "", exitCode: 0 })
+    .when(["pr", "view", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], { stdout: "", stderr: "unsupported", exitCode: 1 })
+    .when(["api", "repos/miki-thecat/runtime/pulls?head=miki-thecat%3Afeature%2Frest-paginated&state=open&per_page=1"], json([{ number: 7, state: "OPEN", head: { ref: branch, sha: "rest-paginated-sha", repo: { full_name: "miki-thecat/runtime" } }, base: { ref: "main" } }]))
+    .when(["api", "repos/miki-thecat/runtime/pulls/7/reviews?per_page=100", "--paginate", "--slurp"], json(reviews))
+    .when(["api", "repos/miki-thecat/runtime/commits/rest-paginated-sha/check-runs?per_page=100", "--paginate", "--slurp"], json({ check_runs: checkRuns }))
+    .when(["api", "repos/miki-thecat/runtime/commits/rest-paginated-sha/status?per_page=100", "--paginate", "--slurp"], json({ statuses: [{ context: "legacy", state: "failure" }] }));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.snapshot({}, createOperationContext({ traceId: createTraceId(), runId: createRunId(), actor: "model" }));
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  const pullRequest = result.data.currentPullRequest;
+  assert.equal(pullRequest?.reviews.length, 32);
+  assert.equal(pullRequest?.reviewsSummary.approved, 30);
+  assert.equal(pullRequest?.reviewsSummary.changesRequested, 1);
+  assert.equal(pullRequest?.checks.length, 32);
+  assert.equal(pullRequest?.checksSummary.failed, 1);
+  assert.equal(pullRequest?.checksSummary.pending, 0);
+  assert.equal(pullRequest?.checksSummary.state, "failure");
+});
+
+test("github.wait keeps a legacy failing status from passing successful check runs", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], { stdout: "", stderr: "unsupported", exitCode: 1 })
+    .when(["api", "repos/miki-thecat/runtime/pulls/7"], json({ head: { sha: "status-sha" } }))
+    .when(["api", "repos/miki-thecat/runtime/commits/status-sha/check-runs?per_page=100", "--paginate", "--slurp"], json({ check_runs: [{ name: "build", status: "completed", conclusion: "success" }] }))
+    .when(["api", "repos/miki-thecat/runtime/commits/status-sha/status?per_page=100", "--paginate", "--slurp"], json({ statuses: [{ context: "legacy", state: "failure" }] }));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.wait({ pullRequest: 7, condition: "checks_passed", intervalMs: 0, timeoutMs: 100, maxPolls: 1 });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.terminal, true);
+  assert.equal(result.data.passed, false);
+  assert.equal(result.data.checksSummary.failed, 1);
+});
+
+test("github.wait uses its default deadline instead of an implicit 120-poll cap", async () => {
+  let now = 0;
+  const tracer = new Tracer({ clock: () => new Date(now) });
+  const pending = Array.from({ length: 121 }, () => json([{ name: "verify", state: "IN_PROGRESS" }]));
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], [...pending, json([{ name: "verify", state: "COMPLETED", conclusion: "SUCCESS" }])]);
+  const provider = new GitHubProvider({ runner, tracer, clock: () => now, sleep: async (milliseconds) => { now += milliseconds; } });
+
+  const result = await provider.wait({ pullRequest: 7 }, createOperationContext({ traceId: createTraceId(), runId: createRunId(), actor: "model" }));
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.pollCountInternal, 122);
+  assert.equal(result.data.passed, true);
+});
+
+test("github.publish scopes default-remote PR reconciliation to origin", async () => {
+  const branch = "feature/default-origin";
+  const repositoryA = { ...repo, nameWithOwner: "other-owner/checkout" };
+  const repositoryB = { ...repo, defaultBranchRef: { name: "main" } };
+  const runner = new FixtureRunner()
+    .when(["remote", "get-url", "origin"], { stdout: "git@github.com:miki-thecat/runtime.git\n", stderr: "", exitCode: 0 })
+    .when(["api", "repos/miki-thecat/runtime"], json(repositoryB))
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repositoryA))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: `${branch}\n`, stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "origin-sha\n", stderr: "", exitCode: 0 })
+    .when(["ls-remote", "--heads", "origin", `refs/heads/${branch}`], { stdout: "origin-sha\trefs/heads/" + branch + "\n", stderr: "", exitCode: 0 })
+    .when(["api", "repos/miki-thecat/runtime/pulls", "--method", "POST", "--raw-field", "title=origin", "--raw-field", `head=${branch}`, "--raw-field", "base=main", "--raw-field", "body="], json({ number: 52, state: "OPEN", head: { ref: branch, sha: "origin-sha" }, base: { ref: "main" } }))
+    .when(["pr", "view", "52", "--repo", "miki-thecat/runtime", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 52, state: "OPEN", headRefName: branch, headRefOid: "origin-sha", baseRefName: "main" }));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.publish({ branch, title: "origin" });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.repository.nameWithOwner, "miki-thecat/runtime");
+  assert.equal(result.data.pullRequest.number, 52);
+  assert.equal(runner.executableCalls.some((args) => args[0] === "gh" && args[1] === "pr" && args.includes("--repo") && args[args.indexOf("--repo") + 1] === "other-owner/checkout"), false);
+  assert.equal(runner.executableCalls.some((args) => args[0] === "gh" && args[1] === "pr" && args.includes("--repo") && args[args.indexOf("--repo") + 1] === "miki-thecat/runtime"), true);
+});
+
+test("github reads retry a rate-limited API call after bounded backoff without shell duplication", async () => {
+  const delays: number[] = [];
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], [
+      { stdout: "", stderr: "HTTP 429: rate limit exceeded\nRetry-After: 1\n", exitCode: 1, httpStatus: 429 },
+      json([{ name: "verify", state: "COMPLETED", conclusion: "SUCCESS" }]),
+    ]);
+  const provider = new GitHubProvider({ runner, sleep: async (milliseconds) => { delays.push(milliseconds); } });
+
+  const result = await provider.wait({ pullRequest: 7, condition: "checks_passed", intervalMs: 0, timeoutMs: 5_000, maxPolls: 1 });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.passed, true);
+  assert.deepEqual(delays, [1_000]);
+  assert.equal(runner.shellCalls.length, 0);
+  assert.equal(result.meta.metrics.retries, 1);
+});
