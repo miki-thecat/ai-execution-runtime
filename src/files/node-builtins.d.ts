@@ -27,6 +27,7 @@ declare module "node:fs" {
   }
   export function lstatSync(path: string): FileStats;
   export function realpathSync(path: string): string;
+  export function linkSync(existingPath: string, newPath: string): void;
   export function readdirSync(path: string, options: { readonly withFileTypes: true }): DirectoryEntry[];
 }
 

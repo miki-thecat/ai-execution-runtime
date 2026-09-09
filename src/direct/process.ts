@@ -29,8 +29,8 @@ interface ProcessRecord {
   readonly processId: ProcessId;
   readonly pid?: number;
   readonly operation: string;
-  readonly executable: string;
-  readonly args: readonly string[];
+  readonly commandKind: "shell" | "executable";
+  readonly argumentCount: number;
   readonly cwd?: string;
   readonly startedAt: string;
   readonly traceId: string;
@@ -55,7 +55,7 @@ class OutputCollector {
     this.maxBytes = maxBytes;
     this.returned = new Uint8Array(maxBytes);
     this.path = join(tmpdir(), `aer-direct-${id}-${stream}-${Date.now()}`);
-    this.file = openSync(this.path, "wx");
+    this.file = openSync(this.path, "wx", 0o600);
   }
 
   add(chunk: Uint8Array | string): void {
@@ -154,9 +154,11 @@ function metadataFor(
   command: ExecutableCommand,
   args: readonly string[],
   env: Readonly<Record<string, string | undefined>> | undefined,
+  shell: boolean,
 ): Record<string, unknown> {
   return {
-    executable: command.executable,
+    commandKind: shell ? "shell" : "executable",
+    ...(shell ? {} : { executable: command.executable }),
     argumentCount: args.length,
     ...(command.cwd === undefined ? {} : { cwd: command.cwd }),
     environmentKeys: Object.keys(env ?? {}).sort(),
@@ -206,8 +208,8 @@ export class DirectProcessManager {
     const record: ProcessRecord = {
       processId: id,
       operation: options.operation,
-      executable: options.command.executable,
-      args,
+      commandKind: options.shell === undefined || options.shell === false ? "executable" : "shell",
+      argumentCount: args.length,
       ...(options.command.cwd === undefined ? {} : { cwd: options.command.cwd }),
       startedAt: startedAt.toISOString(),
       traceId: options.context.traceId,
@@ -237,7 +239,7 @@ export class DirectProcessManager {
     try {
       child = spawn(options.command.executable, args, spawnOptions);
     } catch (error) {
-      this.persist(record, "failed", { error: error instanceof Error ? error.message : "Process could not be started" });
+      this.persist(record, "failed", { errorCode: "PROCESS_SPAWN_FAILED", error: "Process could not be started" });
       throw this.spawnError(error);
     }
 
@@ -264,7 +266,7 @@ export class DirectProcessManager {
       provider: "node:child_process",
       effectClass,
       effectState: "none",
-      metadata: { ...metadataFor(options.command, args, env), pid: child.pid, processId: id },
+      metadata: { ...metadataFor(options.command, args, env, options.shell !== undefined && options.shell !== false), pid: child.pid, processId: id },
     });
 
     let settled = false;
@@ -283,26 +285,30 @@ export class DirectProcessManager {
       const stderrBytes = stderr.byteLength;
       const refs: ArtifactRef[] = [];
       let artifactBytes = 0;
-      if (stdoutBytes > maxOutputBytes && this.artifacts !== undefined) {
-        stdout.spill((bytes) => {
-          const artifact = this.putArtifact(bytes, "stdout", options, id);
-          refs.push(artifact.ref);
-          artifactBytes += artifact.size;
-        });
-      } else {
+      let finalizationError = error;
+      try {
+        if (stdoutBytes > maxOutputBytes && this.artifacts !== undefined) {
+          stdout.spill((bytes) => {
+            const artifact = this.putArtifact(bytes, "stdout", options, id);
+            refs.push(artifact.ref);
+            artifactBytes += artifact.size;
+          });
+        } else stdout.cleanup();
+        if (stderrBytes > maxOutputBytes && this.artifacts !== undefined) {
+          stderr.spill((bytes) => {
+            const artifact = this.putArtifact(bytes, "stderr", options, id);
+            refs.push(artifact.ref);
+            artifactBytes += artifact.size;
+          });
+        } else stderr.cleanup();
+      } catch {
+        finalizationError = "Process output artifact persistence failed";
+      } finally {
         stdout.cleanup();
-      }
-      if (stderrBytes > maxOutputBytes && this.artifacts !== undefined) {
-        stderr.spill((bytes) => {
-          const artifact = this.putArtifact(bytes, "stderr", options, id);
-          refs.push(artifact.ref);
-          artifactBytes += artifact.size;
-        });
-      } else {
         stderr.cleanup();
       }
       const endedAt = this.tracer.now();
-      const status = cancelled ? "cancelled" : error === undefined ? "completed" : "unknown";
+      const status = cancelled ? "cancelled" : finalizationError === undefined ? "completed" : "unknown";
       const effectState = status === "completed" ? "applied" : "unknown";
       const returnedOutputBytes = Math.min(stdoutBytes, maxOutputBytes) + Math.min(stderrBytes, maxOutputBytes);
       const result: ProcessResult = {
@@ -323,20 +329,22 @@ export class DirectProcessManager {
         durationMs: Math.max(0, endedAt.getTime() - startedAt.getTime()),
         timedOut,
         cancelled,
-        ...(error === undefined ? {} : { error }),
+        ...(finalizationError === undefined ? {} : { error: finalizationError }),
       };
-      this.persist(runningRecord, status, {
-        completedAt: endedAt.toISOString(),
-        ...(code === null ? {} : { exitCode: code }),
-        ...(signal === null ? {} : { signal }),
-        timedOut,
-        cancelled,
-        artifactRefs: refs,
-        rawOutputBytes: result.rawOutputBytes,
-        returnedOutputBytes,
-        effectState,
-      });
-      this.tracer.emit({
+      try {
+        this.persist(runningRecord, status, {
+          completedAt: endedAt.toISOString(),
+          ...(code === null ? {} : { exitCode: code }),
+          ...(signal === null ? {} : { signal }),
+          timedOut,
+          cancelled,
+          artifactRefs: refs,
+          rawOutputBytes: result.rawOutputBytes,
+          returnedOutputBytes,
+          effectState,
+          ...(finalizationError === undefined ? {} : { errorCode: "PROCESS_FINALIZATION_FAILED", error: "Process finalization failed" }),
+        });
+        this.tracer.emit({
         traceId: options.context.traceId,
         runId: options.context.runId,
         spanId,
@@ -351,7 +359,7 @@ export class DirectProcessManager {
         status,
         executor: "direct",
         provider: "node:child_process",
-        ...(error === undefined ? {} : { summary: error }),
+        ...(finalizationError === undefined ? {} : { summary: "Process finalization failed" }),
         measurements: {
           durationMs: result.durationMs,
           internalCalls: 1,
@@ -365,9 +373,11 @@ export class DirectProcessManager {
         effectClass,
         effectState,
         metadata: { processId: id, timedOut, cancelled },
-      });
-      this.handles.delete(id);
-      resolveWait(result);
+        });
+      } finally {
+        this.handles.delete(id);
+        resolveWait(result);
+      }
     };
     child.on("error", (error) => finish(child.exitCode, child.signalCode, error.message));
     child.on("close", (code, signal) => finish(code, signal));
@@ -427,15 +437,27 @@ export class DirectProcessManager {
       const id = entity.id as ProcessId;
       const projectId = data.projectId ?? entity.projectId;
       const taskId = data.taskId ?? entity.taskId;
+      const reconciled: ProcessRecord = {
+        processId: id,
+        ...(typeof data.pid === "number" ? { pid: data.pid } : {}),
+        operation: typeof data.operation === "string" ? data.operation : "process.run",
+        commandKind: data.commandKind === "shell" ? "shell" : "executable",
+        argumentCount: typeof data.argumentCount === "number" && Number.isSafeInteger(data.argumentCount) && data.argumentCount >= 0 ? data.argumentCount : 0,
+        ...(typeof data.cwd === "string" ? { cwd: data.cwd } : {}),
+        startedAt: typeof data.startedAt === "string" ? data.startedAt : entity.createdAt ?? new Date().toISOString(),
+        traceId: data.traceId,
+        runId: data.runId,
+        ...(projectId === undefined ? {} : { projectId }),
+        ...(taskId === undefined ? {} : { taskId }),
+        spanId: data.spanId,
+        operationId: typeof data.operationId === "string" ? data.operationId : createOperationId(),
+        effectClass: data.effectClass === "read" || data.effectClass === "workspace_write" || data.effectClass === "network" || data.effectClass === "remote_write" || data.effectClass === "destructive" || data.effectClass === "privileged" ? data.effectClass : "destructive",
+        reattachable: false,
+      };
       orphaned.push(id);
-      this.state.saveEntity({
-        ...entity,
-        status: "unknown",
-        updatedAt: new Date().toISOString(),
-        data: stateData({ ...(data as ProcessRecord), processId: id }, "unknown", {
-          orphaned: true,
-          orphanReason: "Process handles cannot be safely reattached after runtime restart",
-        }),
+      this.persist(reconciled, "unknown", {
+        orphaned: true,
+        orphanReason: "Process handles cannot be safely reattached after runtime restart",
       });
       this.tracer.emit({
         traceId: data.traceId as import("../core/ids.ts").TraceId,
@@ -445,13 +467,13 @@ export class DirectProcessManager {
         actor: "runtime",
         ...(projectId === undefined ? {} : { projectId: projectId as import("../core/ids.ts").ProjectId }),
         ...(taskId === undefined ? {} : { taskId: taskId as import("../core/ids.ts").TaskId }),
-        ...(data.operation === undefined ? {} : { operation: data.operation }),
-        operationId: data.operationId as import("../core/ids.ts").OperationId,
+        operation: reconciled.operation,
+        operationId: reconciled.operationId as import("../core/ids.ts").OperationId,
         status: "unknown",
         executor: "direct",
         provider: "node:child_process",
         effectState: "unknown",
-        effectClass: data.effectClass ?? "destructive",
+        effectClass: reconciled.effectClass,
         summary: "Process was orphaned during runtime restart; reattachment is unsafe",
         metadata: { processId: id, orphaned: true },
       });
@@ -479,7 +501,7 @@ export class DirectProcessManager {
     const artifact = this.artifacts.put(bytes, {
       mediaType: "text/plain",
       origin: "direct.process." + stream,
-      sensitivity: "internal",
+      sensitivity: "sensitive",
     });
     this.tracer.emit({
       traceId: options.context.traceId,

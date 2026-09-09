@@ -90,7 +90,11 @@ test("FA-04 project, task, Git, resume, and verification state survive reopen", 
     assert.equal(checked.meta.effectClass, "workspace_write");
     assert.equal(checked.meta.effectState, "applied");
     assert.equal(checked.data.checks[0]?.status, "passed");
+    assert.equal(checked.data.checks[0]?.stdout, "verified");
     assert.ok(state.getEntity("verifications", checked.data.verificationId));
+    const durableVerification = state.getEntity("verifications", checked.data.verificationId);
+    assert.equal(JSON.stringify(durableVerification).includes("verified"), false);
+    assert.equal((durableVerification?.data?.evidence as { checks?: readonly { stdout?: string; stderr?: string }[] } | undefined)?.checks?.[0]?.stdout, "");
     assert.ok(state.listEvents({ type: "process.started" }).length > 0);
     assert.ok(state.listEvents({ type: "process.completed" }).length > 0);
     assert.equal(state.listEvents({ runId: run.runId }).filter((event) => event.type.startsWith("process.")).every((event) => event.effectClass === "workspace_write"), true);

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { FileArtifactStore } from "../src/artifacts/index.ts";
+import { FileArtifactStore, type ArtifactStore } from "../src/artifacts/index.ts";
 import { createOperationContext, createRunId, createTraceId } from "../src/core/index.ts";
 import { DirectExecutor } from "../src/direct/index.ts";
 import { InMemoryEventSink, Tracer } from "../src/observability/index.ts";
@@ -130,7 +130,7 @@ test("environment values are usable by the child but absent from telemetry", asy
   if (!result.ok) return;
   assert.equal(result.data.stdout, secret);
   assert.equal(JSON.stringify(sink.events).includes(secret), false);
-  assert.equal(JSON.stringify(sink.events).includes("AER_TEST_SECRET"), true);
+  assert.equal(JSON.stringify(sink.events).includes("AER_TEST_SECRET"), false);
 });
 
 test("raw direct execution keeps a destructive default while trusted reads use least privilege", async () => {
@@ -196,5 +196,61 @@ test("restart reconciliation marks active processes unknown instead of reattachi
     assert.equal(sink.events[0]?.effectState, "unknown");
   } finally {
     state.close();
+  }
+});
+
+test("durable process reconciliation state excludes argv and shell source", async () => {
+  const state = new SqliteStateStore(":memory:");
+  const tracer = new Tracer({ sink: state });
+  try {
+    const { context } = contextFor(tracer);
+    const executor = new DirectExecutor({ tracer, state });
+    const secret = "token=secret-sentinel";
+    const result = await executor.runExecutable({ executable: "printf", args: [secret] }, context);
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    const persisted = state.getEntity("processes", result.data.processId);
+    assert.equal(JSON.stringify(persisted).includes("secret-sentinel"), false);
+    assert.equal(persisted?.data?.argumentCount, 1);
+
+    const shell = await executor.runShell({ command: `printf '${secret}'` }, context);
+    assert.equal(shell.ok, true);
+    if (!shell.ok) return;
+    assert.equal(JSON.stringify(state.getEntity("processes", shell.data.processId)).includes("secret-sentinel"), false);
+  } finally {
+    state.close();
+  }
+});
+
+test("artifact failure during process finalization still settles wait with exit evidence", async () => {
+  const artifacts = {
+    put() { throw new Error("injected artifact failure"); },
+    metadata() { return undefined; },
+    read() { return new Uint8Array(); },
+    has() { return false; },
+  } satisfies ArtifactStore;
+  const tracer = new Tracer();
+  const { context } = contextFor(tracer);
+  const executor = new DirectExecutor({ tracer, artifacts, defaultMaxOutputBytes: 1 });
+  const handle = executor.startExecutable({ executable: "printf", args: ["long output"] }, context);
+  const result = await handle.wait();
+  assert.equal(result.status, "unknown");
+  assert.equal(result.effectState, "unknown");
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "l");
+  assert.equal(result.error, "Process output artifact persistence failed");
+});
+
+test("direct output spill files are private from creation", async () => {
+  const tracer = new Tracer();
+  const { context } = contextFor(tracer);
+  const executor = new DirectExecutor({ tracer, cancelGraceMs: 20 });
+  const handle = executor.startExecutable({ executable: "sh", args: ["-c", "sleep 1"] }, context);
+  const spillFiles = readdirSync(tmpdir()).filter((name) => name.startsWith(`aer-direct-${handle.processId}-`));
+  try {
+    assert.equal(spillFiles.length, 2);
+    assert.equal(spillFiles.every((name) => (statSync(join(tmpdir(), name)).mode & 0o777) === 0o600), true);
+  } finally {
+    await handle.cancel();
   }
 });

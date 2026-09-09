@@ -31,7 +31,7 @@ declare module "node:child_process" {
 }
 
 declare module "node:fs" {
-  export function openSync(path: string, flags: string): number;
+  export function openSync(path: string, flags: string | number, mode?: number): number;
   export function readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number): number;
   export function writeSync(fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number): number;
   export function closeSync(fd: number): void;
@@ -49,5 +49,9 @@ declare module "node:path" {
 declare module "node:process" {
   export const env: Readonly<Record<string, string | undefined>>;
   export const platform: string;
-  export function kill(pid: number, signal?: string): boolean;
+  export function kill(pid: number, signal?: string | number): boolean;
+}
+
+declare module "node:os" {
+  export function hostname(): string;
 }
