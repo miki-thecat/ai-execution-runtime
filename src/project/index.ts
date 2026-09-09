@@ -4,3 +4,4 @@ export * from "./events.ts";
 export * from "./registry.ts";
 export * from "./runtime.ts";
 export * from "./types.ts";
+export * from "./trust.ts";

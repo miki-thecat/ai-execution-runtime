@@ -41,6 +41,7 @@ declare module "node:fs" {
   interface FileStats {
     readonly size: number;
     readonly mode: number;
+    readonly dev: number;
     readonly ino: number;
     readonly birthtimeMs: number;
     readonly mtimeMs: number;

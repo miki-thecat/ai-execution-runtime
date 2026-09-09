@@ -1,6 +1,7 @@
 import type { ProjectId, RunId, TaskId, ArtifactRef, TraceId } from "../core/ids.ts";
 import type { RuntimeStatus } from "../core/result.ts";
 import type { ProjectConfig } from "./config.ts";
+import type { ProjectBoundaryState, TrustedVerificationPlan } from "./trust.ts";
 
 export interface ProjectIdentity {
   readonly projectId: ProjectId;
@@ -12,6 +13,9 @@ export interface ProjectIdentity {
   readonly configPath: string;
   readonly goal?: string;
   readonly config: ProjectConfig;
+  /** Runtime-owned trust state; commands are intentionally absent from compact views. */
+  readonly boundary: ProjectBoundaryState;
+  readonly trustedVerificationPlan?: TrustedVerificationPlan;
 }
 
 /**
@@ -27,6 +31,7 @@ export interface ProjectIdentityView {
   readonly root: string;
   readonly configPath: string;
   readonly goal?: string;
+  readonly boundary: ProjectBoundaryState;
 }
 
 export type ProjectRef = ProjectIdentity | ProjectIdentityView | ProjectId | string;
@@ -82,6 +87,10 @@ export interface VerificationSummary {
   readonly updatedAt: string;
   readonly summary?: string;
   readonly artifactRefs: readonly ArtifactRef[];
+  readonly coverage?: "full" | "partial";
+  readonly canonicalPassed?: boolean;
+  readonly trustedPlanDigest?: string;
+  readonly executionPosture?: "host_unisolated";
 }
 
 export interface ProjectInspect {
@@ -95,6 +104,7 @@ export interface ProjectInspect {
   readonly activeProcesses: readonly Readonly<Record<string, unknown>>[];
   readonly latestVerification?: VerificationSummary;
   readonly capabilities: Readonly<Record<string, boolean>>;
+  readonly boundary: ProjectBoundaryState;
 }
 
 export interface ResumeEvent {
@@ -131,6 +141,7 @@ export interface ProjectResume {
   readonly blockers: readonly ResumeBlocker[];
   readonly unknownEffects: readonly ResumeBlocker[];
   readonly artifactRefs: readonly ArtifactRef[];
+  readonly boundary: ProjectBoundaryState;
 }
 
 export interface ProjectRegistrationInput {
@@ -168,4 +179,8 @@ export interface ProjectRecordData {
   readonly rootDir: string;
   readonly name: string;
   readonly goal?: string;
+  readonly registeredRealRoot?: string;
+  readonly rootDevice?: string;
+  readonly rootInode?: string;
+  readonly trustedVerificationPlan?: TrustedVerificationPlan;
 }
