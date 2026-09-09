@@ -1,0 +1,222 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createOperationContext, createRunId, createTraceId } from "../src/core/index.ts";
+import { InMemoryEventSink, Tracer } from "../src/observability/index.ts";
+import { GitHubProvider, type GitHubCommandResult, type GitHubCommandRunner } from "../src/github/index.ts";
+
+type Fixture = GitHubCommandResult | (() => GitHubCommandResult);
+
+class FixtureRunner implements GitHubCommandRunner {
+  readonly executableCalls: string[][] = [];
+  readonly shellCalls: string[] = [];
+  private readonly fixtures = new Map<string, Fixture | Fixture[]>();
+  private readonly shellFixtures = new Map<string, Fixture | Fixture[]>();
+
+  when(args: readonly string[], fixture: Fixture | readonly Fixture[]): this {
+    this.fixtures.set(JSON.stringify(args), Array.isArray(fixture) ? [...fixture] : fixture);
+    return this;
+  }
+
+  whenShell(command: string, fixture: Fixture | readonly Fixture[]): this {
+    this.shellFixtures.set(command, Array.isArray(fixture) ? [...fixture] : fixture);
+    return this;
+  }
+
+  async runExecutable(command: { readonly executable: string; readonly args?: readonly string[] }): Promise<GitHubCommandResult> {
+    const args = [command.executable, ...(command.args ?? [])];
+    this.executableCalls.push(args);
+    return this.consume(args);
+  }
+
+  async runShell(input: { readonly command: string }): Promise<GitHubCommandResult> {
+    this.shellCalls.push(input.command);
+    const fixture = this.shellFixtures.get(input.command);
+    if (fixture !== undefined) {
+      if (Array.isArray(fixture)) {
+        const next = fixture.shift();
+        return next === undefined ? { stdout: "", stderr: "fixture exhausted", exitCode: 1 } : typeof next === "function" ? next() : next;
+      }
+      return typeof fixture === "function" ? fixture() : fixture;
+    }
+    return { stdout: "", stderr: "fixture shell miss", exitCode: 1 };
+  }
+
+  private consume(args: readonly string[]): GitHubCommandResult {
+    const fixture = this.fixtures.get(JSON.stringify(args.slice(1)));
+    if (fixture === undefined) return { stdout: "", stderr: `fixture miss: ${args.join(" ")}`, exitCode: 1 };
+    if (Array.isArray(fixture)) {
+      const next = fixture.shift();
+      return next === undefined ? { stdout: "", stderr: "fixture exhausted", exitCode: 1 } : typeof next === "function" ? next() : next;
+    }
+    return typeof fixture === "function" ? fixture() : fixture;
+  }
+}
+
+function json(value: unknown, extra: Partial<GitHubCommandResult> = {}): GitHubCommandResult {
+  const stdout = JSON.stringify(value);
+  return { stdout, stderr: "", exitCode: 0, rawOutputBytes: stdout.length * 2, returnedOutputBytes: stdout.length, ...extra };
+}
+
+function context(tracer: Tracer) {
+  const run = tracer.startRun({ actor: "model" });
+  return { run, context: createOperationContext({ traceId: run.traceId, runId: run.runId, spanId: run.spanId, actor: "model" }) };
+}
+
+const repo = {
+  name: "runtime",
+  nameWithOwner: "miki-thecat/runtime",
+  url: "https://github.com/miki-thecat/runtime",
+  defaultBranchRef: { name: "main" },
+  owner: { login: "miki-thecat" },
+};
+
+test("github capabilities report gh, authentication, and current repository", async () => {
+  const runner = new FixtureRunner()
+    .when(["--version"], { stdout: "gh version 2.60.0 (2025-01-01)\n", stderr: "", exitCode: 0 })
+    .when(["auth", "status", "--json", "hosts"], json({ hosts: { "github.com": [{ login: "miki-thecat", active: true }] } }))
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo));
+  const provider = new GitHubProvider({ runner });
+  const result = await provider.capabilities();
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.ghAvailable, true);
+  assert.equal(result.data.authenticated, true);
+  assert.equal(result.data.account, "miki-thecat");
+  assert.equal(result.data.currentRepository?.nameWithOwner, "miki-thecat/runtime");
+  assert.equal(result.data.structuredJson, true);
+  assert.deepEqual(result.data.routes, ["gh-json", "raw-gh"]);
+});
+
+test("github.snapshot compresses repository, PR, checks, reviews, and native dependencies", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "view", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({
+      number: 7,
+      title: "semantic layer",
+      state: "OPEN",
+      headRefName: "feature/semantic",
+      headRefOid: "abc123",
+      baseRefName: "main",
+      statusCheckRollup: [
+        { name: "verify", status: "COMPLETED", conclusion: "SUCCESS" },
+        { name: "lint", status: "IN_PROGRESS" },
+      ],
+      reviewDecision: "REVIEW_REQUIRED",
+      reviews: [{ author: { login: "reviewer" }, state: "APPROVED" }],
+    }))
+    .when(["issue", "view", "7", "--json", "number,title,state,url,labels,assignees"], json({ number: 7, title: "FA-05", state: "OPEN", labels: [{ name: "ready" }] }))
+    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocked_by"], json([{ number: 5 }]))
+    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocking"], json([{ number: 8 }]))
+    .when(["branch", "--show-current"], { stdout: "feature/semantic\n", stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "abc123\n", stderr: "", exitCode: 0 });
+  const sink = new InMemoryEventSink();
+  const tracer = new Tracer({ sink });
+  const provider = new GitHubProvider({ runner, tracer });
+  const { run, context: operationContext } = context(tracer);
+
+  const result = await provider.snapshot({ issueNumber: 7, includeWork: true, issueNumbers: [7] }, operationContext);
+  run.complete();
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.repository?.nameWithOwner, "miki-thecat/runtime");
+  assert.equal(result.data.currentPullRequest?.checksSummary.pending, 1);
+  assert.deepEqual(result.data.dependencies, { issue: 7, blockedBy: [5], blocking: [8] });
+  assert.deepEqual(result.data.work?.blocked, [7]);
+  assert.equal(result.meta.metrics.pollCountModel, 0);
+  assert.ok(result.meta.metrics.internalCalls >= 6);
+  assert.ok(result.meta.metrics.rawOutputBytes > result.meta.metrics.returnedOutputBytes);
+  assert.ok(result.meta.metrics.compressionRatio > 1);
+  assert.equal(sink.events.some((event) => event.operation === "github.snapshot" && event.type === "operation.completed"), true);
+});
+
+test("github.wait polls internally and exposes zero model polls", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["pr", "checks", "7", "--json", "name,state,bucket,link"], [
+      json([{ name: "verify", state: "IN_PROGRESS" }]),
+      json([{ name: "verify", state: "COMPLETED", conclusion: "SUCCESS" }]),
+    ]);
+  const tracer = new Tracer();
+  const provider = new GitHubProvider({ runner, tracer, sleep: async () => undefined });
+  const { run, context: operationContext } = context(tracer);
+
+  const result = await provider.wait({ pullRequest: 7, intervalMs: 0, maxPolls: 3 }, operationContext);
+  run.complete();
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.terminal, true);
+  assert.equal(result.data.passed, true);
+  assert.equal(result.data.pollCountInternal, 2);
+  assert.equal(result.data.pollCountModel, 0);
+  assert.equal(result.meta.metrics.pollCountInternal, 2);
+  assert.equal(result.meta.metrics.pollCountModel, 0);
+});
+
+test("github.publish reuses an already reconciled PR without pushing or creating", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: "feature/semantic\n", stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "abc123\n", stderr: "", exitCode: 0 })
+    .when(["ls-remote", "--heads", "origin", "refs/heads/feature/semantic"], { stdout: "abc123\trefs/heads/feature/semantic\n", stderr: "", exitCode: 0 })
+    .when(["pr", "list", "--head", "feature/semantic", "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json([{ number: 7, title: "semantic layer", state: "OPEN", headRefName: "feature/semantic", headRefOid: "abc123", baseRefName: "main" }]))
+    .when(["pr", "view", "7", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 7, title: "semantic layer", state: "OPEN", headRefName: "feature/semantic", headRefOid: "abc123", baseRefName: "main" }));
+  const provider = new GitHubProvider({ runner });
+  const result = await provider.publish({ title: "ignored on reuse" });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.created, false);
+  assert.equal(result.data.reused, true);
+  assert.equal(result.data.pushed, false);
+  assert.equal(result.data.reconciled, true);
+  assert.equal(runner.executableCalls.some((call) => call[0] === "git" && call[1] === "push"), false);
+  assert.equal(runner.shellCalls.length, 0);
+});
+
+test("github.publish creates through the API only after confirming no PR exists", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: "feature/new\n", stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "fedcba\n", stderr: "", exitCode: 0 })
+    .when(["ls-remote", "--heads", "origin", "refs/heads/feature/new"], { stdout: "fedcba\trefs/heads/feature/new\n", stderr: "", exitCode: 0 })
+    .when(["pr", "list", "--head", "feature/new", "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json([]))
+    .when(["api", "repos/miki-thecat/runtime/pulls", "--method", "POST", "--field", "title=new PR", "--field", "head=feature/new", "--field", "base=main", "--field", "body=body"], json({ number: 11, title: "new PR", state: "OPEN", head: { ref: "feature/new", sha: "fedcba" }, base: { ref: "main" } }))
+    .when(["pr", "view", "11", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 11, title: "new PR", state: "OPEN", headRefName: "feature/new", headRefOid: "fedcba", baseRefName: "main" }));
+  const provider = new GitHubProvider({ runner });
+  const result = await provider.publish({ title: "new PR", body: "body" });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.created, true);
+  assert.equal(result.data.pullRequest.number, 11);
+  assert.equal(runner.executableCalls.some((call) => call[0] === "gh" && call[1] === "api"), true);
+  assert.equal(runner.shellCalls.length, 0);
+});
+
+test("github.publish reconciles an ambiguous push before reusing a PR", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["symbolic-ref", "--quiet", "--short", "HEAD"], { stdout: "feature/ambiguous\n", stderr: "", exitCode: 0 })
+    .when(["rev-parse", "HEAD"], { stdout: "def456\n", stderr: "", exitCode: 0 })
+    .when(["ls-remote", "--heads", "origin", "refs/heads/feature/ambiguous"], [
+      { stdout: "", stderr: "", exitCode: 0 },
+      { stdout: "def456\trefs/heads/feature/ambiguous\n", stderr: "", exitCode: 0 },
+      { stdout: "def456\trefs/heads/feature/ambiguous\n", stderr: "", exitCode: 0 },
+    ])
+    .when(["push", "origin", "HEAD:refs/heads/feature/ambiguous"], { stdout: "", stderr: "transport closed", exitCode: 1 })
+    .when(["pr", "list", "--head", "feature/ambiguous", "--state", "all", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json([{ number: 9, state: "OPEN", headRefName: "feature/ambiguous", headRefOid: "def456", baseRefName: "main" }]))
+    .when(["pr", "view", "9", "--json", "number,title,state,url,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,statusCheckRollup,reviewDecision,reviews"], json({ number: 9, state: "OPEN", headRefName: "feature/ambiguous", headRefOid: "def456", baseRefName: "main" }));
+  const provider = new GitHubProvider({ runner });
+  const result = await provider.publish({ title: "ambiguous" });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.pushed, true);
+  assert.equal(result.data.reconciled, true);
+  assert.equal(result.data.created, false);
+  assert.equal(result.data.effectState, "applied");
+  assert.equal(runner.executableCalls.filter((call) => call[0] === "git" && call[1] === "push").length, 1);
+});

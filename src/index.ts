@@ -9,3 +9,4 @@ export * from "./changes/index.ts";
 export * from "./project/index.ts";
 export * from "./tasks/index.ts";
 export * from "./verify/index.ts";
+export * from "./github/index.ts";
