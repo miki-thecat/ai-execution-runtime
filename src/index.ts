@@ -6,3 +6,6 @@ export * from "./artifacts/index.ts";
 export * from "./direct/index.ts";
 export * from "./files/index.ts";
 export * from "./changes/index.ts";
+export * from "./project/index.ts";
+export * from "./tasks/index.ts";
+export * from "./verify/index.ts";
