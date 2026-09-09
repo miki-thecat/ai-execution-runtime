@@ -109,7 +109,7 @@ test("github.snapshot compresses repository, PR, checks, reviews, and native dep
       reviews: [{ author: { login: "reviewer" }, state: "APPROVED" }],
     }))
     .when(["issue", "view", "7", "--json", "number,title,state,url,labels,assignees"], json({ number: 7, title: "FA-05", state: "OPEN", labels: [{ name: "ready" }] }))
-    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocked_by"], json([{ number: 5 }]))
+    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocked_by"], json([{ number: 5, state: "open" }]))
     .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocking"], json([{ number: 8 }]))
     .when(["branch", "--show-current"], { stdout: "feature/semantic\n", stderr: "", exitCode: 0 })
     .when(["rev-parse", "HEAD"], { stdout: "abc123\n", stderr: "", exitCode: 0 });
@@ -472,6 +472,44 @@ test("github.work marks incomplete native dependency reads as unknown", async ()
   assert.equal(result.data.items[0]?.status, "unknown");
   assert.deepEqual(result.data.ready, []);
   assert.equal(result.data.dependencies[0]?.state, "unknown");
+});
+
+test("github.work treats a closed predecessor as resolved", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["issue", "view", "7", "--json", "number,title,state,url,labels,assignees"], json({ number: 7, title: "FA-05", state: "OPEN", labels: [{ name: "ready" }] }))
+    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocked_by"], json([{ number: 5, state: "CLOSED" }]))
+    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocking"], json([]));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.work({ issueNumbers: [7] });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.items[0]?.status, "ready");
+  assert.deepEqual(result.data.items[0]?.blockedBy, []);
+  assert.deepEqual(result.data.dependencies[0]?.blockedBy, []);
+  assert.deepEqual(result.data.ready, [7]);
+  assert.deepEqual(result.data.blocked, []);
+});
+
+test("github.work retains an open predecessor alongside a closed predecessor", async () => {
+  const runner = new FixtureRunner()
+    .when(["repo", "view", "--json", "name,nameWithOwner,url,defaultBranchRef,owner"], json(repo))
+    .when(["issue", "view", "7", "--json", "number,title,state,url,labels,assignees"], json({ number: 7, title: "FA-05", state: "OPEN", labels: [{ name: "ready" }] }))
+    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocked_by"], json([{ number: 5, state: "CLOSED" }, { number: 6, state: "OPEN" }]))
+    .when(["api", "repos/miki-thecat/runtime/issues/7/dependencies/blocking"], json([]));
+  const provider = new GitHubProvider({ runner });
+
+  const result = await provider.work({ issueNumbers: [7] });
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.data.items[0]?.status, "blocked");
+  assert.deepEqual(result.data.items[0]?.blockedBy, [6]);
+  assert.deepEqual(result.data.dependencies[0]?.blockedBy, [6]);
+  assert.deepEqual(result.data.ready, []);
+  assert.deepEqual(result.data.blocked, [7]);
 });
 
 test("github.snapshot enriches REST pull requests with reviews and check-runs", async () => {

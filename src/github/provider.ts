@@ -479,9 +479,31 @@ function parsePullRequests(value: unknown): GitHubPullRequest[] {
   return value.map(parsePullRequest).filter((item): item is GitHubPullRequest => item !== undefined);
 }
 
-function parseDependencyNumbers(value: unknown): number[] | undefined {
+interface ParsedDependencies {
+  readonly numbers: readonly number[];
+  readonly complete: boolean;
+}
+
+function parseDependencyNumbers(value: unknown, omitClosed = false): ParsedDependencies | undefined {
   if (!Array.isArray(value)) return undefined;
-  return value.map((entry) => numberValue(nested(entry, "number")) ?? numberValue(entry)).filter((item): item is number => item !== undefined);
+  const numbers: number[] = [];
+  let complete = true;
+  for (const entry of value) {
+    const number = numberValue(nested(entry, "number")) ?? numberValue(entry);
+    if (number === undefined) {
+      complete = false;
+      continue;
+    }
+    if (omitClosed) {
+      const state = normalizeStatus(nested(entry, "state"));
+      if (!isObject(entry) || !["open", "closed"].includes(state)) {
+        complete = false;
+      }
+      if (state === "closed") continue;
+    }
+    numbers.push(number);
+  }
+  return { numbers: [...new Set(numbers)], complete };
 }
 
 function mergeDependencies(issue: number, blockedBy: readonly number[], blocking: readonly number[]): GitHubIssueDependencies {
@@ -1218,10 +1240,10 @@ export class GitHubProvider {
     const blocking = await this.apiJson(`repos/${repositoryPath(repository)}/issues/${number}/dependencies/blocking`, [], cwd, context, metrics);
     if (blockedBy !== undefined) routes.add(blockedBy.route);
     if (blocking !== undefined) routes.add(blocking.route);
-    const blockedByNumbers = parseDependencyNumbers(blockedBy?.value);
+    const blockedByNumbers = parseDependencyNumbers(blockedBy?.value, true);
     const blockingNumbers = parseDependencyNumbers(blocking?.value);
-    const dependencies = mergeDependencies(number, blockedByNumbers ?? [], blockingNumbers ?? []);
-    return blockedByNumbers !== undefined && blockingNumbers !== undefined
+    const dependencies = mergeDependencies(number, blockedByNumbers?.numbers ?? [], blockingNumbers?.numbers ?? []);
+    return blockedByNumbers?.complete === true && blockingNumbers?.complete === true
       ? dependencies
       : { ...dependencies, state: "unknown" };
   }
