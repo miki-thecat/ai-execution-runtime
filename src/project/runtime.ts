@@ -1,6 +1,6 @@
 import { assertProjectReferences, authorityMismatch } from "./authority.ts";
-import { createOperationContext, createRunId, createRuntimeError, createTraceId, runtimeFailure, runtimeSuccess, createOperationMeta, type OperationContext, type RuntimeError, type RuntimeResult } from "../core/index.ts";
-import type { ArtifactRef, ProjectId } from "../core/ids.ts";
+import { createOperationContext, createSpanId, createRunId, createRuntimeError, createTraceId, runtimeFailure, runtimeSuccess, createOperationMeta, type OperationContext, type RuntimeError, type RuntimeResult } from "../core/index.ts";
+import type { ArtifactRef, ProjectId, RunId, TaskId, TraceId } from "../core/ids.ts";
 import type { EffectState } from "../core/effects.ts";
 import type { RuntimeStatus } from "../core/result.ts";
 import { DirectExecutor } from "../direct/index.ts";
@@ -226,6 +226,43 @@ export class ProjectRuntime {
       ...(options.artifacts === undefined ? {} : { artifacts: options.artifacts }),
     });
     this.git = new LocalGitSnapshot({ direct: this.direct });
+    this.reconcileUnknownRunChildren();
+  }
+
+  /** A terminal UNKNOWN parent cannot continue to own running delegated work. */
+  private reconcileUnknownRunChildren(): void {
+    if (this.state === undefined) return;
+    for (const parent of this.state.listEntities("runs", { status: "unknown" })) {
+      for (const kind of ["tasks", "agent_runs"] as const) {
+        for (const child of this.state.listEntities(kind, { runId: parent.id, status: "running" })) {
+          // Never infer or repair project authority from a run ID alone.
+          if (child.projectId !== parent.projectId) continue;
+          const traceId = child.traceId ?? child.data?.traceId ?? parent.traceId;
+          if (typeof traceId !== "string") continue;
+          const summary = "Running child reconciled on reopen: parent run is terminal unknown; execution outcome remains unknown";
+          const completedAt = this.tracer.now().toISOString();
+          this.tracer.emit({
+            type: kind === "tasks" ? "task.unknown" : "agent.failed",
+            traceId: traceId as TraceId,
+            runId: parent.id as RunId,
+            spanId: createSpanId(),
+            ...(child.projectId === undefined ? {} : { projectId: child.projectId as ProjectId }),
+            ...(kind === "tasks" ? { taskId: child.id as TaskId } : child.taskId === undefined ? {} : { taskId: child.taskId as TaskId }),
+            actor: "runtime",
+            status: "unknown",
+            effectState: "unknown",
+            summary,
+            metadata: { source: "project.reopen", parentStatus: "unknown", from: "running", to: "unknown", ...(kind === "agent_runs" ? { agentRunId: child.id, terminalState: "incomplete" } : {}) },
+          });
+          this.state.saveEntity({
+            ...child,
+            status: "unknown",
+            updatedAt: completedAt,
+            data: { ...child.data, completedAt, effectState: "unknown", ...(kind === "tasks" ? { reason: summary } : { terminalState: "incomplete", summary }) },
+          });
+        }
+      }
+    }
   }
 
   register(input: Parameters<ProjectRegistry["register"]>[0]): ProjectIdentity {
