@@ -948,12 +948,12 @@ export class LocalDaemonClient {
   private readonly transport: LocalControlClient;
   private readonly effectClassFor: ((operation: string) => EffectClass | undefined) | undefined;
 
-  constructor(options: { readonly endpoint: string; readonly timeoutMs?: number; readonly maxFrameBytes?: number; readonly resolveEffectClass?: (operation: string) => EffectClass | undefined } | string) {
+  constructor(options: { readonly endpoint: string; readonly transport?: LocalControlClient; readonly timeoutMs?: number; readonly maxFrameBytes?: number; readonly resolveEffectClass?: (operation: string) => EffectClass | undefined } | string) {
     this.effectClassFor = typeof options === "string" ? undefined : options.resolveEffectClass;
     const transportOptions = typeof options === "string"
       ? options
       : { endpoint: options.endpoint, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.maxFrameBytes === undefined ? {} : { maxFrameBytes: options.maxFrameBytes }) };
-    this.transport = new LocalControlClient(transportOptions);
+    this.transport = typeof options === "string" ? new LocalControlClient(transportOptions) : options.transport ?? new LocalControlClient(transportOptions);
   }
 
   ping(): Promise<unknown> { return this.transport.ping(); }
