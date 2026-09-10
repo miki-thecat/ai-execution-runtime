@@ -42,6 +42,7 @@ Docker Sandbox, external Codex, GitHub account access, and Secure MCP Tunnel are
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Observability](docs/OBSERVABILITY.md)
+- [Post-Beta to v1.0 plan](docs/POST_BETA_PLAN.md)
 - [Full Alpha implementation plan](docs/FULL_ALPHA_PLAN.md)
 - [Full Alpha Issue DAG](docs/ISSUE_DAG.md)
 - [Agent/worker rules](AGENTS.md)
