@@ -1,3 +1,4 @@
+import { measureMcpPresentation } from "../src/mcp/presentation.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AERDaemon, createMcpFactory, createMcpHandler, registerMcpOperations, SqliteStateStore } from "../src/index.ts";
@@ -29,6 +30,17 @@ test("modern stateless MCP calls shared AER state without discover", async () =>
     const result = called.result as { structuredContent?: { data?: { projectId?: string } }; isError?: boolean };
     assert.equal(result.isError, undefined);
     assert.equal(result.structuredContent?.data?.projectId, project.projectId);
+    const presentation = measureMcpPresentation(called.result as never);
+    const content = (called.result as { content: { text: string }[] }).content;
+    const summary = JSON.parse(content[0]!.text);
+    assert.equal(summary.operation, "project.inspect");
+    assert.equal(summary.data, undefined);
+    assert.ok(presentation.textBytes < 2500);
+    assert.ok(presentation.textBytes < presentation.structuredBytes);
+    const events = state.listEvents({ type: "mcp.presented" });
+    assert.equal(events.length, 1);
+    for (const [key, value] of Object.entries(presentation)) assert.equal(events[0]?.metadata?.[key === "presentationTokenProxy" ? "presentationByteQuarterProxy" : key], value);
+    assert.equal(events[0]?.returnedOutputBytes, 0);
     assert.equal(factories, 2);
   } finally { state.close(); }
 });
@@ -46,6 +58,14 @@ test("MCP schema and AER effect authority fail closed", async () => {
     assert.equal(structured?.status, "waiting_approval");
     assert.equal(structured?.error?.code, "EFFECT_APPROVAL_REQUIRED");
     assert.notEqual((approval.result as { isError?: boolean }).isError, true);
+    const approvalResult = approval.result as { content: { text: string }[] };
+    assert.deepEqual(JSON.parse(approvalResult.content[0]!.text), structured);
+    const failed = await mcpCall(handler, 5, "tools/call", { name: "file.read", arguments: { projectId: project.projectId, path: "../outside" } });
+    const failure = failed.result as { isError: boolean; content: { text: string }[]; structuredContent: { error: { code: string; retryable: boolean; effect: string } } };
+    assert.equal(failure.isError, true);
+    assert.equal(typeof failure.structuredContent.error.code, "string");
+    assert.equal(typeof failure.structuredContent.error.retryable, "boolean");
+    assert.deepEqual(JSON.parse(failure.content[0]!.text), failure.structuredContent);
     assert.equal(daemon.state.listEvents({ type: "process.started" }).length, 0);
   } finally { state.close(); }
 });

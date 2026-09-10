@@ -61,6 +61,7 @@ export const EVENT_TYPES = [
   "device.disconnected",
   "remote.requested",
   "remote.completed",
+  "mcp.presented",
 ] as const;
 
 export type EventType = (typeof EVENT_TYPES)[number];

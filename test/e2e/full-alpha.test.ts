@@ -54,6 +54,13 @@ test("Full Alpha walking skeleton and first RDC dogfood baseline pass", async ()
   assert.equal(report.mcp.protocol, "2026-07-28");
   assert.equal(report.mcp.listPassed, true);
   assert.equal(report.mcp.callPassed, true);
+  assert.deepEqual(report.mcp.presentation.map((row) => row.operation), ["project.inspect", "project.resume", "file.search", "github.wait", "run.inspect", "run.compare"]);
+  for (const row of report.mcp.presentation) {
+    assert.ok(row.structuredBytes > row.textBytes, row.operation);
+    assert.ok(row.textBytes < 2500, row.operation);
+    assert.ok(row.presentationBytes < row.duplicatedJsonPresentationBytes * 0.75, row.operation);
+    assert.equal(row.presentationTokenProxy, row.presentationBytes / 4);
+  }
   assert.equal(report.plugin.status, "pass");
   assert.equal(report.plugin.deterministic, true);
   assert.equal(report.tunnel.status, "SKIPPED");
