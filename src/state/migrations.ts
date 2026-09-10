@@ -251,6 +251,35 @@ export const STATE_MIGRATIONS: readonly StateMigration[] = [
       ALTER TABLE events ADD COLUMN environment_json TEXT;
     `,
   },
+  {
+    version: 5,
+    sql: `
+      ALTER TABLE artifacts ADD COLUMN project_ids_json TEXT NOT NULL DEFAULT '[]';
+      UPDATE artifacts
+      SET project_ids_json = COALESCE((
+        SELECT json_group_array(project_id)
+        FROM (
+          SELECT DISTINCT e.project_id AS project_id
+          FROM events e,
+               json_each(CASE WHEN json_valid(e.artifact_refs_json) THEN CASE WHEN json_type(e.artifact_refs_json) = 'array' THEN e.artifact_refs_json ELSE '[]' END ELSE '[]' END) AS refs
+          WHERE e.project_id IS NOT NULL AND refs.value = artifacts.artifact_ref
+          ORDER BY e.project_id
+        )
+      ), '[]');
+      CREATE TRIGGER runs_project_binding BEFORE UPDATE OF project_id ON runs
+      WHEN OLD.project_id IS NOT NEW.project_id
+      BEGIN SELECT RAISE(ABORT, 'Run project binding is immutable'); END;
+      CREATE TRIGGER tasks_project_binding BEFORE UPDATE OF project_id, run_id ON tasks
+      WHEN OLD.project_id IS NOT NEW.project_id OR OLD.run_id IS NOT NEW.run_id
+      BEGIN SELECT RAISE(ABORT, 'Task project/run binding is immutable'); END;
+      CREATE TRIGGER changesets_project_binding BEFORE UPDATE OF project_id ON changesets
+      WHEN OLD.project_id IS NOT NEW.project_id
+      BEGIN SELECT RAISE(ABORT, 'ChangeSet project binding is immutable'); END;
+      CREATE TRIGGER verifications_project_binding BEFORE UPDATE OF project_id ON verifications
+      WHEN OLD.project_id IS NOT NEW.project_id
+      BEGIN SELECT RAISE(ABORT, 'Verification project binding is immutable'); END;
+    `,
+  },
 ] as const;
 
 export const CURRENT_STATE_SCHEMA_VERSION = STATE_MIGRATIONS.at(-1)?.version ?? 0;

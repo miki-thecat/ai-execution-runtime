@@ -41,6 +41,36 @@ test("SQLite state survives close and reopen with canonical run events", () => {
   }
 });
 
+test("v5 migration backfills project ownership for legacy artifact evidence", () => {
+  const directory = temporaryDirectory();
+  const dbPath = join(directory, "aer.db");
+  const projectId = "project_legacy";
+  const ref = `artifact://sha256:${"a".repeat(64)}`;
+  const legacy = new DatabaseSync(dbPath);
+  try {
+    for (const migration of STATE_MIGRATIONS.filter(({ version }) => version < 5)) {
+      legacy.exec(migration.sql);
+      legacy.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(migration.version, new Date().toISOString());
+    }
+    const now = new Date().toISOString();
+    legacy.prepare("INSERT INTO artifacts (artifact_ref, digest, size, media_type, origin, sensitivity, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(
+      ref, "a".repeat(64), 1, "text/plain", "legacy", "internal", now, now,
+    );
+    const insertEvent = legacy.prepare("INSERT INTO events (event_id, schema_version, trace_id, run_id, span_id, timestamp, type, actor, project_id, duration_ms, internal_calls, retries, poll_count_internal, poll_count_model, input_bytes, raw_output_bytes, returned_output_bytes, artifact_bytes, files_read, files_changed, compression_ratio, artifact_refs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    insertEvent.run("event_legacy", 1, "trace_legacy", "run_legacy", "span_legacy", now, "artifact.created", "runtime", projectId, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, JSON.stringify([ref]));
+  } finally {
+    legacy.close();
+  }
+  try {
+    const migrated = new SqliteStateStore(dbPath);
+    try {
+      assert.deepEqual(migrated.getArtifact(ref as never)?.projectIds, [projectId]);
+    } finally { migrated.close(); }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("state migration removes legacy raw process commands and verification output", () => {
   const directory = temporaryDirectory();
   const dbPath = join(directory, "aer.db");
@@ -214,6 +244,23 @@ test("concurrent artifact writers cannot overwrite stronger sensitivity metadata
     assert.equal(metadata.sensitivity, "secret");
     assert.equal(artifacts.metadata(metadata.ref)?.sensitivity, "secret");
   } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("state-owned artifact project binding cannot be widened by disk metadata", () => {
+  const directory = temporaryDirectory();
+  const state = new SqliteStateStore(join(directory, "aer.db"));
+  try {
+    const artifacts = new FileArtifactStore({ rootDir: join(directory, "artifacts"), state });
+    const artifact = artifacts.put("project evidence", { projectId: "project_one" });
+    const metadataPath = join(artifacts.rootDir, "sha256", `${artifact.digest}.json`);
+    const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as Record<string, unknown>;
+    writeFileSync(metadataPath, JSON.stringify({ ...metadata, projectIds: ["project_one", "project_two"] }), { mode: 0o600 });
+    assert.throws(() => artifacts.read(artifact.ref, { projectId: "project_two" }), (error: unknown) => (error as { code?: string }).code === "ARTIFACT_PROJECT_MISMATCH");
+    assert.equal(new TextDecoder().decode(artifacts.read(artifact.ref, { projectId: "project_one" })), "project evidence");
+  } finally {
+    state.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });

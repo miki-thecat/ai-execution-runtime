@@ -336,7 +336,7 @@ export async function runFullAlphaScenario(): Promise<FullAlphaScenarioResult> {
     steps.push(step("direct command + bounded output/artifact", "shell.run", direct));
     const directData = direct.ok ? direct.data as { readonly artifactRefs?: readonly string[] } : {};
     const directRefs = directData.artifactRefs ?? [];
-    const boundedEvidence = directRefs.every((ref) => daemon!.artifacts.has(ref as never) && daemon!.artifacts.read(ref as never).byteLength <= daemon!.budgets.maxArtifactBytes);
+    const boundedEvidence = directRefs.every((ref) => daemon!.artifacts.has(ref as never, { projectId: project.projectId }) && daemon!.artifacts.read(ref as never, { projectId: project.projectId }).byteLength <= daemon!.budgets.maxArtifactBytes);
     if (!boundedEvidence) throw new Error("bounded command evidence could not be reread");
     const artifactRef = directRefs[0];
     if (artifactRef === undefined) throw new Error("bounded command did not produce an evidence artifact");
