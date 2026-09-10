@@ -263,6 +263,10 @@ export function registerMcpOperations(daemon: AERDaemon, options: Pick<McpSurfac
       const value = input as { runIds?: readonly string[]; a?: string; b?: string };
       const runIds = value.runIds ?? [value.a, value.b].filter((id): id is string => typeof id === "string" && id.trim() !== "");
       if (runIds.length === 0 || runIds.length > 20) throw createRuntimeError({ code: "RUN_COMPARE_INPUT_INVALID", message: "run.compare requires between one and twenty run IDs", retryable: false, effect: "none" });
+      for (const runId of runIds) {
+        const run = daemon.state.getRun(runId as never);
+        if (run === undefined || run.projectId !== context.projectId) throw createRuntimeError({ code: "PROJECT_AUTHORITY_MISMATCH", message: "Input reference is not owned by the target project", retryable: false, effect: "none" });
+      }
       const comparison = compareRuns(runIds, daemon.state);
       return runtimeSuccess(comparison, createOperationMeta({ context, operation: "run.compare", status: "completed", effectClass: "read", effectState: "none", metrics: { internalCalls: 1, returnedOutputBytes: JSON.stringify(comparison).length }, summary: "Runs compared" }));
     },
