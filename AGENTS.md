@@ -4,12 +4,12 @@
 Build AI Execution Runtime (AER): a persistent execution layer for AI clients to operate a computer directly or delegate bounded work, with durable state, verification, rollback evidence, and observability.
 
 ## Authority and context
-Architecture authority is `docs/ARCHITECTURE.md`, `docs/OBSERVABILITY.md`, then `docs/FULL_ALPHA_PLAN.md`; the exact GitHub Issue defines the local scope and acceptance contract. Architecture wins on conflict. Do not redesign shared architecture inside an implementation Issue.
+Architecture authority is `docs/ARCHITECTURE.md`, `docs/OBSERVABILITY.md`, then the phase plan: `docs/POST_BETA_PLAN.md` for post-Beta/v1 work and `docs/FULL_ALPHA_PLAN.md` for historical Full Alpha scope; the exact GitHub Issue defines the local scope and acceptance contract. Architecture wins on conflict. Do not redesign shared architecture inside an implementation Issue.
 
 Use progressive disclosure: do not read canonical docs wholesale. Locate headings/terms first and read only sections relevant to the current Issue; when the Issue already restates the applicable contract, use it unless a concrete ambiguity requires the canonical doc.
 
-## Full Alpha delivery
-Work breadth-first toward a runnable product. Preserve contracts and dependency direction, complete the requested vertical capability, keep it observable, and add only contract/happy-path/critical workspace-or-effect safety tests. Defer exhaustive edge cases, compatibility polish, performance tuning, and speculative abstractions unless the Issue explicitly owns them.
+## Delivery
+Work breadth-first toward the active phase Goal. Preserve contracts and dependency direction, complete the requested vertical capability, keep it observable, and add only the acceptance evidence required by the active Goal/Issue. In post-Beta work, Goals are fixed while Issues are created just-in-time from observed failures or missing acceptance evidence. Defer exhaustive edge cases, compatibility polish, performance tuning, and speculative abstractions unless the active Goal/Issue owns them.
 
 ## Non-negotiable invariants
 - ChatGPT/AI client plans; AER v0 has no second LLM planner.
