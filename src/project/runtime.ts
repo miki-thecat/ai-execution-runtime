@@ -343,7 +343,7 @@ export class ProjectRuntime {
       const git = project.boundary.root.status === "trusted"
         ? await this.git.snapshot(project.rootDir, spanContext, gitMetrics)
         : unavailableGit(project.rootDir, project.boundary.root.code ?? "PROJECT_ROOT_DRIFT");
-      const result = this.resumeData(project, git, options);
+      const result = this.resumeData(project, git, options, operationContext.runId);
       span.record(gitMetrics);
       const event = span.complete({ summary: "Project resume pack created", artifactRefs: result.artifactRefs });
       this.persistEvent(event);
@@ -401,7 +401,7 @@ export class ProjectRuntime {
     };
   }
 
-  resumeData(project: ProjectIdentity, git: GitSnapshot, options: ProjectResumeOptions = {}): ProjectResume {
+  resumeData(project: ProjectIdentity, git: GitSnapshot, options: ProjectResumeOptions = {}, currentRunId?: RunId): ProjectResume {
     const itemLimit = validateLimit(options.itemLimit, 20);
     const eventLimit = validateLimit(options.eventLimit, 20);
     const tasks = newestEntities([
@@ -417,14 +417,14 @@ export class ProjectRuntime {
     const eventRunIds = new Set([...runIds, ...processes.map((process) => process.runId).filter((runId): runId is string => runId !== undefined)]);
     const taskSummaries = tasks.filter((task) => active(task.status)).map(taskSummary).filter((task): task is TaskSummary => task !== undefined).slice(0, itemLimit).reverse();
     const taskRunIds = new Set(tasks.filter((task) => active(task.status)).map((task) => task.runId).filter((runId): runId is string => runId !== undefined));
-    const activeRuns: RunSummary[] = runs.filter((run) => active(run.status)).slice(0, itemLimit).map((run) => ({
+    const activeRuns: RunSummary[] = runs.filter((run) => run.id !== currentRunId && active(run.status)).slice(0, itemLimit).map((run) => ({
       runId: run.id as import("../core/ids.ts").RunId,
       status: run.status as RuntimeStatus,
       updatedAt: run.updatedAt ?? run.createdAt ?? "",
       ...(stringValue(run, "summary") === undefined ? {} : { summary: boundedText(stringValue(run, "summary") as string, 1_000) }),
     })).reverse();
     const missingRunLimit = Math.max(0, itemLimit - activeRuns.length);
-    for (const runId of [...taskRunIds].filter((runId) => !runs.some((run) => run.id === runId)).slice(0, missingRunLimit)) {
+    for (const runId of [...taskRunIds].filter((runId) => runId !== currentRunId && !runs.some((run) => run.id === runId)).slice(0, missingRunLimit)) {
       const task = tasks.find((candidate) => candidate.runId === runId);
       if (task === undefined || task.status === undefined) continue;
       activeRuns.push({ runId: runId as import("../core/ids.ts").RunId, status: task.status as RuntimeStatus, updatedAt: task.updatedAt ?? task.createdAt ?? "", summary: boundedText(stringValue(task, "title") ?? "Task run", 1_000) });
