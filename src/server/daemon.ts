@@ -27,7 +27,7 @@ import {
 } from "../core/index.ts";
 import { FileArtifactStore, type ArtifactStore } from "../artifacts/index.ts";
 import { DirectExecutor, type DirectExecutionOptions, type DirectProcessManager } from "../direct/index.ts";
-import { Tracer } from "../observability/index.ts";
+import { Tracer, type RunTrace } from "../observability/index.ts";
 import { Redactor } from "../observability/redaction.ts";
 import { OperationRegistry } from "../operations/index.ts";
 import type { Operation } from "../operations/operation.ts";
@@ -566,7 +566,21 @@ export class AERDaemon {
     }
     const project = this.resolveProject(envelope.projectId ?? envelope.target?.projectId);
     const input = this.confineInput(envelope.input === undefined ? envelope.validatedInput : envelope.input, project?.rootDir);
-    const context = this.contextFor(envelope, effectClass, device, project, input);
+    const baseContext = this.contextFor(envelope, effectClass, device, project, input);
+    // A transport envelope is a user-level run even when the caller did not
+    // explicitly create a RunTrace. Claim the run only when it is not already
+    // durable so embedded callers retain ownership of their existing trace.
+    const ownedRun = this.state.getRun(baseContext.runId) === undefined
+      ? this.tracer.startRun({
+        traceId: baseContext.traceId,
+        runId: baseContext.runId,
+        actor: baseContext.actor,
+        ...(baseContext.projectId === undefined ? {} : { projectId: baseContext.projectId }),
+        ...(baseContext.deviceId === undefined ? {} : { deviceId: baseContext.deviceId }),
+        metadata: { source: "daemon" },
+      })
+      : undefined;
+    const context = ownedRun === undefined ? baseContext : createOperationContext({ ...baseContext, spanId: ownedRun.spanId });
     const requestMetadata = {
       requestId: envelope.requestId,
       ...(envelope.principal === undefined ? {} : { principal: envelope.principal }),
@@ -599,10 +613,10 @@ export class AERDaemon {
           return this.finish(envelope, context, effectClass, runtimeFailure(
             createRuntimeError({ code: "IDEMPOTENCY_CONFLICT", message: "The idempotency key is already bound to a different semantic intent", retryable: false, effect: "none", details: { receiptId, fingerprint, existingFingerprint: stored?.fingerprint } }),
             createOperationMeta({ context, operation: envelope.operation, status: "failed", effectClass, effectState: "none", summary: "Idempotency fingerprint conflict" }),
-          ));
+          ), undefined, ownedRun);
         }
         const replay = this.replayReceipt(existing, context, envelope.operation, effectClass);
-        if (stored !== undefined && replay !== undefined && idempotencyKey !== undefined) return this.finish(envelope, context, effectClass, replay as DaemonOperationResult<Output>, this.publicReceipt(stored, receiptId, idempotencyKey, true));
+        if (stored !== undefined && replay !== undefined && idempotencyKey !== undefined) return this.finish(envelope, context, effectClass, replay as DaemonOperationResult<Output>, this.publicReceipt(stored, receiptId, idempotencyKey, true), ownedRun);
       }
       const timestamp = now();
       this.state.saveEntity({
@@ -661,10 +675,10 @@ export class AERDaemon {
       this.state.saveEntity({ kind: "effect_receipts", id: receiptId, ...(project === undefined ? {} : { projectId: project.projectId }), status, createdAt: stored.createdAt, updatedAt: timestamp, data: stored as unknown as Readonly<Record<string, unknown>> });
       result = this.attachReceipt(result, this.publicReceipt(stored, receiptId, idempotencyKey, false));
     }
-    return this.finish(envelope, context, effectClass, result);
+    return this.finish(envelope, context, effectClass, result, undefined, ownedRun);
   }
 
-  private finish<T>(envelope: SemanticOperationEnvelope, context: OperationContext, effectClass: EffectClass, result: DaemonOperationResult<T>, receipt?: EffectReceipt): DaemonOperationResult<T> {
+  private finish<T>(envelope: SemanticOperationEnvelope, context: OperationContext, effectClass: EffectClass, result: DaemonOperationResult<T>, receipt?: EffectReceipt, ownedRun?: RunTrace): DaemonOperationResult<T> {
     const finalResult = receipt === undefined ? result : this.attachReceipt(result, receipt);
     const completedIdempotencyKey = envelope.idempotencyKey ?? envelope.idempotency?.key;
     this.emit({
@@ -683,6 +697,12 @@ export class AERDaemon {
       ...(finalResult.ok ? {} : { errorCode: finalResult.error.code }),
       metadata: { requestId: envelope.requestId, ...(receipt === undefined ? {} : { receiptId: receipt.receiptId, replayed: receipt.replayed === true }) },
     });
+    if (ownedRun !== undefined) {
+      if (finalResult.ok) ownedRun.complete({ operation: envelope.operation });
+      else if (finalResult.meta.status === "unknown" || finalResult.error.effect === "unknown") ownedRun.unknown(finalResult.error, { operation: envelope.operation });
+      else if (finalResult.meta.status === "cancelled") ownedRun.cancel(finalResult.error, { operation: envelope.operation });
+      else ownedRun.fail(finalResult.error, { operation: envelope.operation });
+    }
     return finalResult;
   }
 

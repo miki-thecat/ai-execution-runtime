@@ -15,7 +15,9 @@ import { CodexAgentExecutor } from "../agents/index.ts";
 import { createDirectOperations } from "../direct/index.ts";
 import { sanitizeDurableText } from "../observability/redaction.ts";
 import type { Operation } from "../operations/operation.ts";
+import type { OperationContext } from "../core/context.ts";
 import type { RuntimeBudgetOverrides } from "../policy/budgets.ts";
+import { compareRuns, summarizeRun } from "../benchmark/compare.ts";
 
 /** The modern protocol date supported by this surface. */
 export const AER_MCP_PROTOCOL_VERSION = "2026-07-28" as const;
@@ -26,6 +28,9 @@ export interface McpSurfaceOptions {
   /** Injecting a daemon is useful for embedding and keeps state AER-owned. */
   readonly daemon?: AERDaemon;
   readonly dataRoot?: string;
+  /** Deterministic provider injection is used by the offline Full Alpha dogfood. */
+  readonly github?: GitHubProvider;
+  readonly agent?: CodexAgentExecutor;
 }
 
 export type McpServerFactory = () => McpServer;
@@ -105,13 +110,13 @@ function requireProject(daemon: AERDaemon, projectId: string): ReturnType<AERDae
 }
 
 /** Register the compact adapter catalog once on an AER daemon. */
-export function registerMcpOperations(daemon: AERDaemon): AERDaemon {
+export function registerMcpOperations(daemon: AERDaemon, options: Pick<McpSurfaceOptions, "github" | "agent"> = {}): AERDaemon {
   daemon.registerDevice({ deviceId: daemon.deviceId, presence: "online" });
   const projectRuntime = new ProjectRuntime({ state: daemon.state, tracer: daemon.tracer, artifacts: daemon.artifacts, direct: daemon.direct, registry: daemon.projects });
   const tasks = new TaskManager({ state: daemon.state, tracer: daemon.tracer });
   const verification = new VerificationRunner({ state: daemon.state, tracer: daemon.tracer, artifacts: daemon.artifacts, direct: daemon.direct, registry: daemon.projects });
-  const github = new GitHubProvider({ direct: daemon.direct });
-  const agent = new CodexAgentExecutor({ state: daemon.state, tracer: daemon.tracer, artifacts: daemon.artifacts, registry: daemon.projects, tasks });
+  const github = options.github ?? new GitHubProvider({ direct: daemon.direct });
+  const agent = options.agent ?? new CodexAgentExecutor({ state: daemon.state, tracer: daemon.tracer, artifacts: daemon.artifacts, registry: daemon.projects, tasks });
 
   registerIfMissing(daemon, {
     name: "project.inspect", effectClass: "read", executor: "runtime", provider: "aer",
@@ -123,17 +128,52 @@ export function registerMcpOperations(daemon: AERDaemon): AERDaemon {
   });
   registerIfMissing(daemon, createDirectOperations(daemon.direct)[0]!);
   registerIfMissing(daemon, createDirectOperations(daemon.direct)[1]!);
-  registerIfMissing(daemon, {
-    name: "file.read", effectClass: "read", executor: "direct", provider: "node:fs",
-    execute: (input, context) => {
-      const project = requireProject(daemon, context.projectId ?? "");
-      if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
-      return createFileOperations({ rootDir: project.rootDir, state: daemon.state, tracer: daemon.tracer, artifacts: daemon.artifacts }).read(input as Parameters<ReturnType<typeof createFileOperations>["read"]>[0], context, { instrument: false });
+  // File services are rooted per project. Register the compact adapters here
+  // rather than exposing a second backend-shaped file API through MCP.
+  for (const operation of [
+    {
+      name: "file.read", effectClass: "read" as const, executor: "direct", provider: "node:fs",
+      execute: (input: unknown, context: OperationContext) => {
+        const project = requireProject(daemon, context.projectId ?? "");
+        if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
+        return createFileOperations({ rootDir: project.rootDir, state: daemon.state, tracer: daemon.tracer, artifacts: daemon.artifacts }).read(input as import("../files/index.ts").FileReadInput, context, { instrument: false });
+      },
     },
-  });
+    {
+      name: "file.search", effectClass: "read" as const, executor: "direct", provider: "node:fs/rg",
+      execute: (input: unknown, context: OperationContext) => {
+        const project = requireProject(daemon, context.projectId ?? "");
+        if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
+        return createFileOperations({ rootDir: project.rootDir, state: daemon.state, tracer: daemon.tracer, artifacts: daemon.artifacts }).search(input as import("../files/index.ts").FileSearchInput, context, { instrument: false });
+      },
+    },
+    {
+      name: "file.patch", effectClass: "workspace_write" as const, executor: "direct", provider: "node:fs",
+      execute: (input: unknown, context: OperationContext) => {
+        const project = requireProject(daemon, context.projectId ?? "");
+        if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
+        return createFileOperations({ rootDir: project.rootDir, state: daemon.state, tracer: daemon.tracer, artifacts: daemon.artifacts }).patch(input as import("../files/index.ts").FilePatchInput, context, { instrument: false });
+      },
+    },
+  ] satisfies readonly Operation<unknown, unknown>[]) registerIfMissing(daemon, operation);
   registerIfMissing(daemon, {
     name: "verify.run", effectClass: "workspace_write", executor: "direct", provider: "node:child_process",
     execute: (input, context) => verification.run({ project: context.projectId ?? "", ...(input as { checkNames?: readonly string[] }) }, context),
+  });
+  registerIfMissing(daemon, {
+    name: "artifact.read", effectClass: "read", executor: "runtime", provider: "aer",
+    execute: (input, context) => {
+      const value = input as { ref: import("../core/ids.ts").ArtifactRef; offset?: number; maxBytes?: number };
+      const offset = value.offset ?? 0;
+      const maxBytes = Math.min(value.maxBytes ?? 64 * 1024, context.budgets.maxReturnedOutputBytes, 64 * 1024);
+      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(maxBytes) || maxBytes < 0) throw createRuntimeError({ code: "ARTIFACT_READ_INVALID", message: "Artifact offset and byte bound are invalid", retryable: false, effect: "none" });
+      const metadata = daemon.artifacts.metadata(value.ref);
+      if (metadata === undefined) throw createRuntimeError({ code: "ARTIFACT_NOT_FOUND", message: "Artifact metadata is not available", retryable: false, effect: "none" });
+      const bytes = daemon.artifacts.read(value.ref, { offset, length: maxBytes });
+      const nextOffset = offset + bytes.byteLength < metadata.size ? offset + bytes.byteLength : undefined;
+      const content = new TextDecoder().decode(bytes);
+      return runtimeSuccess({ ref: value.ref, offset, content, bytes: bytes.byteLength, totalBytes: metadata.size, ...(nextOffset === undefined ? {} : { nextOffset }), hasMore: nextOffset !== undefined }, createOperationMeta({ context, operation: "artifact.read", status: "completed", effectClass: "read", effectState: "none", metrics: { internalCalls: 1, rawOutputBytes: metadata.size, returnedOutputBytes: new TextEncoder().encode(content).byteLength }, summary: "Bounded artifact read" }));
+    },
   });
   registerIfMissing(daemon, {
     name: "agent.run", effectClass: "workspace_write", executor: "agent", provider: "codex",
@@ -143,7 +183,7 @@ export function registerMcpOperations(daemon: AERDaemon): AERDaemon {
       if (projectId === undefined) throw createRuntimeError({ code: "PROJECT_REQUIRED", message: "Agent work requires a canonical project target", retryable: false, effect: "none" });
       const task = tasks.create({ projectId, title: value.title ?? value.goal ?? "Delegated agent task", ...(value.goal === undefined ? {} : { goal: value.goal }), ...((value.prompt ?? value.input) === undefined ? {} : { description: value.prompt ?? value.input }) }, context);
       const run = await agent.run({ taskId: task.taskId, projectId, runId: task.runId, title: task.title, ...(value.goal === undefined ? {} : { goal: value.goal }), ...(value.prompt === undefined ? {} : { prompt: value.prompt }), ...(value.input === undefined ? {} : { input: value.input }) }, context);
-      return runtimeSuccess(run, createOperationMeta({ context, operation: "agent.run", status: run.status === "unknown" ? "unknown" : run.status === "completed" ? "completed" : run.status === "cancelled" ? "cancelled" : "failed", effectClass: "workspace_write", effectState: run.effectState, summary: bounded(run.summary), executor: "agent", provider: "codex" }));
+      return runtimeSuccess(run, createOperationMeta({ context, operation: "agent.run", status: run.status === "unknown" ? "unknown" : run.status === "completed" ? "completed" : run.status === "cancelled" ? "cancelled" : "failed", effectClass: "workspace_write", effectState: run.effectState, metrics: { durationMs: run.metrics.durationMs, internalCalls: run.metrics.commandCount + run.metrics.toolCallCount, retries: run.metrics.retries, inputBytes: run.metrics.inputBytes, rawOutputBytes: run.metrics.rawOutputBytes, returnedOutputBytes: run.metrics.returnedOutputBytes, artifactBytes: run.metrics.artifactBytes, ...(run.metrics.usage?.inputTokens === undefined ? {} : { tokenInput: run.metrics.usage.inputTokens }), ...(run.metrics.usage?.outputTokens === undefined ? {} : { tokenOutput: run.metrics.usage.outputTokens }), ...(run.metrics.usage?.cachedInputTokens === undefined ? {} : { tokenCached: run.metrics.usage.cachedInputTokens }) }, artifactRefs: run.artifactRefs, summary: bounded(run.summary), executor: "agent", provider: "codex" }));
     },
   });
   for (const operation of createGitHubOperations(github)) registerIfMissing(daemon, operation);
@@ -156,8 +196,39 @@ export function registerMcpOperations(daemon: AERDaemon): AERDaemon {
     execute: (input, context) => {
       const runId = (input as { runId: string }).runId;
       const run = daemon.state.getRun(runId as never);
-      const events = daemon.state.listEvents({ runId: runId as never, limit: 100, order: "desc" });
-      return runtimeSuccess({ run, events }, createOperationMeta({ context, operation: "run.inspect", status: "completed", effectClass: "read", effectState: "none", summary: "Run inspected" }));
+      const events = daemon.state.listEvents({ runId: runId as never, limit: 20, order: "asc" });
+      const metrics = summarizeRun(runId, daemon.state.listEvents({ runId: runId as never, limit: 1_000, order: "asc" }), daemon.state);
+      const timeline = events.map((event) => ({
+        eventId: event.eventId,
+        timestamp: event.timestamp,
+        type: event.type,
+        ...(event.operation === undefined ? {} : { operation: event.operation }),
+        ...(event.status === undefined ? {} : { status: event.status }),
+        spanId: event.spanId,
+        ...(event.parentSpanId === undefined ? {} : { parentSpanId: event.parentSpanId }),
+        durationMs: event.durationMs,
+        internalCalls: event.internalCalls,
+        pollCountInternal: event.pollCountInternal,
+        pollCountModel: event.pollCountModel,
+        rawOutputBytes: event.rawOutputBytes,
+        returnedOutputBytes: event.returnedOutputBytes,
+        filesChanged: event.filesChanged,
+        ...(event.effectState === undefined ? {} : { effectState: event.effectState }),
+        artifactRefs: event.artifactRefs,
+        ...(event.errorCode === undefined ? {} : { errorCode: event.errorCode }),
+      }));
+      const compact = { run, events: timeline, timeline, metrics };
+      return runtimeSuccess(compact, createOperationMeta({ context, operation: "run.inspect", status: "completed", effectClass: "read", effectState: "none", metrics: { internalCalls: 1, rawOutputBytes: JSON.stringify(events).length, returnedOutputBytes: JSON.stringify(compact).length }, summary: "Run inspected" }));
+    },
+  });
+  registerIfMissing(daemon, {
+    name: "run.compare", effectClass: "read", executor: "runtime", provider: "aer",
+    execute: (input, context) => {
+      const value = input as { runIds?: readonly string[]; a?: string; b?: string };
+      const runIds = value.runIds ?? [value.a, value.b].filter((id): id is string => typeof id === "string" && id.trim() !== "");
+      if (runIds.length === 0 || runIds.length > 20) throw createRuntimeError({ code: "RUN_COMPARE_INPUT_INVALID", message: "run.compare requires between one and twenty run IDs", retryable: false, effect: "none" });
+      const comparison = compareRuns(runIds, daemon.state);
+      return runtimeSuccess(comparison, createOperationMeta({ context, operation: "run.compare", status: "completed", effectClass: "read", effectState: "none", metrics: { internalCalls: 1, returnedOutputBytes: JSON.stringify(comparison).length }, summary: "Runs compared" }));
     },
   });
   return daemon;
@@ -179,12 +250,14 @@ async function call(daemon: AERDaemon, operation: string, input: Record<string, 
 
 /** Build a fresh SDK McpServer. The daemon and its state remain shared/authoritative. */
 export function createMcpServer(options: McpSurfaceOptions = {}): McpServer {
-  const daemon = registerMcpOperations(options.daemon ?? new AERDaemon(options.dataRoot === undefined ? {} : { dataRoot: options.dataRoot }));
+  const daemon = registerMcpOperations(options.daemon ?? new AERDaemon(options.dataRoot === undefined ? {} : { dataRoot: options.dataRoot }), options);
   const server = new McpServer({ name: AER_MCP_SERVER_NAME, version: AER_MCP_SERVER_VERSION }, { instructions: "AER owns project, task, effect, budget, and run state. Client effect assertions are ignored." });
 
   server.registerTool("project.inspect", { description: "Inspect the registered project and bounded local Git state.", inputSchema: projectArgs }, async (input) => resultContent(await call(daemon, "project.inspect", input as Record<string, unknown>)));
   server.registerTool("project.resume", { description: "Resume bounded project context from AER durable state.", inputSchema: { ...projectArgs, eventLimit: z.number().int().positive().max(100).optional(), itemLimit: z.number().int().positive().max(100).optional() } }, async (input) => resultContent(await call(daemon, "project.resume", input as Record<string, unknown>)));
   server.registerTool("file.read", { description: "Read a bounded file inside the registered project root.", inputSchema: { ...projectArgs, path: z.string().min(1), startLine: z.number().int().positive().optional(), endLine: z.number().int().positive().optional(), maxBytes: z.number().int().positive().max(65536).optional() } }, async (input) => resultContent(await call(daemon, "file.read", input as Record<string, unknown>)));
+  server.registerTool("file.search", { description: "Search bounded project files and return compact matches.", inputSchema: { ...projectArgs, query: z.string().min(1), path: z.string().optional(), regex: z.boolean().optional(), maxResults: z.number().int().positive().max(100).optional(), maxBytes: z.number().int().positive().max(65536).optional() } }, async (input) => resultContent(await call(daemon, "file.search", input as Record<string, unknown>)));
+  server.registerTool("file.patch", { description: "Apply a guarded file replacement and record a ChangeSet.", inputSchema: { ...projectArgs, path: z.string().min(1), expectedHash: z.string().nullable().optional(), content: z.string().optional(), patch: z.string().optional() } }, async (input) => resultContent(await call(daemon, "file.patch", input as Record<string, unknown>)));
   server.registerTool("shell.run", { description: "Run a bounded shell command under AER policy.", inputSchema: { ...projectArgs, command: z.string().min(1).max(32768), timeoutMs: z.number().int().positive().max(600000).optional(), maxOutputBytes: z.number().int().positive().max(65536).optional() } }, async (input) => resultContent(await call(daemon, "shell.run", input as Record<string, unknown>)));
   server.registerTool("verify.run", { description: "Run the registered project verification plan.", inputSchema: { ...projectArgs, checkNames: z.array(z.string().min(1)).max(100).optional() } }, async (input) => resultContent(await call(daemon, "verify.run", input as Record<string, unknown>)));
   server.registerTool("github.snapshot", { description: "Return a bounded semantic GitHub snapshot.", inputSchema: { ...projectArgs, cwd: z.string().optional(), issueNumber: z.number().int().positive().optional(), issueNumbers: z.array(z.number().int().positive()).max(100).optional(), includeWork: z.boolean().optional() } }, async (input) => resultContent(await call(daemon, "github.snapshot", input as Record<string, unknown>)));
@@ -192,11 +265,13 @@ export function createMcpServer(options: McpSurfaceOptions = {}): McpServer {
   server.registerTool("agent.run", { description: "Delegate one bounded task to Codex through AER.", inputSchema: { ...projectArgs, title: z.string().min(1).max(500).optional(), goal: z.string().max(2000).optional(), prompt: z.string().max(32768).optional(), input: z.string().max(32768).optional() } }, async (input) => resultContent(await call(daemon, "agent.run", input as Record<string, unknown>)));
   server.registerTool("device.list", { description: "List AER-known device presence and capabilities.", inputSchema: { budgets: budgetSchema } }, async (input) => resultContent(await call(daemon, "device.list", input as Record<string, unknown>)));
   server.registerTool("run.inspect", { description: "Inspect bounded durable state for one AER run.", inputSchema: { runId: z.string().min(1), budgets: budgetSchema } }, async (input) => resultContent(await call(daemon, "run.inspect", input as Record<string, unknown>)));
+  server.registerTool("run.compare", { description: "Compare hierarchy-aware metrics for AER runs.", inputSchema: { runIds: z.array(z.string().min(1)).min(1).max(20), budgets: budgetSchema } }, async (input) => resultContent(await call(daemon, "run.compare", input as Record<string, unknown>)));
+  server.registerTool("artifact.read", { description: "Read a bounded local evidence artifact.", inputSchema: { ref: z.string().min(1), offset: z.number().int().nonnegative().optional(), maxBytes: z.number().int().nonnegative().max(65536).optional(), budgets: budgetSchema } }, async (input) => resultContent(await call(daemon, "artifact.read", input as Record<string, unknown>)));
   return server;
 }
 
 export function createMcpFactory(options: McpSurfaceOptions = {}): McpServerFactory {
-  const daemon = registerMcpOperations(options.daemon ?? new AERDaemon(options.dataRoot === undefined ? {} : { dataRoot: options.dataRoot }));
+  const daemon = registerMcpOperations(options.daemon ?? new AERDaemon(options.dataRoot === undefined ? {} : { dataRoot: options.dataRoot }), options);
   return () => createMcpServer({ daemon });
 }
 

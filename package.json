@@ -14,8 +14,10 @@
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit",
     "lint": "tsc --project tsconfig.json --noEmit",
-    "test": "node --experimental-strip-types --test test/**/*.test.ts",
-    "aer": "node --experimental-strip-types src/cli/index.ts"
+    "test": "node --experimental-strip-types --test test/*.test.ts test/e2e/*.test.ts",
+    "aer": "node --experimental-strip-types src/cli/index.ts",
+    "benchmark": "node --experimental-strip-types examples/full-alpha.ts",
+    "e2e": "node --experimental-strip-types --test test/e2e/*.test.ts"
   },
   "devDependencies": {
     "typescript": "^5.9.2"

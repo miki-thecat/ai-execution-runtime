@@ -10,6 +10,7 @@ import { probeLocalEndpoint } from "../remote/index.ts";
 import { createSemanticOperationEnvelope } from "../remote/index.ts";
 import type { RuntimeBudgetOverrides } from "../policy/budgets.ts";
 import { sanitizeDurableText } from "../observability/redaction.ts";
+import { compareRuns } from "../benchmark/compare.ts";
 
 export interface CliOptions {
   readonly dataRoot?: string;
@@ -161,8 +162,10 @@ export async function runCli(arguments_: readonly string[] = argv.slice(2), opti
       const daemon = makeDaemon(dataRoot);
       if (!http) {
         await (await import("../mcp/index.ts")).serveStdio(createMcpFactory({ daemon }));
-        finishDaemon(daemon);
-        return { ok: true, command, data: { transport: "stdio", protocol: "modern", protocolVersion: "2026-07-28" } };
+        // The stdio transport owns the process after connect. Keeping this
+        // promise pending keeps the daemon state alive and prevents the CLI
+        // JSON envelope from being written onto the MCP stdout stream.
+        return await new Promise<CliEnvelope>(() => undefined);
       }
       const port = parseNumber(args[args.indexOf("--port") + 1]) ?? 8787;
       const listener = await serveMcpHttp({ daemon, port });
@@ -221,8 +224,12 @@ export async function runCli(arguments_: readonly string[] = argv.slice(2), opti
         if (subcommand === "list") return { ok: true, command: "runs list", data: daemon.state.listEntities("runs", { limit: 100 }) };
         if (subcommand === "show" || subcommand === "compare") {
           const ids = args.slice(2).filter((value) => value !== "--json");
+          if (subcommand === "compare") {
+            if (ids.length === 0) throw Object.assign(new Error("At least one run ID is required"), { code: "CLI_RUN_ID_REQUIRED" });
+            return { ok: true, command: "runs compare", data: compareRuns(ids, daemon.state) };
+          }
           const data = ids.map((id) => daemon.state.getRun(id as never) ?? { runId: id, status: "unknown" });
-          return { ok: true, command: `runs ${subcommand}`, data: subcommand === "show" ? data[0] : { runs: data } };
+          return { ok: true, command: "runs show", data: data[0] };
         }
       }
       throw Object.assign(new Error("Unknown command"), { code: "CLI_COMMAND_UNKNOWN" });
