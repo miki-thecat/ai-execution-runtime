@@ -89,6 +89,50 @@ test("CLI init resolves relative project paths against --cwd/options cwd", async
   }
 });
 
+test("CLI init updates an existing verification plan, which requires explicit trust", async () => {
+  const root = await mkdtemp(join(tmpdir(), "aer-cli-verify-"));
+  const project = join(root, "project");
+  const dataRoot = join(root, "state");
+  await mkdir(project);
+  try {
+    const initialized = await runCli(["init", "."], { cwd: project, dataRoot });
+    assert.equal(initialized.ok, true);
+    const planned = await runCli(["init", ".", "--verify", "node -e \"process.stdout.write('changed')\""], { cwd: project, dataRoot });
+    assert.equal(planned.ok, true);
+    const rejected = await runCli(["verify"], { cwd: project, dataRoot });
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error?.code, "TRUSTED_VERIFICATION_PLAN_MISSING");
+    const trusted = await runCli(["verify", "trust"], { cwd: project, dataRoot });
+    assert.equal(trusted.ok, true);
+    const rerun = await runCli(["verify"], { cwd: project, dataRoot });
+    assert.equal(rerun.ok, true);
+    assert.equal((rerun.data as { data?: { checks?: unknown[] } }).data?.checks?.length, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("CLI init trusts a fresh verification plan with multiple checks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "aer-cli-fresh-verify-"));
+  const project = join(root, "project");
+  const dataRoot = join(root, "state");
+  await mkdir(project);
+  try {
+    const initialized = await runCli([
+      "init",
+      ".",
+      "--verify",
+      "node -e \"process.stdout.write('first')\"",
+      "--verify",
+      "node -e \"process.stdout.write('second')\"",
+    ], { cwd: project, dataRoot });
+    assert.equal(initialized.ok, true);
+    assert.equal((initialized.data as { boundary?: { verificationPlan?: { status?: string } } }).boundary?.verificationPlan?.status, "trusted");
+
+    const verified = await runCli(["verify"], { cwd: project, dataRoot });
+    assert.equal(verified.ok, true);
+    assert.equal((verified.data as { data?: { checks?: unknown[] } }).data?.checks?.length, 2);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 
 test("local CLI approval is explicit, one-shot, audited, and runs in the canonical project root", async () => {
   const root = await mkdtemp(join(tmpdir(), "aer-cli-approval-"));

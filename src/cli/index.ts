@@ -110,6 +110,18 @@ function parseNumber(value: string | undefined): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
+function parseVerifyCommands(args: readonly string[]): readonly string[] | undefined {
+  const commands: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== "--verify") continue;
+    const command = args[index + 1];
+    if (command === undefined || command.trim() === "") throw Object.assign(new Error("A verification command is required after --verify"), { code: "CLI_VERIFY_COMMAND_REQUIRED" });
+    commands.push(command);
+    index += 1;
+  }
+  return commands.length === 0 ? undefined : commands;
+}
+
 function makeDaemon(dataRoot: string, localDestructiveApproval = false): AERDaemon {
   const basePolicy = fullAlphaDefaultPolicy();
   const policy = localDestructiveApproval
@@ -155,11 +167,12 @@ export async function runCli(arguments_: readonly string[] = argv.slice(2), opti
   const cwd = resolve(options.cwd ?? selectedCwd ?? processCwd());
   try {
     if (command === "doctor") return { ok: true, command, data: await doctor(dataRoot) };
-    if (command === "help" || command === "--help" || command === "-h") return { ok: true, command: "help", data: { commands: ["doctor", "init", "inspect", "resume", "run", "verify", "github snapshot", "github wait", "agent codex", "runs list", "runs show", "runs compare", "device list", "mcp", "daemon"] } };
+    if (command === "help" || command === "--help" || command === "-h") return { ok: true, command: "help", data: { commands: ["doctor", "init", "verify", "verify trust", "inspect", "resume", "run", "github snapshot", "github wait", "agent codex", "runs list", "runs show", "runs compare", "device list", "mcp", "daemon"] } };
     if (command === "init") {
       const root = args[1] === undefined ? cwd : resolve(cwd, args[1]);
+      const verify = parseVerifyCommands(args.slice(2));
       const daemon = makeDaemon(dataRoot);
-      try { return { ok: true, command, data: daemon.registerProject({ rootDir: root }) }; }
+      try { return { ok: true, command, data: daemon.registerProject({ rootDir: root, writeConfig: verify !== undefined, ...(verify === undefined ? {} : { verify }) }) }; }
       finally { finishDaemon(daemon); }
     }
     if (command === "daemon") {
@@ -183,6 +196,10 @@ export async function runCli(arguments_: readonly string[] = argv.slice(2), opti
     }
     const daemon = makeDaemon(dataRoot);
     try {
+      if (command === "verify" && args[1] === "trust") {
+        const projectId = projectFor(daemon, cwd);
+        return { ok: true, command: "verify trust", data: daemon.projects.trustVerificationPlan(projectId) };
+      }
       if (command === "inspect" || command === "resume" || command === "verify") {
         const projectId = projectFor(daemon, cwd);
         const operation = command === "inspect" ? "project.inspect" : command === "resume" ? "project.resume" : "verify.run";
