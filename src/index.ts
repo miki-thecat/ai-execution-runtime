@@ -19,3 +19,4 @@ export * from "./remote/index.ts";
 export * from "./server/index.ts";
 export * from "./mcp/index.ts";
 export * from "./cli/index.ts";
+export * from "./benchmark/index.ts";
