@@ -15,16 +15,25 @@ import {
   TaskManager,
 } from "../src/index.ts";
 
-function fixture(prefix: string): { readonly root: string; readonly runtime: string; readonly executable: string } {
+function fixture(prefix: string, approvalMode: "legacy" | "config" = "legacy", supportsDisable = true): { readonly root: string; readonly runtime: string; readonly executable: string } {
   const root = mkdtempSync(join(tmpdir(), `${prefix}-project-`));
   const runtime = mkdtempSync(join(tmpdir(), `${prefix}-runtime-`));
   const executable = join(runtime, "codex-fixture");
+  const approvalHelp = approvalMode === "legacy" ? "--ask-for-approval --config" : "--config";
+  const disabledFeatures = ["apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use", "hooks", "image_generation", "multi_agent", "plugin_sharing", "plugins", "remote_plugin", "skill_mcp_dependency_install", "skill_search"];
+  const disableHelp = supportsDisable ? "--disable" : "";
+  const disableGate = supportsDisable ? disabledFeatures.map((feature) => `args.some((arg, index) => arg === '--disable' && args[index + 1] === '${feature}')`).join(" && ") : "true";
+  const approvalGate = approvalMode === "legacy"
+    ? "args.includes('--ask-for-approval') && args.includes('never')"
+    : "args.includes('--config') && args.includes('approval_policy=\"never\"')";
   writeFileSync(executable, `#!/usr/bin/env node
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex 0.99.0'); process.exit(0); }
-if (args[0] === 'exec' && args[1] === '--help') { console.log('--json --sandbox --ask-for-approval --ignore-user-config --ignore-rules --color --ephemeral --skip-git-repo-check --config'); process.exit(0); }
+if (args[0] === 'features') { ${supportsDisable ? `console.log('apps stable false\\nbrowser_use stable false\\nbrowser_use_external stable false\\nbrowser_use_full_cdp_access stable false\\ncomputer_use stable false\\nhooks stable false\\nimage_generation stable false\\nmulti_agent stable false\\nplugin_sharing stable false\\nplugins stable false\\nremote_plugin stable false\\nskill_mcp_dependency_install stable false\\nskill_search stable false'); process.exit(0);` : `process.exit(2);`} }
+if (args[0] === 'sandbox') process.exit(0);
+if (args[0] === 'exec' && args[1] === '--help') { console.log('--json --sandbox ${disableHelp} ${approvalHelp} --ignore-user-config --ignore-rules --color --ephemeral --skip-git-repo-check'); process.exit(0); }
 if (args[0] === 'app-server') process.exit(1);
-if (args.includes('--ignore-user-config') && args.includes('--ignore-rules') && args.includes('--ask-for-approval') && args.includes('--sandbox')) {
+if (args.includes('--ignore-user-config') && args.includes('--ignore-rules') && (${approvalGate}) && (${disableGate}) && args.includes('--config') && args.includes('web_search=\"disabled\"') && args.includes('default_permissions=\"aer_worker\"') && args.some((arg) => arg.startsWith('permissions.aer_worker.filesystem=') && arg.includes('":workspace_roots"="write"'))) {
   const output = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
   output({ type: 'thread.started', thread_id: 'thread-fixture' });
   output({ type: 'item.completed', item: { type: 'agent_message', text: process.env.GH_TOKEN ? 'secret-visible' : (process.env.AER_REQUIRED_ORDINARY || 'missing') } });
@@ -90,7 +99,8 @@ test("Codex adapter owns bounded agent lifecycle and least-privilege child postu
     assert.equal(capabilities.compatible, true);
     assert.equal(capabilities.installedVersion, "0.99.0");
     assert.equal(capabilities.appServer, "unsupported");
-    assert.deepEqual(capabilities.requiredIsolation, ["ignore-user-config", "ignore-rules"]);
+    assert.deepEqual(capabilities.requiredIsolation, ["ignore-user-config", "ignore-rules", "disable-connected-surfaces"]);
+    assert.equal(capabilities.supportedIsolation.includes("disable-connected-surfaces"), true);
     const result = await executor.run({ taskId: task.taskId, projectId: project.projectId, runId: task.runId, prompt: "say hello" }, context(project.projectId, task.taskId, task.runId));
     assert.equal(result.status, "completed");
     assert.equal(result.output, "ordinary-value");
@@ -110,6 +120,51 @@ test("Codex adapter owns bounded agent lifecycle and least-privilege child postu
     else process.env.GH_TOKEN = priorToken;
     if (priorOrdinary === undefined) delete process.env.AER_REQUIRED_ORDINARY;
     else process.env.AER_REQUIRED_ORDINARY = priorOrdinary;
+    state.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("Codex adapter supports config-based approval_policy=never used by current CLI", async () => {
+  const { root, runtime, executable } = fixture("aer-agent-modern", "config");
+  const state = new SqliteStateStore(join(runtime, "aer.db"));
+  try {
+    const registry = new ProjectRegistry({ state });
+    const project = registry.register({ rootDir: root });
+    const tasks = new TaskManager({ state });
+    const task = tasks.create({ projectId: project.projectId, title: "modern approval posture" });
+    const executor = new CodexAgentExecutor({ executable, registry, state, tasks });
+    const capabilities = await executor.capabilities();
+    assert.equal(capabilities.compatible, true);
+    assert.equal(capabilities.supportedAutomationFlags.includes("--ask-for-approval"), false);
+    assert.equal(capabilities.supportedAutomationFlags.includes("--config"), true);
+    const result = await executor.run({ taskId: task.taskId, projectId: project.projectId, runId: task.runId, prompt: "report" }, context(project.projectId, task.taskId, task.runId));
+    assert.equal(result.status, "completed");
+    assert.equal(result.capabilityPosture.approval, "never");
+  } finally {
+    state.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+
+test("Codex capability posture never claims connected suppression without the disable control", async () => {
+  const { root, runtime, executable } = fixture("aer-agent-no-disable", "legacy", false);
+  const state = new SqliteStateStore(join(runtime, "aer.db"));
+  try {
+    const registry = new ProjectRegistry({ state });
+    registry.register({ rootDir: root });
+    const executor = new CodexAgentExecutor({ executable, registry, state });
+    const capabilities = await executor.capabilities();
+    assert.equal(capabilities.compatible, false);
+    assert.equal(capabilities.incompatibilities.some((reason) => reason.includes("--disable")), true);
+    assert.equal(capabilities.capabilityPosture.apps, "unavailable");
+    assert.equal(capabilities.capabilityPosture.plugins, "unavailable");
+    assert.equal(capabilities.capabilityPosture.browser, "unavailable");
+    assert.equal(capabilities.capabilityPosture.multiAgent, "unavailable");
+  } finally {
     state.close();
     rmSync(root, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });

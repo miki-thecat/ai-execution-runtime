@@ -16,16 +16,19 @@ The scenario exercises project init/inspect/resume, direct output and artifacts,
 ## CLI and MCP
 
 ```sh
-pnpm aer -- doctor
-pnpm aer -- init .
-pnpm aer -- inspect
-pnpm aer -- resume
-pnpm aer -- run 'printf hello'
-pnpm aer -- runs list
-pnpm aer -- runs compare <run-id-a> <run-id-b>
-pnpm aer -- mcp                 # modern MCP v2 stdio
-pnpm aer -- mcp --http          # Streamable HTTP on 127.0.0.1:8787
+pnpm aer doctor
+pnpm aer init .
+pnpm aer inspect
+pnpm aer resume
+pnpm aer run 'printf hello'              # waits for approval
+pnpm aer run --approve 'printf hello'    # explicit local-CLI one-shot approval
+pnpm aer runs list
+pnpm aer runs compare <run-id-a> <run-id-b>
+pnpm aer mcp                    # modern MCP v2 stdio
+pnpm aer mcp --http             # Streamable HTTP on 127.0.0.1:8787
 ```
+
+Approval is deliberately local-CLI-only in Full Alpha: `--approve` authorizes only that one raw shell invocation and records a durable decision/audit event; MCP has no approval-grant tool.
 
 All automation-facing commands return structured JSON. AER owns project, task, effect, budget, artifact, and run state; clients can narrow budgets and assert effects, but cannot raise runtime limits or downgrade registered effect classes. Direct and delegated execution do not receive ambient secret-like environment values by default.
 

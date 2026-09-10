@@ -92,6 +92,27 @@ test("a long process is cancelled through its runtime-owned handle", async () =>
   assert.equal(sink.events.at(-1)?.effectState, "unknown");
 });
 
+test("a narrower context deadline does not leave the wider process timeout referenced after completion", async () => {
+  const sink = new InMemoryEventSink();
+  const tracer = new Tracer({ sink });
+  const run = tracer.startRun({ actor: "model" });
+  const context = createOperationContext({
+    traceId: run.traceId,
+    runId: run.runId,
+    spanId: run.spanId,
+    actor: "model",
+    effectPolicy: permissiveEffectPolicy(),
+    deadline: Date.now() + 5_000,
+  });
+  const before = process.getActiveResourcesInfo().filter((value) => value === "Timeout").length;
+  const executor = new DirectExecutor({ tracer });
+  const result = await executor.runShell({ command: "printf done", timeoutMs: 60_000 }, context);
+  assert.equal(result.ok, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  const after = process.getActiveResourcesInfo().filter((value) => value === "Timeout").length;
+  assert.equal(after, before);
+});
+
 test("deadline timeout returns a truthful cancelled result and event", async () => {
   const sink = new InMemoryEventSink();
   const tracer = new Tracer({ sink });

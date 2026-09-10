@@ -12,7 +12,7 @@ import { VerificationRunner } from "../verify/index.ts";
 import { createFileOperations } from "../files/index.ts";
 import { GitHubProvider, createGitHubOperations } from "../github/index.ts";
 import { CodexAgentExecutor } from "../agents/index.ts";
-import { createDirectOperations } from "../direct/index.ts";
+import type { ExecutableCommand, ShellRunInput } from "../direct/index.ts";
 import { sanitizeDurableText } from "../observability/redaction.ts";
 import type { Operation } from "../operations/operation.ts";
 import type { OperationContext } from "../core/context.ts";
@@ -126,8 +126,24 @@ export function registerMcpOperations(daemon: AERDaemon, options: Pick<McpSurfac
     name: "project.resume", effectClass: "read", executor: "runtime", provider: "aer",
     execute: (input, context) => projectRuntime.resume(context.projectId ?? "", context, input as { eventLimit?: number; itemLimit?: number }),
   });
-  registerIfMissing(daemon, createDirectOperations(daemon.direct)[0]!);
-  registerIfMissing(daemon, createDirectOperations(daemon.direct)[1]!);
+  registerIfMissing(daemon, {
+    name: "shell.run", effectClass: "destructive", executor: "direct", provider: "node:child_process",
+    execute: (input: unknown, context: OperationContext) => {
+      const project = requireProject(daemon, context.projectId ?? "");
+      if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
+      const value = input as ShellRunInput;
+      return daemon.direct.runShell({ ...value, cwd: value.cwd ?? project.rootDir }, context, { instrument: false });
+    },
+  });
+  registerIfMissing(daemon, {
+    name: "process.run", effectClass: "destructive", executor: "direct", provider: "node:child_process",
+    execute: (input: unknown, context: OperationContext) => {
+      const project = requireProject(daemon, context.projectId ?? "");
+      if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
+      const value = input as ExecutableCommand;
+      return daemon.direct.runExecutable({ ...value, cwd: value.cwd ?? project.rootDir }, context, { instrument: false });
+    },
+  });
   // File services are rooted per project. Register the compact adapters here
   // rather than exposing a second backend-shaped file API through MCP.
   for (const operation of [
