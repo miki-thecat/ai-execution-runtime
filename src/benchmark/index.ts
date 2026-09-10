@@ -1,3 +1,5 @@
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { measureMcpPresentation, type McpPresentationMeasurements } from "../mcp/presentation.ts";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -59,6 +61,9 @@ export interface FullAlphaScenarioResult {
   readonly comparison: RunComparison;
   readonly dogfood: readonly DogfoodCase[];
   readonly mcp: {
+    /** Repeatable offline measurements from actual HTTP MCP tool results. */
+    readonly presentation: readonly (McpPresentationMeasurements & { readonly operation: string; readonly duplicatedJsonPresentationBytes: number })[];
+    readonly presentationScope: "UTF-8 CallToolResult JSON; excludes JSON-RPC/transport framing; tokens are byte/4 proxies";
     readonly protocol: string;
     readonly listedTools: number;
     readonly listPassed: boolean;
@@ -387,6 +392,22 @@ export async function runFullAlphaScenario(): Promise<FullAlphaScenarioResult> {
     const listedTools = listed.result !== null && typeof listed.result === "object" && Array.isArray((listed.result as Record<string, unknown>).tools) ? ((listed.result as Record<string, unknown>).tools as unknown[]).length : 0;
     if (!toolResult) throw new Error("MCP initialize/list/call failed");
     const mcpRunId = daemon.state.listEvents({ type: "remote.completed", limit: 1, order: "desc" })[0]?.runId;
+    const presentation = [];
+    const representativeCalls = [
+      ["project.inspect", { projectId: project.projectId }],
+      ["project.resume", { projectId: project.projectId }],
+      ["file.search", { projectId: project.projectId, query: "needle", path: "notes.txt" }],
+      ["github.wait", { projectId: project.projectId, cwd: projectRoot, pullRequest: 7, condition: "checks_terminal", intervalMs: 1, maxPolls: 3 }],
+      ["run.inspect", { runId: searched.meta.runId }],
+      ["run.compare", { runIds: [local.meta.runId, mcpRunId!] }],
+    ] as const;
+    for (const [operation, args] of representativeCalls) {
+      const rpc = await rpcRequest(handler, 10 + presentation.length, "tools/call", { name: operation, arguments: args });
+      const result = rpc.result as CallToolResult | undefined;
+      if (result === undefined || result.isError || result.structuredContent?.data === undefined) throw new Error(`MCP benchmark failed: ${operation}`);
+      const duplicated = { ...result, content: [{ type: "text" as const, text: JSON.stringify(result.structuredContent) }] };
+      presentation.push({ operation, ...measureMcpPresentation(result), duplicatedJsonPresentationBytes: measureMcpPresentation(duplicated).presentationBytes });
+    }
     steps.push({ name: "MCP Inspector list/call", operation: "project.inspect", status: "passed", ...(mcpRunId === undefined ? {} : { runId: mcpRunId }), summary: `${listedTools} tools through the official SDK handler` });
 
     const compared = await execute("run.compare", { runIds: [...new Set([...runIds, ...(mcpRunId === undefined ? [] : [mcpRunId])])].slice(0, 20) });
@@ -433,7 +454,7 @@ export async function runFullAlphaScenario(): Promise<FullAlphaScenarioResult> {
       "fresh-client-resume": freshMetric!,
     };
     const dogfood = rdcBaseline(actual);
-    return { ok: true, scenario: "full-alpha", projectId: project.projectId, steps, runs, inspection, comparison, dogfood, mcp: { protocol: "2026-07-28", listedTools, listPassed: toolResult, callPassed: toolResult, inspector: "pass" }, plugin, tunnel, cleanup: "completed" };
+    return { ok: true, scenario: "full-alpha", projectId: project.projectId, steps, runs, inspection, comparison, dogfood, mcp: { presentation, presentationScope: "UTF-8 CallToolResult JSON; excludes JSON-RPC/transport framing; tokens are byte/4 proxies", protocol: "2026-07-28", listedTools, listPassed: toolResult, callPassed: toolResult, inspector: "pass" }, plugin, tunnel, cleanup: "completed" };
   } finally {
     await daemon?.stop();
     if (endpoint !== undefined) rmSync(endpoint, { force: true });

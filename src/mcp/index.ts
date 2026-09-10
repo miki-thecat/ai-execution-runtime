@@ -1,3 +1,4 @@
+import { measureMcpPresentation } from "./presentation.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -80,10 +81,18 @@ function json(value: unknown): string {
   catch { return JSON.stringify({ error: { code: "MCP_RESULT_NOT_SERIALIZABLE", message: "Result is not serializable" } }); }
 }
 
-function resultContent(result: DaemonOperationResult<unknown>): CallToolResult {
+function formatResultContent(result: DaemonOperationResult<unknown>): CallToolResult {
   if (result.ok) {
     const value = { data: result.data, meta: result.meta };
-    return { content: [{ type: "text", text: json(value) }], structuredContent: value };
+    const summary = {
+      operation: result.meta.operation,
+      status: result.meta.status,
+      summary: sanitizeDurableText(result.meta.summary ?? "Operation completed", 500),
+      runId: result.meta.runId,
+      truncated: result.meta.truncated,
+      details: "See structuredContent for full data and metadata.",
+    };
+    return { content: [{ type: "text", text: json(summary) }], structuredContent: value };
   }
   const error = safeError(result.error);
   const waiting = result.error.code === "EFFECT_APPROVAL_REQUIRED" || result.meta.policyDecision === "approval_required";
@@ -95,6 +104,17 @@ function resultContent(result: DaemonOperationResult<unknown>): CallToolResult {
     content: [{ type: "text", text: json(value) }],
     structuredContent: value,
   };
+}
+
+function resultContent(daemon: AERDaemon, result: DaemonOperationResult<unknown>): CallToolResult {
+  const response = formatResultContent(result);
+  const { presentationTokenProxy, ...measurements } = measureMcpPresentation(response);
+  daemon.tracer.emit({
+    type: "mcp.presented", actor: "runtime", operation: result.meta.operation,
+    traceId: result.meta.traceId, runId: result.meta.runId, spanId: result.meta.spanId,
+    metadata: { ...measurements, presentationByteQuarterProxy: presentationTokenProxy, measurementScope: "serialized MCP CallToolResult; excludes JSON-RPC and transport framing", proxyMethod: "UTF-8 presentation bytes / 4; not exact tokens" },
+  });
+  return response;
 }
 
 function projectIdFor(value: string | undefined): string | undefined {
@@ -269,20 +289,20 @@ export function createMcpServer(options: McpSurfaceOptions = {}): McpServer {
   const daemon = registerMcpOperations(options.daemon ?? new AERDaemon(options.dataRoot === undefined ? {} : { dataRoot: options.dataRoot }), options);
   const server = new McpServer({ name: AER_MCP_SERVER_NAME, version: AER_MCP_SERVER_VERSION }, { instructions: "AER owns project, task, effect, budget, and run state. Client effect assertions are ignored." });
 
-  server.registerTool("project.inspect", { description: "Inspect the registered project and bounded local Git state.", inputSchema: projectArgs }, async (input) => resultContent(await call(daemon, "project.inspect", input as Record<string, unknown>)));
-  server.registerTool("project.resume", { description: "Resume bounded project context from AER durable state.", inputSchema: { ...projectArgs, eventLimit: z.number().int().positive().max(100).optional(), itemLimit: z.number().int().positive().max(100).optional() } }, async (input) => resultContent(await call(daemon, "project.resume", input as Record<string, unknown>)));
-  server.registerTool("file.read", { description: "Read a bounded file inside the registered project root.", inputSchema: { ...projectArgs, path: z.string().min(1), startLine: z.number().int().positive().optional(), endLine: z.number().int().positive().optional(), maxBytes: z.number().int().positive().max(65536).optional() } }, async (input) => resultContent(await call(daemon, "file.read", input as Record<string, unknown>)));
-  server.registerTool("file.search", { description: "Search bounded project files and return compact matches.", inputSchema: { ...projectArgs, query: z.string().min(1), path: z.string().optional(), regex: z.boolean().optional(), maxResults: z.number().int().positive().max(100).optional(), maxBytes: z.number().int().positive().max(65536).optional() } }, async (input) => resultContent(await call(daemon, "file.search", input as Record<string, unknown>)));
-  server.registerTool("file.patch", { description: "Apply a guarded file replacement and record a ChangeSet.", inputSchema: { ...projectArgs, path: z.string().min(1), expectedHash: z.string().nullable().optional(), content: z.string().optional(), patch: z.string().optional() } }, async (input) => resultContent(await call(daemon, "file.patch", input as Record<string, unknown>)));
-  server.registerTool("shell.run", { description: "Run a bounded shell command under AER policy.", inputSchema: { ...projectArgs, command: z.string().min(1).max(32768), timeoutMs: z.number().int().positive().max(600000).optional(), maxOutputBytes: z.number().int().positive().max(65536).optional() } }, async (input) => resultContent(await call(daemon, "shell.run", input as Record<string, unknown>)));
-  server.registerTool("verify.run", { description: "Run the registered project verification plan.", inputSchema: { ...projectArgs, checkNames: z.array(z.string().min(1)).max(100).optional() } }, async (input) => resultContent(await call(daemon, "verify.run", input as Record<string, unknown>)));
-  server.registerTool("github.snapshot", { description: "Return a bounded semantic GitHub snapshot.", inputSchema: { ...projectArgs, cwd: z.string().optional(), issueNumber: z.number().int().positive().optional(), issueNumbers: z.array(z.number().int().positive()).max(100).optional(), includeWork: z.boolean().optional() } }, async (input) => resultContent(await call(daemon, "github.snapshot", input as Record<string, unknown>)));
-  server.registerTool("github.wait", { description: "Wait inside AER for GitHub checks to settle.", inputSchema: { ...projectArgs, cwd: z.string().optional(), pullRequest: z.union([z.number().int().positive(), z.string().min(1)]), condition: z.enum(["checks_terminal", "checks_passed"]).optional(), intervalMs: z.number().int().positive().max(30000).optional(), timeoutMs: z.number().int().positive().max(600000).optional(), maxPolls: z.number().int().positive().max(1000).optional() } }, async (input) => resultContent(await call(daemon, "github.wait", input as Record<string, unknown>)));
-  server.registerTool("agent.run", { description: "Delegate one bounded task to Codex through AER.", inputSchema: { ...projectArgs, title: z.string().min(1).max(500).optional(), goal: z.string().max(2000).optional(), prompt: z.string().max(32768).optional(), input: z.string().max(32768).optional() } }, async (input) => resultContent(await call(daemon, "agent.run", input as Record<string, unknown>)));
-  server.registerTool("device.list", { description: "List AER-known device presence and capabilities.", inputSchema: { budgets: budgetSchema } }, async (input) => resultContent(await call(daemon, "device.list", input as Record<string, unknown>)));
-  server.registerTool("run.inspect", { description: "Inspect bounded durable state for one AER run.", inputSchema: { runId: z.string().min(1), budgets: budgetSchema } }, async (input) => resultContent(await call(daemon, "run.inspect", input as Record<string, unknown>)));
-  server.registerTool("run.compare", { description: "Compare hierarchy-aware metrics for AER runs.", inputSchema: { runIds: z.array(z.string().min(1)).min(1).max(20), budgets: budgetSchema } }, async (input) => resultContent(await call(daemon, "run.compare", input as Record<string, unknown>)));
-  server.registerTool("artifact.read", { description: "Read a bounded local evidence artifact.", inputSchema: { ref: z.string().min(1), offset: z.number().int().nonnegative().optional(), maxBytes: z.number().int().nonnegative().max(65536).optional(), budgets: budgetSchema } }, async (input) => resultContent(await call(daemon, "artifact.read", input as Record<string, unknown>)));
+  server.registerTool("project.inspect", { description: "Inspect the registered project and bounded local Git state.", inputSchema: projectArgs }, async (input) => resultContent(daemon, await call(daemon, "project.inspect", input as Record<string, unknown>)));
+  server.registerTool("project.resume", { description: "Resume bounded project context from AER durable state.", inputSchema: { ...projectArgs, eventLimit: z.number().int().positive().max(100).optional(), itemLimit: z.number().int().positive().max(100).optional() } }, async (input) => resultContent(daemon, await call(daemon, "project.resume", input as Record<string, unknown>)));
+  server.registerTool("file.read", { description: "Read a bounded file inside the registered project root.", inputSchema: { ...projectArgs, path: z.string().min(1), startLine: z.number().int().positive().optional(), endLine: z.number().int().positive().optional(), maxBytes: z.number().int().positive().max(65536).optional() } }, async (input) => resultContent(daemon, await call(daemon, "file.read", input as Record<string, unknown>)));
+  server.registerTool("file.search", { description: "Search bounded project files and return compact matches.", inputSchema: { ...projectArgs, query: z.string().min(1), path: z.string().optional(), regex: z.boolean().optional(), maxResults: z.number().int().positive().max(100).optional(), maxBytes: z.number().int().positive().max(65536).optional() } }, async (input) => resultContent(daemon, await call(daemon, "file.search", input as Record<string, unknown>)));
+  server.registerTool("file.patch", { description: "Apply a guarded file replacement and record a ChangeSet.", inputSchema: { ...projectArgs, path: z.string().min(1), expectedHash: z.string().nullable().optional(), content: z.string().optional(), patch: z.string().optional() } }, async (input) => resultContent(daemon, await call(daemon, "file.patch", input as Record<string, unknown>)));
+  server.registerTool("shell.run", { description: "Run a bounded shell command under AER policy.", inputSchema: { ...projectArgs, command: z.string().min(1).max(32768), timeoutMs: z.number().int().positive().max(600000).optional(), maxOutputBytes: z.number().int().positive().max(65536).optional() } }, async (input) => resultContent(daemon, await call(daemon, "shell.run", input as Record<string, unknown>)));
+  server.registerTool("verify.run", { description: "Run the registered project verification plan.", inputSchema: { ...projectArgs, checkNames: z.array(z.string().min(1)).max(100).optional() } }, async (input) => resultContent(daemon, await call(daemon, "verify.run", input as Record<string, unknown>)));
+  server.registerTool("github.snapshot", { description: "Return a bounded semantic GitHub snapshot.", inputSchema: { ...projectArgs, cwd: z.string().optional(), issueNumber: z.number().int().positive().optional(), issueNumbers: z.array(z.number().int().positive()).max(100).optional(), includeWork: z.boolean().optional() } }, async (input) => resultContent(daemon, await call(daemon, "github.snapshot", input as Record<string, unknown>)));
+  server.registerTool("github.wait", { description: "Wait inside AER for GitHub checks to settle.", inputSchema: { ...projectArgs, cwd: z.string().optional(), pullRequest: z.union([z.number().int().positive(), z.string().min(1)]), condition: z.enum(["checks_terminal", "checks_passed"]).optional(), intervalMs: z.number().int().positive().max(30000).optional(), timeoutMs: z.number().int().positive().max(600000).optional(), maxPolls: z.number().int().positive().max(1000).optional() } }, async (input) => resultContent(daemon, await call(daemon, "github.wait", input as Record<string, unknown>)));
+  server.registerTool("agent.run", { description: "Delegate one bounded task to Codex through AER.", inputSchema: { ...projectArgs, title: z.string().min(1).max(500).optional(), goal: z.string().max(2000).optional(), prompt: z.string().max(32768).optional(), input: z.string().max(32768).optional() } }, async (input) => resultContent(daemon, await call(daemon, "agent.run", input as Record<string, unknown>)));
+  server.registerTool("device.list", { description: "List AER-known device presence and capabilities.", inputSchema: { budgets: budgetSchema } }, async (input) => resultContent(daemon, await call(daemon, "device.list", input as Record<string, unknown>)));
+  server.registerTool("run.inspect", { description: "Inspect bounded durable state for one AER run.", inputSchema: { runId: z.string().min(1), budgets: budgetSchema } }, async (input) => resultContent(daemon, await call(daemon, "run.inspect", input as Record<string, unknown>)));
+  server.registerTool("run.compare", { description: "Compare hierarchy-aware metrics for AER runs.", inputSchema: { runIds: z.array(z.string().min(1)).min(1).max(20), budgets: budgetSchema } }, async (input) => resultContent(daemon, await call(daemon, "run.compare", input as Record<string, unknown>)));
+  server.registerTool("artifact.read", { description: "Read a bounded local evidence artifact.", inputSchema: { ref: z.string().min(1), offset: z.number().int().nonnegative().optional(), maxBytes: z.number().int().nonnegative().max(65536).optional(), budgets: budgetSchema } }, async (input) => resultContent(daemon, await call(daemon, "artifact.read", input as Record<string, unknown>)));
   return server;
 }
 
