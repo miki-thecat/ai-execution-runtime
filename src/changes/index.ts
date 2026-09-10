@@ -1,3 +1,4 @@
+import { assertProjectRoot, authorityMismatch } from "../project/authority.ts";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -64,6 +65,7 @@ export interface ChangeSet {
   readonly traceId: OperationContext["traceId"];
   readonly runId: OperationContext["runId"];
   readonly projectId?: OperationContext["projectId"];
+  readonly rootDir?: string;
   readonly actor: OperationContext["actor"];
   readonly status: ChangeSetStatus;
   readonly createdAt: string;
@@ -331,6 +333,7 @@ export class ChangeSetManager {
 
   /** Persist evidence before a physical file mutation takes place. */
   prepare(input: ChangeSetInput): ChangeSet {
+    assertProjectRoot(this.state, input.context, this.rootDir);
     if (input.files.length === 0) throw new Error("A ChangeSet must contain at least one file");
     const requestedContentBytes = input.files.reduce((total, file) => total + (file.before?.byteLength ?? 0) + ((file.afterExists ?? true) ? file.after.byteLength : 0), 0);
     if (requestedContentBytes > input.context.budgets.maxArtifactBytes) {
@@ -360,10 +363,10 @@ export class ChangeSetManager {
         });
       }
       const beforeArtifact = beforeExists && file.before !== undefined
-        ? this.artifacts?.put(file.before, { mediaType: "text/plain", origin: "changeset.before" })
+        ? this.artifacts?.put(file.before, { ...(input.context.projectId === undefined ? {} : { projectId: input.context.projectId }), mediaType: "text/plain", origin: "changeset.before" })
         : undefined;
       const afterArtifact = afterExists
-        ? this.artifacts?.put(file.after, { mediaType: "text/plain", origin: "changeset.after" })
+        ? this.artifacts?.put(file.after, { ...(input.context.projectId === undefined ? {} : { projectId: input.context.projectId }), mediaType: "text/plain", origin: "changeset.after" })
         : undefined;
       if (beforeArtifact !== undefined) this.emitArtifact(beforeArtifact.ref, beforeArtifact.size, input.context, "changeset.before");
       if (afterArtifact !== undefined) this.emitArtifact(afterArtifact.ref, afterArtifact.size, input.context, "changeset.after");
@@ -398,6 +401,7 @@ export class ChangeSetManager {
       id,
       traceId: input.context.traceId,
       runId: input.context.runId,
+      rootDir: this.rootDir,
       ...(input.context.projectId === undefined ? {} : { projectId: input.context.projectId }),
       actor: input.context.actor,
       status: "prepared",
@@ -414,6 +418,8 @@ export class ChangeSetManager {
   }
 
   markApplied(changeset: ChangeSet, context: OperationContext): ChangeSet {
+    assertProjectRoot(this.state, context, this.rootDir);
+    if (changeset.projectId !== context.projectId || changeset.rootDir !== this.rootDir) authorityMismatch("ChangeSet binding does not match apply context");
     const applied: ChangeSet = { ...changeset, status: "applied", updatedAt: this.clock().toISOString() };
     this.persist(applied);
     this.emit("changeset.applied", applied, context);
@@ -472,10 +478,15 @@ export class ChangeSetManager {
     const { changeset, context } = input;
     let writeApplied = false;
     try {
+      assertProjectRoot(this.state, context, this.rootDir);
+      if (changeset.projectId !== context.projectId || changeset.rootDir !== this.rootDir) authorityMismatch("ChangeSet project or root does not match rollback context");
+      const durable = this.state?.getEntity("changesets", changeset.id);
+      if (durable !== undefined && (durable.projectId !== context.projectId || durable.data?.rootDir !== this.rootDir || JSON.stringify(durable.data?.files) !== JSON.stringify(changeset.files))) authorityMismatch("ChangeSet does not match durable rollback evidence");
+      if (durable === undefined && !this.snapshots.has(changeset.id)) authorityMismatch("ChangeSet has no locally owned rollback evidence");
       return this.withMutationLock(() => {
         const snapshots = this.snapshots.get(changeset.id);
         const planned = changeset.files.map((file, index) => ({ file, snapshot: snapshots?.[index] }));
-        const beforeContent = planned.map(({ file, snapshot }) => ({ file, content: this.contentForRollback(changeset.id, file, snapshot, context.budgets.maxFileReadBytes) }));
+        const beforeContent = planned.map(({ file, snapshot }) => ({ file, content: this.contentForRollback(changeset.id, file, snapshot, context.budgets.maxFileReadBytes, context.projectId) }));
         const currentStates = planned.map(({ file }) => {
           const path = resolveConfinedPath(this.rootDir, file.path, true);
           const current = currentBytes(this.rootDir, path, context.budgets.maxFileReadBytes);
@@ -525,7 +536,7 @@ export class ChangeSetManager {
     }
   }
 
-  private contentForRollback(changesetId: ChangesetId, file: ChangeSetFile, snapshot: Snapshot | undefined, maxBytes: number): Uint8Array | undefined {
+  private contentForRollback(changesetId: ChangesetId, file: ChangeSetFile, snapshot: Snapshot | undefined, maxBytes: number, projectId?: string): Uint8Array | undefined {
     if (!file.beforeExists) return undefined;
     let content: Uint8Array | undefined;
     if (snapshot?.before !== undefined) {
@@ -540,7 +551,7 @@ export class ChangeSetManager {
         const chunks: Uint8Array[] = [];
         let offset = 0;
         while (offset < metadata.size) {
-          const chunk = this.artifacts.read(file.beforeArtifactRef, { offset, length: Math.min(64 * 1024, metadata.size - offset) });
+          const chunk = this.artifacts.read(file.beforeArtifactRef, { ...(projectId === undefined ? {} : { projectId }), offset, length: Math.min(64 * 1024, metadata.size - offset) });
           if (chunk.byteLength === 0) break;
           chunks.push(chunk); offset += chunk.byteLength;
         }
@@ -585,7 +596,7 @@ export class ChangeSetManager {
       traceId: changeset.traceId,
       createdAt: changeset.createdAt,
       updatedAt: changeset.updatedAt,
-      data: { changesetId: changeset.id, summary: sanitizeDurableText(changeset.summary), diffSummary: changeset.diffSummary, files: changeset.files },
+      data: { changesetId: changeset.id, rootDir: this.rootDir, summary: sanitizeDurableText(changeset.summary), diffSummary: changeset.diffSummary, files: changeset.files },
     });
     for (const [index, file] of changeset.files.entries()) {
       const previous = this.state.getEntity("changeset_files", `${changeset.id}:${file.path}`);

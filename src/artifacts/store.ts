@@ -15,6 +15,7 @@ export const MAX_ARTIFACT_READ_BYTES = 64 * 1024;
 export type ArtifactSensitivity = Sensitivity;
 
 export interface ArtifactMetadata {
+  readonly projectIds?: readonly string[];
   readonly ref: ArtifactRef;
   readonly digest: string;
   readonly size: number;
@@ -26,6 +27,7 @@ export interface ArtifactMetadata {
 }
 
 export interface ArtifactPutOptions {
+  readonly projectId?: string;
   readonly mediaType?: string;
   readonly origin?: string;
   readonly sensitivity?: ArtifactSensitivity;
@@ -33,6 +35,7 @@ export interface ArtifactPutOptions {
 }
 
 export interface ArtifactReadOptions {
+  readonly projectId?: string;
   readonly offset?: number;
   /** Reads are capped at MAX_ARTIFACT_READ_BYTES even when a larger length is requested. */
   readonly length?: number;
@@ -44,7 +47,7 @@ export interface ArtifactStore {
   put(content: Uint8Array | string, options?: ArtifactPutOptions): ArtifactMetadata;
   metadata(ref: ArtifactRef): ArtifactMetadata | undefined;
   read(ref: ArtifactRef, options?: ArtifactReadOptions): Uint8Array;
-  has(ref: ArtifactRef): boolean;
+  has(ref: ArtifactRef, options?: ArtifactReadOptions): boolean;
 }
 
 export interface FileArtifactStoreOptions {
@@ -84,6 +87,10 @@ function maxReadLength(length: number | undefined): number {
   return Math.min(length, MAX_ARTIFACT_READ_BYTES);
 }
 
+function validProjectIds(value: unknown): value is readonly string[] {
+  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === "string" && item.length > 0));
+}
+
 function readJson(path: string): ArtifactMetadata {
   let parsed: unknown;
   try {
@@ -95,7 +102,7 @@ function readJson(path: string): ArtifactMetadata {
   const value = parsed as Record<string, unknown>;
   if (typeof value.ref !== "string" || typeof value.digest !== "string" || typeof value.size !== "number" ||
       typeof value.mediaType !== "string" || typeof value.origin !== "string" || typeof value.sensitivity !== "string" ||
-      typeof value.createdAt !== "string" || typeof value.updatedAt !== "string" || !isSensitivity(value.sensitivity)) {
+      typeof value.createdAt !== "string" || typeof value.updatedAt !== "string" || !isSensitivity(value.sensitivity) || !validProjectIds(value.projectIds)) {
     throw integrityFailure("Invalid artifact metadata");
   }
   return value as unknown as ArtifactMetadata;
@@ -103,7 +110,7 @@ function readJson(path: string): ArtifactMetadata {
 
 function validateMetadata(metadata: StoredArtifactMetadata, ref: ArtifactRef, digest: string): ArtifactMetadata {
   if (metadata.ref !== ref || metadata.digest !== digest || !Number.isSafeInteger(metadata.size) || metadata.size < 0 ||
-      !isSensitivity(metadata.sensitivity)) {
+      !isSensitivity(metadata.sensitivity) || !validProjectIds(metadata.projectIds)) {
     throw integrityFailure("Artifact metadata does not match its content address", { ref });
   }
   return metadata as ArtifactMetadata;
@@ -189,6 +196,7 @@ export class FileArtifactStore implements ArtifactStore {
     const sensitivity = previous === undefined ? requestedSensitivity : strongestSensitivity(previous.sensitivity, requestedSensitivity);
     const metadata: ArtifactMetadata = {
       ref, digest, size: bytes.byteLength,
+      projectIds: [...new Set([...(stateMetadata?.projectIds ?? diskMetadata?.projectIds ?? []), ...(options.projectId === undefined ? [] : [options.projectId])])].sort(),
       mediaType: previous?.mediaType ?? options.mediaType ?? "application/octet-stream",
       origin: previous?.origin ?? options.origin ?? "runtime",
       sensitivity,
@@ -212,7 +220,7 @@ export class FileArtifactStore implements ArtifactStore {
     if (disk !== undefined && persisted !== undefined && disk.size !== persisted.size) throw integrityFailure("Persisted artifact metadata is inconsistent", { ref });
     if (disk === undefined) return persisted;
     if (persisted === undefined) return disk;
-    return { ...disk, sensitivity: strongestSensitivity(disk.sensitivity, persisted.sensitivity) };
+    return { ...disk, projectIds: [...(persisted.projectIds ?? [])], sensitivity: strongestSensitivity(disk.sensitivity, persisted.sensitivity) };
   }
 
   read(ref: ArtifactRef, options: ArtifactReadOptions = {}): Uint8Array {
@@ -222,11 +230,12 @@ export class FileArtifactStore implements ArtifactStore {
     const length = maxReadLength(options.length ?? options.maxBytes);
     const metadata = this.metadata(ref);
     if (metadata === undefined) throw integrityFailure("Artifact metadata is missing", { ref });
+    if (options.projectId === undefined ? (metadata.projectIds?.length ?? 0) > 0 : !metadata.projectIds?.includes(options.projectId)) throw createRuntimeError({ code: "ARTIFACT_PROJECT_MISMATCH", message: "Artifact is not owned by the requested project", retryable: false, effect: "none" });
     return this.readVerified(ref, digest, metadata, offset, length);
   }
 
-  has(ref: ArtifactRef): boolean {
-    try { this.read(ref, { length: 0 }); return true; } catch { return false; }
+  has(ref: ArtifactRef, options: ArtifactReadOptions = {}): boolean {
+    try { this.read(ref, { ...options, length: 0 }); return true; } catch { return false; }
   }
 
   private withDigestLock<T>(digest: string, operation: () => T): T {

@@ -551,6 +551,7 @@ export class DirectProcessManager {
   private putArtifact(bytes: Uint8Array, stream: "stdout" | "stderr", options: ProcessStartOptions, id: ProcessId) {
     if (this.artifacts === undefined) throw new Error("Output artifact store is unavailable");
     const artifact = this.artifacts.put(bytes, {
+      ...(options.context.projectId === undefined ? {} : { projectId: options.context.projectId }),
       mediaType: "text/plain",
       origin: "direct.process." + stream,
       sensitivity: "sensitive",

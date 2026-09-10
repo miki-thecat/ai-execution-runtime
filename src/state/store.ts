@@ -60,6 +60,7 @@ export interface StateEntityQuery {
 }
 
 export interface StoredArtifactMetadata {
+  readonly projectIds?: readonly string[];
   readonly ref: ArtifactRef;
   readonly digest: string;
   readonly size: number;
@@ -518,18 +519,19 @@ export class SqliteStateStore implements StateStore {
     if (!isSensitivity(metadata.sensitivity)) throw createRuntimeError({ code: "ARTIFACT_INTEGRITY_FAILED", message: "Artifact sensitivity is invalid", retryable: false, effect: "none" });
     try {
       this.database.exec("BEGIN IMMEDIATE;");
-      const row = this.database.prepare("SELECT digest, size, sensitivity FROM artifacts WHERE artifact_ref = ?").get(metadata.ref);
+      const row = this.database.prepare("SELECT digest, size, sensitivity, project_ids_json FROM artifacts WHERE artifact_ref = ?").get(metadata.ref);
       if (row !== undefined && (stringValue(row, "digest") !== metadata.digest || numberValue(row, "size") !== metadata.size)) {
         throw createRuntimeError({ code: "ARTIFACT_INTEGRITY_FAILED", message: "Persisted artifact metadata conflicts with its content address", retryable: false, effect: "none" });
       }
       const existingSensitivity = row === undefined ? undefined : stringValue(row, "sensitivity");
       if (existingSensitivity !== undefined && !isSensitivity(existingSensitivity)) throw createRuntimeError({ code: "ARTIFACT_INTEGRITY_FAILED", message: "Persisted artifact sensitivity is invalid", retryable: false, effect: "none" });
       const sensitivity = existingSensitivity === undefined ? metadata.sensitivity : strongestSensitivity(existingSensitivity, metadata.sensitivity);
+      const projects = [...new Set([...(row === undefined ? [] : JSON.parse(stringValue(row, "project_ids_json")) as string[]), ...(metadata.projectIds ?? [])])].sort();
       this.database.prepare(`
-        INSERT INTO artifacts (artifact_ref, digest, size, media_type, origin, sensitivity, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(artifact_ref) DO UPDATE SET sensitivity=excluded.sensitivity, updated_at=excluded.updated_at
-      `).run(metadata.ref, metadata.digest, metadata.size, metadata.mediaType, metadata.origin, sensitivity, metadata.createdAt, metadata.updatedAt);
+        INSERT INTO artifacts (artifact_ref, digest, size, media_type, origin, sensitivity, created_at, updated_at, project_ids_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(artifact_ref) DO UPDATE SET sensitivity=excluded.sensitivity, updated_at=excluded.updated_at, project_ids_json=excluded.project_ids_json
+      `).run(metadata.ref, metadata.digest, metadata.size, metadata.mediaType, metadata.origin, sensitivity, metadata.createdAt, metadata.updatedAt, JSON.stringify(projects));
       this.database.exec("COMMIT;");
     } catch (error) {
       try { this.database.exec("ROLLBACK;"); } catch { /* BEGIN may not have acquired the writer lock. */ }
@@ -542,6 +544,7 @@ export class SqliteStateStore implements StateStore {
     const row = this.call(() => this.database.prepare("SELECT * FROM artifacts WHERE artifact_ref = ?").get(ref));
     if (row === undefined) return undefined;
     return {
+      projectIds: JSON.parse(stringValue(row, "project_ids_json")) as string[],
       ref: stringValue(row, "artifact_ref") as ArtifactRef,
       digest: stringValue(row, "digest"),
       size: numberValue(row, "size"),

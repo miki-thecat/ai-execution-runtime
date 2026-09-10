@@ -1,3 +1,4 @@
+import { assertProjectReferences } from "../project/authority.ts";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
@@ -312,6 +313,7 @@ export class AERDaemon {
     this.processes = this.direct.processes;
 
     const persistedLocal = this.state.listEntities("devices").find((entity) => entity.data?.local === true);
+    if (persistedLocal !== undefined && options.deviceId !== undefined && persistedLocal.id !== options.deviceId) throw daemonError("DEVICE_BINDING_CONFLICT", "Persisted local device binding cannot be replaced by a target ID");
     this.localDeviceId = options.deviceId ?? (persistedLocal?.id as DeviceId | undefined) ?? createDeviceId();
     this.localDeviceName = options.deviceName ?? (typeof persistedLocal?.data?.name === "string" ? persistedLocal.data.name : "local-device");
     this.localDeviceCapabilities = options.deviceCapabilities ?? (persistedLocal?.data?.capabilities as DeviceCapabilities | undefined) ?? { features: { local: true } };
@@ -448,6 +450,7 @@ export class AERDaemon {
       ...(envelope.idempotencyKey === undefined ? {} : { idempotencyKey: envelope.idempotencyKey }),
     });
     const effectClass = this.operations.get<unknown, unknown>(envelope.operation)?.effectClass ?? "read";
+    this.emit({ traceId: createTraceId(), runId: createRunId(), spanId: createSpanId(), type: "remote.completed", actor: "runtime", deviceId: this.localDeviceId, operation: envelope.operation ?? "unknown", status: "failed", effectClass, effectState: "none", errorCode: error.code, metadata: { rejected: true } });
     return runtimeFailure(error, createOperationMeta({ context, operation: envelope.operation ?? "unknown", status: error.effect === "unknown" ? "unknown" : "failed", effectClass, effectState: error.effect, summary: error.message }));
   }
 
@@ -565,7 +568,21 @@ export class AERDaemon {
       throw daemonError("DEVICE_CAPABILITY_MISSING", "Target device does not advertise the requested semantic operation", { operation: envelope.operation, deviceId: device.deviceId });
     }
     const project = this.resolveProject(envelope.projectId ?? envelope.target?.projectId);
+    assertProjectReferences(this.state, { ...(project === undefined ? {} : { projectId: project.projectId }), runId: envelope.runId, ...(envelope.taskId === undefined ? {} : { taskId: envelope.taskId }) });
+    const existingRun = this.state.getEntity("runs", envelope.runId);
+    if (existingRun?.data?.deviceId !== undefined && existingRun.data.deviceId !== device.deviceId) throw daemonError("DEVICE_BINDING_CONFLICT", "Run belongs to another device");
     const input = this.confineInput(envelope.input === undefined ? envelope.validatedInput : envelope.input, project?.rootDir);
+    if (input !== null && typeof input === "object") {
+      const value = input as Record<string, unknown>;
+      if (value.projectId !== undefined && value.projectId !== project?.projectId || value.deviceId !== undefined && value.deviceId !== device.deviceId) throw daemonError("REQUEST_TARGET_CONFLICT", "Input target aliases disagree with runtime binding");
+      for (const [key, kind] of [["runId", "runs"], ["taskId", "tasks"]] as const) {
+        if (value[key] === undefined) continue;
+        if (typeof value[key] !== "string") throw daemonError("REQUEST_REFERENCE_INVALID", "Reference must be an ID");
+        const entity = this.state.getEntity(kind, value[key]);
+        if (entity === undefined || entity.projectId !== project?.projectId) throw daemonError("PROJECT_AUTHORITY_MISMATCH", "Input reference is not owned by the target project");
+        if (entity.data?.deviceId !== undefined && entity.data.deviceId !== device.deviceId) throw daemonError("DEVICE_BINDING_CONFLICT", "Input reference belongs to another device");
+      }
+    }
     const baseContext = this.contextFor(envelope, effectClass, device, project, input);
     // A transport envelope is a user-level run even when the caller did not
     // explicitly create a RunTrace. Claim the run only when it is not already
@@ -580,6 +597,8 @@ export class AERDaemon {
         metadata: { source: "daemon" },
       })
       : undefined;
+    const boundRun = this.state.getEntity("runs", baseContext.runId);
+    if (boundRun !== undefined && boundRun.data?.deviceId === undefined) this.state.saveEntity({ ...boundRun, data: { ...boundRun.data, deviceId: device.deviceId } });
     const context = ownedRun === undefined ? baseContext : createOperationContext({ ...baseContext, spanId: ownedRun.spanId });
     const requestMetadata = {
       requestId: envelope.requestId,
@@ -774,6 +793,7 @@ export class AERDaemon {
     const selected = this.devices.get(deviceId ?? this.localDeviceId);
     if (selected === undefined) throw daemonError("DEVICE_NOT_FOUND", "Target device is not registered");
     if (selected.presence !== "online") throw daemonError("DEVICE_OFFLINE", "Target device is offline");
+    if (selected.deviceId !== this.localDeviceId) throw daemonError("DEVICE_TRANSPORT_UNBOUND", "Target device is not bound to this local transport");
     return selected;
   }
 

@@ -599,7 +599,7 @@ export class CodexAgentExecutor implements AgentExecutor {
     const status = statusForTerminal(terminal);
     const output = bounded(parsed.output, maxOutputBytes);
     const artifactRefs = this.captureTranscript && transcript.length > 0
-      ? [this.artifacts.put(transcript.join(""), { mediaType: "application/x-ndjson", origin: "codex.exec", sensitivity: this.transcriptSensitivity }).ref]
+      ? [this.artifacts.put(transcript.join(""), { ...(context.projectId === undefined ? {} : { projectId: context.projectId }), mediaType: "application/x-ndjson", origin: "codex.exec", sensitivity: this.transcriptSensitivity }).ref]
       : [];
     const artifactBytes = artifactRefs.reduce((total, ref) => total + (this.artifacts.metadata(ref)?.size ?? 0), 0);
     const metrics: AgentMetrics = {

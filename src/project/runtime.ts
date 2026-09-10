@@ -1,5 +1,5 @@
+import { assertProjectReferences, authorityMismatch } from "./authority.ts";
 import { createOperationContext, createRunId, createRuntimeError, createTraceId, runtimeFailure, runtimeSuccess, createOperationMeta, type OperationContext, type RuntimeError, type RuntimeResult } from "../core/index.ts";
-import { isAbsolute, relative, resolve } from "node:path";
 import type { ArtifactRef, ProjectId } from "../core/ids.ts";
 import type { EffectState } from "../core/effects.ts";
 import type { RuntimeStatus } from "../core/result.ts";
@@ -54,14 +54,6 @@ function projectView(project: ProjectIdentity): ProjectIdentityView {
     ...(project.goal === undefined ? {} : { goal: boundedText(project.goal, 2_000) }),
     boundary: project.boundary,
   };
-}
-
-function isWithinProject(rootDir: string, cwd: unknown): boolean {
-  if (typeof cwd !== "string" || cwd === "") return false;
-  const root = resolve(rootDir);
-  const candidate = resolve(cwd);
-  const pathFromRoot = relative(root, candidate);
-  return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot));
 }
 
 function unavailableGit(root: string, error: string): GitSnapshot {
@@ -175,7 +167,7 @@ function recentProjectEvents(state: StateStore | undefined, projectId: ProjectId
   if (state === undefined) return [];
   const events = new Map<string, RuntimeEvent>();
   const add = (entries: readonly RuntimeEvent[]): void => {
-    for (const event of entries) events.set(event.eventId, event);
+    for (const event of entries) if (event.projectId === projectId) events.set(event.eventId, event);
   };
   add(state.listEvents({ projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }));
   for (const runId of runIds) add(state.listEvents({ runId: runId as import("../core/ids.ts").RunId, limit: STATE_CONTEXT_LIMIT, order: "desc" }));
@@ -266,6 +258,8 @@ export class ProjectRuntime {
     });
     try {
       if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
+      if (context?.projectId !== undefined && context.projectId !== project.projectId) authorityMismatch("Project target does not match runtime context");
+      assertProjectReferences(this.state, spanContext);
       const gitMetrics: GitSnapshotMetrics = { internalCalls: 0, rawOutputBytes: 0, returnedOutputBytes: 0, artifactBytes: 0 };
       const git = project.boundary.root.status === "trusted"
         ? await this.git.snapshot(project.rootDir, spanContext, gitMetrics)
@@ -306,6 +300,8 @@ export class ProjectRuntime {
     });
     try {
       if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
+      if (context?.projectId !== undefined && context.projectId !== project.projectId) authorityMismatch("Project target does not match runtime context");
+      assertProjectReferences(this.state, spanContext);
       const gitMetrics: GitSnapshotMetrics = { internalCalls: 0, rawOutputBytes: 0, returnedOutputBytes: 0, artifactBytes: 0 };
       const git = project.boundary.root.status === "trusted"
         ? await this.git.snapshot(project.rootDir, spanContext, gitMetrics)
@@ -336,7 +332,7 @@ export class ProjectRuntime {
     const tasks = newestEntities(this.state?.listEntities("tasks", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
     const runs = newestEntities(this.state?.listEntities("runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
     const runIds = new Set([...runs.map((entity) => entity.id), ...tasks.map((entity) => entity.runId).filter((runId): runId is string => runId !== undefined)]);
-    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
+    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []).filter((process) => process.projectId === project.projectId);
     const verifications = newestEntities(this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
     const activeTasks = tasks.filter((task) => active(task.status)).map(taskSummary).filter((task): task is TaskSummary => task !== undefined).slice(0, 50).reverse();
     const activeProcesses = processes.filter((process) => active(process.status)).map((process) => ({
@@ -380,7 +376,7 @@ export class ProjectRuntime {
     const verifications = newestEntities(this.state?.listEntities("verifications", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
     const agents = newestEntities(this.state?.listEntities("agent_runs", { projectId: project.projectId, limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []);
     const runIds = new Set([...runs.map((entity) => entity.id), ...tasks.map((entity) => entity.runId).filter((runId): runId is string => runId !== undefined)]);
-    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []).filter((process) => process.projectId === project.projectId || (process.runId !== undefined && runIds.has(process.runId)) || isWithinProject(project.rootDir, process.data?.cwd));
+    const processes = newestEntities(this.state?.listEntities("processes", { limit: STATE_CONTEXT_LIMIT, order: "desc" }) ?? []).filter((process) => process.projectId === project.projectId);
     const eventRunIds = new Set([...runIds, ...processes.map((process) => process.runId).filter((runId): runId is string => runId !== undefined)]);
     const taskSummaries = tasks.filter((task) => active(task.status)).map(taskSummary).filter((task): task is TaskSummary => task !== undefined).slice(0, itemLimit).reverse();
     const taskRunIds = new Set(tasks.filter((task) => active(task.status)).map((task) => task.runId).filter((runId): runId is string => runId !== undefined));

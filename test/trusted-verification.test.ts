@@ -287,7 +287,7 @@ test("verify.run shares its response budget across noisy passing checks and spil
       for (const ref of check.artifactRefs) {
         assert.ok(evidence.artifactRefs.includes(ref));
         assert.ok(result.meta.artifactRefs.includes(ref));
-        assert.equal(Buffer.from(artifacts.read(ref)).toString(), output);
+        assert.equal(Buffer.from(artifacts.read(ref, { projectId: project.projectId })).toString(), output);
       }
     }
     assert.equal(result.meta.metrics.rawOutputBytes, Buffer.byteLength(output) * 6);
@@ -334,7 +334,7 @@ for (const exitCode of [0, 1]) {
         assert.ok(check.artifactRefs.length > 0);
         for (const ref of check.artifactRefs) {
           assert.ok(durable.artifactRefs.includes(ref));
-          assert.equal(Buffer.from(artifacts.read(ref)).toString(), output);
+          assert.equal(Buffer.from(artifacts.read(ref, { projectId: project.projectId })).toString(), output);
         }
       }
       if (result.ok) {

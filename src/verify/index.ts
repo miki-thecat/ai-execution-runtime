@@ -1,3 +1,4 @@
+import { assertProjectReferences, authorityMismatch } from "../project/authority.ts";
 import { createOperationContext, createRunId, createRuntimeError, createTraceId, createVerificationId, runtimeFailure, runtimeSuccess, type OperationContext, type ProjectId, type RuntimeError, type RuntimeResult } from "../core/index.ts";
 import type { ArtifactRef, VerificationId } from "../core/ids.ts";
 import type { EffectState } from "../core/effects.ts";
@@ -259,6 +260,8 @@ export class VerificationRunner {
     let verificationId: VerificationId | undefined;
     try {
       if (project === undefined) throw createRuntimeError({ code: "PROJECT_NOT_FOUND", message: "Project is not registered", retryable: false, effect: "none" });
+      if (context?.projectId !== undefined && context.projectId !== project.projectId) authorityMismatch("Verification target does not match the project context");
+      assertProjectReferences(this.state, operationContext);
       if (project.boundary.root.status !== "trusted") throw createRuntimeError({ code: project.boundary.root.code ?? "PROJECT_ROOT_DRIFT", message: "Registered project root provenance is not trusted", retryable: false, effect: "none" });
       if (project.boundary.identity.status !== "trusted") throw createRuntimeError({ code: project.boundary.identity.code ?? "PROJECT_IDENTITY_DRIFT", message: "Repository project identity does not match the durable registry", retryable: false, effect: "none" });
       const registeredPlan = project.trustedVerificationPlan;

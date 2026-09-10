@@ -1,3 +1,4 @@
+import { assertProjectReferences, authorityMismatch } from "../project/authority.ts";
 import {
   createRuntimeError,
   createSpanId,
@@ -132,6 +133,8 @@ export class TaskManager {
     const runId = input.runId ?? context?.runId ?? createRunId();
     const traceId = input.traceId ?? context?.traceId ?? createTraceId();
     const projectId = input.projectId ?? context?.projectId;
+    if (context !== undefined && input.projectId !== undefined && input.projectId !== context.projectId) authorityMismatch("Task project aliases disagree");
+    assertProjectReferences(this.state, { ...(projectId === undefined ? {} : { projectId }), runId });
     const task: TaskRecord = {
       taskId,
       id: taskId,
@@ -179,6 +182,8 @@ export class TaskManager {
 
   transition(taskId: TaskId, requestedStatus: TaskStatusInput | TaskTransitionRequest, input: TransitionTaskInput = {}, context?: OperationContext): TaskRecord {
     const current = this.require(taskId);
+    if (context !== undefined && current.projectId !== context.projectId) authorityMismatch("Task belongs to a different project");
+    if (context !== undefined) assertProjectReferences(this.state, context);
     const request = typeof requestedStatus === "string" ? undefined : requestedStatus;
     const status = normalizeStatus(typeof requestedStatus === "string" ? requestedStatus : requestedStatus.status);
     const transitionInput = request === undefined ? input : request;

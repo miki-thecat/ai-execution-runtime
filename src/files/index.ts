@@ -1,3 +1,4 @@
+import { assertProjectRoot } from "../project/authority.ts";
 import { spawnSync } from "node:child_process";
 import { chmodSync, closeSync, existsSync, openSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
@@ -216,6 +217,7 @@ export class FileOperations {
   readonly changes: ChangeSetManager;
   readonly tracer: Tracer;
   private readonly artifacts: ArtifactStore | undefined;
+  private readonly state: ChangeSetManagerOptions["state"];
   private readonly maxReadBytes: number;
   private readonly maxSearchResults: number;
 
@@ -223,6 +225,7 @@ export class FileOperations {
     this.rootDir = resolveConfinedPath(options.rootDir, ".", false);
     this.tracer = options.tracer ?? new Tracer();
     this.artifacts = options.artifacts;
+    this.state = options.state;
     this.maxReadBytes = validLimit(options.maxReadBytes, DEFAULT_MAX_FILE_READ_BYTES, "maxReadBytes");
     this.maxSearchResults = validLimit(options.maxSearchResults, DEFAULT_MAX_SEARCH_RESULTS, "maxSearchResults");
     this.changes = new ChangeSetManager({ ...options, rootDir: this.rootDir, tracer: this.tracer });
@@ -232,6 +235,7 @@ export class FileOperations {
     const instrumentation = this.start("file.read", "read", context, options.instrument !== false);
     const operationContext = instrumentation.context;
     try {
+      assertProjectRoot(this.state, operationContext, this.rootDir);
       assertEffectAllowed(operationContext, "read");
       assertDeadline(operationContext);
       const requestBytes = inputBytes(input);
@@ -285,6 +289,7 @@ export class FileOperations {
     const instrumentation = this.start("file.search", "read", context, options.instrument !== false);
     const operationContext = instrumentation.context;
     try {
+      assertProjectRoot(this.state, operationContext, this.rootDir);
       assertEffectAllowed(operationContext, "read");
       assertDeadline(operationContext);
       const requestBytes = inputBytes(input);
@@ -313,6 +318,7 @@ export class FileOperations {
     const operationContext = instrumentation.context;
     let writeApplied = false;
     try {
+      assertProjectRoot(this.state, operationContext, this.rootDir);
       assertEffectAllowed(operationContext, "workspace_write");
       assertDeadline(operationContext);
       const requestBytes = inputBytes(input);
@@ -454,7 +460,7 @@ export class FileOperations {
 
   private putArtifact(content: Uint8Array, origin: string, context: OperationContext): readonly ArtifactRef[] {
     if (this.artifacts === undefined) return [];
-    const artifact = this.artifacts.put(content, { mediaType: "text/plain", origin });
+    const artifact = this.artifacts.put(content, { ...(context.projectId === undefined ? {} : { projectId: context.projectId }), mediaType: "text/plain", origin });
     this.tracer?.emit({ traceId: context.traceId, runId: context.runId, spanId: context.spanId ?? "span_uninstrumented" as import("../core/index.ts").SpanId, ...(context.parentSpanId === undefined ? {} : { parentSpanId: context.parentSpanId }), type: "artifact.created", actor: context.actor, ...(context.taskId === undefined ? {} : { taskId: context.taskId }), ...(context.projectId === undefined ? {} : { projectId: context.projectId }), artifactRefs: [artifact.ref], measurements: { artifactBytes: artifact.size }, metadata: { origin } });
     return [artifact.ref];
   }
