@@ -146,7 +146,9 @@ function writeCodexFixture(directory: string): string {
   writeFileSync(executable, `#!/usr/bin/env node
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex 0.99.0'); process.exit(0); }
-if (args[0] === 'exec' && args[1] === '--help') { console.log('--json --sandbox --ask-for-approval --ignore-user-config --ignore-rules --color --ephemeral --skip-git-repo-check'); process.exit(0); }
+if (args[0] === 'features') { console.log('apps stable false\\nbrowser_use stable false\\nbrowser_use_external stable false\\nbrowser_use_full_cdp_access stable false\\ncomputer_use stable false\\nhooks stable false\\nimage_generation stable false\\nmulti_agent stable false\\nplugin_sharing stable false\\nplugins stable false\\nremote_plugin stable false\\nskill_mcp_dependency_install stable false\\nskill_search stable false'); process.exit(0); }
+if (args[0] === 'sandbox') process.exit(0);
+if (args[0] === 'exec' && args[1] === '--help') { console.log('--json --sandbox --disable --config --ask-for-approval --ignore-user-config --ignore-rules --color --ephemeral --skip-git-repo-check'); process.exit(0); }
 if (args[0] === 'app-server') process.exit(1);
 if (args[0] === 'exec') {
   const output = (value) => process.stdout.write(JSON.stringify(value) + '\\n');

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { env as parentEnvironment } from "node:process";
 import type { RunId } from "../core/ids.ts";
 import { createSpanId, createRuntimeError, isDeadlineExceeded, type OperationContext, type RuntimeError } from "../core/index.ts";
@@ -47,8 +47,25 @@ const SAFE_BASELINE_KEYS = [
   "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR", "CI",
 ] as const;
 const SAFE_ORDINARY_ENVIRONMENT = /^(?:SHELL|HOSTNAME|LANGUAGE|TZ|COLORTERM|FORCE_COLOR|CONTINUOUS_INTEGRATION|AER_[A-Z0-9_]+|ACP_[A-Z0-9_]+)$/i;
-const REQUIRED_FLAGS = ["--json", "--sandbox", "--ignore-user-config", "--ignore-rules"] as const;
+const REQUIRED_FLAGS = ["--json", "--sandbox", "--ignore-user-config", "--ignore-rules", "--disable", "--config"] as const;
 const KNOWN_FLAGS = [...REQUIRED_FLAGS, "--ask-for-approval", "--color", "--ephemeral", "--config", "--skip-git-repo-check"] as const;
+// Keep this aligned with the controller worker posture: delegated AER agents
+// need repository shell/file capabilities, not ambient connected surfaces.
+const DISABLED_CONNECTED_FEATURES = [
+  "apps",
+  "browser_use",
+  "browser_use_external",
+  "browser_use_full_cdp_access",
+  "computer_use",
+  "hooks",
+  "image_generation",
+  "multi_agent",
+  "plugin_sharing",
+  "plugins",
+  "remote_plugin",
+  "skill_mcp_dependency_install",
+  "skill_search",
+] as const;
 const DEFAULT_CREDENTIAL_CLASSIFIERS: readonly CredentialClassifier[] = [
   { name: "token", pattern: /token/i },
   { name: "secret", pattern: /secret/i },
@@ -85,6 +102,7 @@ interface BuiltEnvironment {
 
 interface PreparedExecution {
   readonly project: ProjectIdentity;
+  readonly executable: string;
   readonly prompt: string;
   readonly args: readonly string[];
   readonly environment: BuiltEnvironment;
@@ -118,25 +136,64 @@ function versionOf(output: string): string | undefined {
   return match?.[0];
 }
 
+function resolvedExecutable(executable: string, environment: Readonly<Record<string, string | undefined>>): string | undefined {
+  const candidates = isAbsolute(executable) || executable.includes("/")
+    ? [resolve(executable)]
+    : (environment.PATH ?? "").split(":").filter(Boolean).map((entry) => resolve(entry, executable));
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return realpathSync(candidate);
+    } catch { /* Try the next PATH entry. */ }
+  }
+  return undefined;
+}
+
+function connectedFeatureArgs(): string[] {
+  return DISABLED_CONNECTED_FEATURES.flatMap((feature) => ["--disable", feature]);
+}
+
+function connectedSuppressionProven(output: string): boolean {
+  const states = new Map<string, string>();
+  for (const line of output.split(/\r?\n/)) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length >= 3) states.set(fields[0]!, fields.at(-1)!);
+  }
+  return DISABLED_CONNECTED_FEATURES.every((feature) => states.get(feature) === "false");
+}
+
+function permissionProfileArgs(executableDir: string, workspaceAccess: "read" | "write", network: boolean): string[] {
+  const filesystem = `{":minimal"="read",":workspace_roots"="${workspaceAccess}",${JSON.stringify(executableDir)}="read"}`;
+  return [
+    "--config", 'default_permissions="aer_worker"',
+    "--config", `permissions.aer_worker.filesystem=${filesystem}`,
+    "--config", `permissions.aer_worker.network={enabled=${network ? "true" : "false"}}`,
+    "--config", 'web_search="disabled"',
+  ];
+}
+
 function flagsFromHelp(output: string): readonly string[] {
   return KNOWN_FLAGS.filter((flag) => new RegExp(`(^|\\s)${flag.replaceAll("-", "\\-")}(?:[=,\\s]|$)`).test(output));
 }
 
-function capabilityPosture(network: "suppressed" | "granted" = "suppressed", sandbox: CapabilityPosture["sandbox"] = "read-only"): CapabilityPosture {
+function capabilityPosture(
+  network: CapabilityPosture["network"] = "unavailable",
+  sandbox: CapabilityPosture["sandbox"] = "read-only",
+  connected: "suppressed" | "unavailable" = "unavailable",
+): CapabilityPosture {
   return {
     userConfig: "ignored",
     execPolicy: "ignored",
     sandbox,
     approval: "never",
-    apps: "suppressed",
-    plugins: "suppressed",
-    hooks: "suppressed",
-    browser: "suppressed",
-    computerUse: "suppressed",
-    remotePlugins: "suppressed",
-    multiAgent: "suppressed",
+    apps: connected,
+    plugins: connected,
+    hooks: connected,
+    browser: connected,
+    computerUse: connected,
+    remotePlugins: connected,
+    multiAgent: connected,
     network,
-  } as CapabilityPosture;
+  };
 }
 
 function credentialClass(key: string, classifiers: readonly CredentialClassifier[]): string | undefined {
@@ -244,6 +301,7 @@ export class CodexAgentExecutor implements AgentExecutor {
   readonly tracer: Tracer;
   readonly provider = PROVIDER;
   private readonly executable: string;
+  private resolvedExecutablePath: string | undefined;
   private readonly registry: CodexExecutorOptions["registry"];
   private readonly state: StateStore | undefined;
   private readonly artifacts: ArtifactStore;
@@ -332,17 +390,27 @@ export class CodexAgentExecutor implements AgentExecutor {
   private async detectCapabilities(context?: OperationContext): Promise<AgentCapabilities> {
     const detectedAt = this.tracer.now().toISOString();
     const environment = environmentFor(this.environmentOptions);
+    const executable = resolvedExecutable(this.executable, environment.values);
+    if (executable === undefined) return this.capabilityResult(detectedAt, undefined, [], "unsupported", ["codex executable is unavailable"], false);
+    this.resolvedExecutablePath = executable;
     let versionProbe: ProbeResult;
-    try { versionProbe = await this.probe(["--version"], environment.values, context); }
-    catch { return this.capabilityResult(detectedAt, undefined, [], "unsupported", ["codex executable is unavailable"]); }
+    try { versionProbe = await this.probe(executable, ["--version"], environment.values, context); }
+    catch { return this.capabilityResult(detectedAt, undefined, [], "unsupported", ["codex executable is unavailable"], false); }
     const installedVersion = versionOf(versionProbe.stdout);
     let help: ProbeResult;
-    try { help = await this.probe(["exec", "--help"], environment.values, context); }
+    try { help = await this.probe(executable, ["exec", "--help"], environment.values, context); }
     catch { help = { code: null, signal: null, stdout: "" }; }
     const supportedFlags = flagsFromHelp(help.stdout);
+    let suppressionProven = false;
+    if (supportedFlags.includes("--disable")) {
+      try {
+        const featureProbe = await this.probe(executable, ["features", ...connectedFeatureArgs(), "list"], environment.values, context);
+        suppressionProven = featureProbe.code === 0 && connectedSuppressionProven(featureProbe.stdout);
+      } catch { suppressionProven = false; }
+    }
     let appServer: CodexCapabilityProbe["appServer"] = "unsupported";
     try {
-      const appHelp = await this.probe(["app-server", "--help"], environment.values, context);
+      const appHelp = await this.probe(executable, ["app-server", "--help"], environment.values, context);
       appServer = appHelp.code === 0 ? "available" : "unsupported";
     } catch { appServer = "unsupported"; }
     const missing = REQUIRED_FLAGS.filter((flag) => !supportedFlags.includes(flag));
@@ -353,8 +421,9 @@ export class CodexAgentExecutor implements AgentExecutor {
       ...(help.code !== 0 ? ["codex exec --help did not complete successfully"] : []),
       ...(missing.length === 0 ? [] : [`required automation flags are unavailable: ${missing.join(", ")}`]),
       ...(hasNeverApprovalControl ? [] : ["installed Codex cannot enforce non-interactive approval_policy=never"]),
+      ...(suppressionProven ? [] : ["connected Codex feature suppression could not be proven"]),
     ];
-    return this.capabilityResult(detectedAt, installedVersion, supportedFlags, appServer, incompatibilities);
+    return this.capabilityResult(detectedAt, installedVersion, supportedFlags, appServer, incompatibilities, suppressionProven);
   }
 
   private capabilityResult(
@@ -363,6 +432,7 @@ export class CodexAgentExecutor implements AgentExecutor {
     supportedFlags: readonly string[],
     appServer: CodexCapabilityProbe["appServer"],
     incompatibilities: readonly string[],
+    suppressionProven = false,
   ): AgentCapabilities {
     const compatible = incompatibilities.length === 0;
     const capabilities = {
@@ -385,11 +455,18 @@ export class CodexAgentExecutor implements AgentExecutor {
       capabilities,
       supportedCapabilities: [...supportedCapabilities, ...(appServer === "available" ? ["app_server" as const] : [])],
       appServer,
-      requiredIsolation: ["ignore-user-config", "ignore-rules"],
-      supportedIsolation: supportedFlags.filter((flag) => flag === "--ignore-user-config" || flag === "--ignore-rules").map((flag) => flag.slice(2)),
+      requiredIsolation: ["ignore-user-config", "ignore-rules", "disable-connected-surfaces"],
+      supportedIsolation: [
+        ...supportedFlags.filter((flag) => flag === "--ignore-user-config" || flag === "--ignore-rules").map((flag) => flag.slice(2)),
+        ...(suppressionProven ? ["disable-connected-surfaces"] : []),
+      ],
       supportedAutomationFlags: supportedFlags,
       incompatibilities,
-      capabilityPosture: capabilityPosture(),
+      capabilityPosture: capabilityPosture(
+        supportedFlags.includes("--config") ? "suppressed" : "unavailable",
+        "read-only",
+        suppressionProven ? "suppressed" : "unavailable",
+      ),
     };
   }
 
@@ -424,21 +501,26 @@ export class CodexAgentExecutor implements AgentExecutor {
     if (!capabilities.compatible) throw createRuntimeError({ code: "AGENT_INCOMPATIBLE", message: "Installed Codex cannot provide the required isolated non-interactive contract", retryable: false, effect: "none", details: { reasons: capabilities.incompatibilities } });
     const sandbox = canWrite ? "workspace-write" : "read-only";
     const network = this.grantNetwork && canNetwork;
-    if (network && !capabilities.supportedAutomationFlags.includes("--config")) throw createRuntimeError({ code: "AGENT_NETWORK_UNSUPPORTED", message: "The installed Codex cannot express the requested network posture", retryable: false, effect: "none" });
-    const args: string[] = ["exec", "--json", "--ignore-user-config", "--ignore-rules", "--sandbox", sandbox];
+    const executable = this.resolvedExecutablePath ?? resolvedExecutable(this.executable, environment.values);
+    if (executable === undefined) throw createRuntimeError({ code: "AGENT_EXECUTABLE_UNRESOLVED", message: "Codex executable path cannot be resolved for the isolated permission profile", retryable: false, effect: "none" });
+    this.resolvedExecutablePath = executable;
+    const workspaceAccess = canWrite ? "write" : "read";
+    const profileArgs = permissionProfileArgs(dirname(executable), workspaceAccess, network);
+    await this.preflightSandbox(executable, project.rootDir, profileArgs, canWrite, environment.values, context);
+    const args: string[] = ["exec", "--json", "--ignore-user-config", "--ignore-rules", ...connectedFeatureArgs(), ...profileArgs];
     if (capabilities.supportedAutomationFlags.includes("--ask-for-approval")) args.push("--ask-for-approval", "never");
     else args.push("--config", 'approval_policy="never"');
     if (capabilities.supportedAutomationFlags.includes("--color")) args.push("--color", "never");
     if (capabilities.supportedAutomationFlags.includes("--ephemeral")) args.push("--ephemeral");
     if (capabilities.supportedAutomationFlags.includes("--skip-git-repo-check")) args.push("--skip-git-repo-check");
-    if (network) args.push("--config", `${sandbox}.network_access=true`);
     args.push(prompt);
     return {
       project,
+      executable,
       prompt,
       args,
       environment,
-      posture: capabilityPosture(network ? "granted" : "suppressed", sandbox),
+      posture: capabilityPosture(network ? "granted" : "suppressed", sandbox, "suppressed"),
       effectClass: canWrite ? "workspace_write" : "read",
       capabilities,
     };
@@ -454,7 +536,7 @@ export class CodexAgentExecutor implements AgentExecutor {
     let stderr = "";
     const processStarted = this.tracer.now();
     let child: AgentChildProcess;
-    try { child = this.spawnProcess(this.executable, prepared.args, { cwd: prepared.project.rootDir, env: prepared.environment.values, stdio: ["ignore", "pipe", "pipe"] }); }
+    try { child = this.spawnProcess(prepared.executable, prepared.args, { cwd: prepared.project.rootDir, env: prepared.environment.values, stdio: ["ignore", "pipe", "pipe"] }); }
     catch (cause) {
       const error = errorFor(cause, "AGENT_SPAWN_FAILED");
       return this.finishWithoutProcess(this.baseRun(agentRunId, task, context, "failed", "failed", error.effect, startedAt, this.tracer.now().toISOString(), "", error.message, this.emptyMetrics(byteLength(prepared.prompt), false), prepared.posture, prepared.environment.evidence, [], undefined, error), "failed", error);
@@ -678,8 +760,27 @@ export class CodexAgentExecutor implements AgentExecutor {
     if (this.state !== undefined && this.state.getEvent(event.eventId) === undefined) this.state.append(event);
   }
 
-  private async probe(args: readonly string[], environment: Readonly<Record<string, string | undefined>>, context?: OperationContext): Promise<ProbeResult> {
-    const child = this.spawnProcess(this.executable, args, { cwd: tmpdir(), env: environment, stdio: ["ignore", "pipe", "pipe"] });
+  private async preflightSandbox(
+    executable: string,
+    workspace: string,
+    profileArgs: readonly string[],
+    canWrite: boolean,
+    environment: Readonly<Record<string, string | undefined>>,
+    context: OperationContext,
+  ): Promise<void> {
+    const base = ["sandbox", ...profileArgs, "-P", "aer_worker", "-C", workspace, "--"];
+    const commands: readonly (readonly string[])[] = [
+      ["/usr/bin/true"],
+      ...(canWrite ? [["/bin/sh", "-ceu", 'umask 077; probe="$1"; set -C; : > "$probe"; rm -f -- "$probe"', "aer-workspace-write-probe", `.aer-write-probe-${createAgentRunId()}`] as const] : []),
+    ];
+    for (const command of commands) {
+      const result = await this.probe(executable, [...base, ...command], environment, context);
+      if (result.code !== 0) throw createRuntimeError({ code: "AGENT_SANDBOX_PREFLIGHT_FAILED", message: "Codex isolated permission profile failed before model execution", retryable: false, effect: "none", details: { exitCode: result.code, signal: result.signal } });
+    }
+  }
+
+  private async probe(executable: string, args: readonly string[], environment: Readonly<Record<string, string | undefined>>, context?: OperationContext): Promise<ProbeResult> {
+    const child = this.spawnProcess(executable, args, { cwd: tmpdir(), env: environment, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let settled = false;
     const configuredDeadline = context?.deadline;
