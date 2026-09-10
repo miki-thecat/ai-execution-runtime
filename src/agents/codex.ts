@@ -15,6 +15,7 @@ import type { RuntimeStatus } from "../core/result.ts";
 import type { StateStore } from "../state/store.ts";
 import { TaskManager } from "../tasks/index.ts";
 import { CodexJsonlParser } from "./jsonl.ts";
+import { linkedWorktreeCommonDir } from "./git-metadata.ts";
 import {
   createAgentRunId,
   DEFAULT_AGENT_ACTOR,
@@ -161,8 +162,9 @@ function connectedSuppressionProven(output: string): boolean {
   return DISABLED_CONNECTED_FEATURES.every((feature) => states.get(feature) === "false");
 }
 
-function permissionProfileArgs(executableDir: string, workspaceAccess: "read" | "write", network: boolean): string[] {
-  const filesystem = `{":minimal"="read",":workspace_roots"="${workspaceAccess}",${JSON.stringify(executableDir)}="read"}`;
+function permissionProfileArgs(executableDir: string, workspaceAccess: "read" | "write", network: boolean, gitCommonDir?: string): string[] {
+  const readRoots = [...new Set([executableDir, ...(gitCommonDir === undefined ? [] : [gitCommonDir])])];
+  const filesystem = `{":minimal"="read",":workspace_roots"="${workspaceAccess}",${readRoots.map((path) => `${JSON.stringify(path)}="read"`).join(",")}}`;
   return [
     "--config", 'default_permissions="aer_worker"',
     "--config", `permissions.aer_worker.filesystem=${filesystem}`,
@@ -505,7 +507,7 @@ export class CodexAgentExecutor implements AgentExecutor {
     if (executable === undefined) throw createRuntimeError({ code: "AGENT_EXECUTABLE_UNRESOLVED", message: "Codex executable path cannot be resolved for the isolated permission profile", retryable: false, effect: "none" });
     this.resolvedExecutablePath = executable;
     const workspaceAccess = canWrite ? "write" : "read";
-    const profileArgs = permissionProfileArgs(dirname(executable), workspaceAccess, network);
+    const profileArgs = permissionProfileArgs(dirname(executable), workspaceAccess, network, linkedWorktreeCommonDir(project.rootDir));
     await this.preflightSandbox(executable, project.rootDir, profileArgs, canWrite, environment.values, context);
     const args: string[] = ["exec", "--json", "--ignore-user-config", "--ignore-rules", ...connectedFeatureArgs(), ...profileArgs];
     if (capabilities.supportedAutomationFlags.includes("--ask-for-approval")) args.push("--ask-for-approval", "never");

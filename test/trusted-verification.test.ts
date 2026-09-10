@@ -5,10 +5,12 @@ import { join } from "node:path";
 import test from "node:test";
 import { FileArtifactStore } from "../src/artifacts/index.ts";
 import type { ProjectId } from "../src/core/index.ts";
+import { sanitizeDurableText } from "../src/observability/redaction.ts";
 import { InMemoryEventSink, Tracer } from "../src/observability/index.ts";
 import { projectConfigPath, ProjectRegistry, ProjectRuntime, writeProjectConfig, type ProjectIdentity } from "../src/project/index.ts";
 import { SqliteStateStore } from "../src/state/index.ts";
-import { VerificationRunner } from "../src/verify/index.ts";
+import { AERDaemon, createSemanticOperationEnvelope, permissiveEffectPolicy } from "../src/index.ts";
+import { createVerifyRunOperation, type VerificationEvidence, VerificationRunner } from "../src/verify/index.ts";
 
 function fixture(prefix: string): { root: string; runtimeRoot: string; dbPath: string } {
   const root = mkdtempSync(join(tmpdir(), `${prefix}-project-`));
@@ -243,3 +245,114 @@ test("verification sanitizes credentials and distinguishes partial success from 
     rmSync(runtimeRoot, { recursive: true, force: true });
   }
 });
+
+test("verify.run shares its response budget across noisy passing checks and spills evidence", async () => {
+  const { root, runtimeRoot, dbPath } = fixture("aer-beta41-output");
+  const state = new SqliteStateStore(dbPath);
+  try {
+    const registry = new ProjectRegistry({ state });
+    // Control characters exercise JSON expansion as well as combined streams.
+    const output = "\u0001\n\"\\é".repeat(4000);
+    writeFileSync(join(root, "noisy-output.txt"), output);
+    const project = registry.register({
+      rootDir: root,
+      verify: ["typecheck", "test", "benchmark"].map((name) => ({
+        name, executable: "/bin/sh",
+        args: ["-c", "cat noisy-output.txt; cat noisy-output.txt >&2"],
+      })),
+    });
+    const artifacts = new FileArtifactStore(join(runtimeRoot, "artifacts"));
+    const runner = new VerificationRunner({ state, registry, artifacts });
+    const daemon = new AERDaemon({ dataRoot: runtimeRoot, state, projects: registry, policy: permissiveEffectPolicy() });
+    daemon.register(createVerifyRunOperation(runner));
+    daemon.registerDevice({ deviceId: daemon.deviceId, presence: "online", capabilities: { operations: ["verify.run"] } });
+    const result = await daemon.execute(createSemanticOperationEnvelope({ operation: "verify.run", projectId: project.projectId, input: { project: project.projectId } }));
+    assert.equal(result.ok, true, JSON.stringify(result));
+    if (!result.ok) return;
+    const evidence = result.data as VerificationEvidence;
+    assert.ok(Buffer.byteLength(JSON.stringify(evidence)) <= Math.min(daemon.budgets.maxOutputBytes, daemon.budgets.maxReturnedOutputBytes));
+    assert.equal(evidence.canonicalPassed, true);
+    assert.equal(evidence.checksPassed, true);
+    assert.equal(evidence.passed, true);
+    assert.equal(evidence.status, "completed");
+    assert.equal(result.meta.effectState, "applied");
+    assert.equal(runner.hasCanonicalFullPass(project.projectId), true);
+    assert.equal(evidence.checks.length, 3);
+    for (const check of evidence.checks) {
+      assert.equal(check.status, "passed");
+      assert.equal(check.exitCode, 0);
+      assert.equal(check.rawOutputBytes, Buffer.byteLength(output) * 2);
+      assert.ok(check.returnedOutputBytes < check.rawOutputBytes);
+      assert.ok(check.artifactRefs.length > 0);
+      for (const ref of check.artifactRefs) {
+        assert.ok(evidence.artifactRefs.includes(ref));
+        assert.ok(result.meta.artifactRefs.includes(ref));
+        assert.equal(Buffer.from(artifacts.read(ref)).toString(), output);
+      }
+    }
+    assert.equal(result.meta.metrics.rawOutputBytes, Buffer.byteLength(output) * 6);
+    assert.equal(result.meta.metrics.returnedOutputBytes, evidence.checks.reduce((sum, check) => sum + check.returnedOutputBytes, 0));
+  } finally {
+    state.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtimeRoot, { recursive: true, force: true });
+  }
+});
+
+for (const exitCode of [0, 1]) {
+  test(`verify.run bounds oversized metadata with noisy checks (exit ${exitCode})`, async () => {
+    const { root, runtimeRoot, dbPath } = fixture("aer-beta41-metadata");
+    const state = new SqliteStateStore(dbPath);
+    try {
+      const registry = new ProjectRegistry({ state });
+      const output = '\u0001\n"\\é'.repeat(4000);
+      writeFileSync(join(root, "noisy-output.txt"), output);
+      const names = Array.from({ length: 24 }, (_, i) => `check-${i}-${'é"\\'.repeat(1500)}`);
+      const project = registry.register({ rootDir: root, verify: names.map((name) => ({
+        name, executable: "/bin/sh",
+        args: ["-c", `cat noisy-output.txt; cat noisy-output.txt >&2; exit ${exitCode} # ${"metadata".repeat(1000)}`],
+      })) });
+      const artifacts = new FileArtifactStore(join(runtimeRoot, "artifacts"));
+      const runner = new VerificationRunner({ state, registry, artifacts });
+      const daemon = new AERDaemon({ dataRoot: runtimeRoot, state, projects: registry, policy: permissiveEffectPolicy(), budgets: { maxOutputBytes: 8192, maxReturnedOutputBytes: 4096 } });
+      daemon.register(createVerifyRunOperation(runner));
+      daemon.registerDevice({ deviceId: daemon.deviceId, presence: "online", capabilities: { operations: ["verify.run"] } });
+      const result = await daemon.execute(createSemanticOperationEnvelope({ operation: "verify.run", projectId: project.projectId, input: { project: project.projectId } }));
+      assert.equal(result.ok, exitCode === 0, JSON.stringify(result));
+      assert.ok(Buffer.byteLength(JSON.stringify(result.ok ? result.data : result.error)) <= 4096);
+      assert.equal(result.meta.effectState, "applied");
+      assert.equal(runner.hasCanonicalFullPass(project.projectId), exitCode === 0);
+      const durable = runner.latest(project.projectId)!;
+      assert.equal(durable.canonicalPassed, exitCode === 0);
+      assert.equal(durable.presentation, undefined);
+      assert.equal(durable.checks.length, names.length);
+      assert.equal(durable.executedCheckIds.length, names.length);
+      assert.ok(Buffer.byteLength(JSON.stringify(durable)) > 4096);
+      for (const [i, check] of durable.checks.entries()) {
+        assert.equal(check.name, sanitizeDurableText(names[i]!));
+        assert.equal(check.exitCode, exitCode);
+        assert.ok(check.artifactRefs.length > 0);
+        for (const ref of check.artifactRefs) {
+          assert.ok(durable.artifactRefs.includes(ref));
+          assert.equal(Buffer.from(artifacts.read(ref)).toString(), output);
+        }
+      }
+      if (result.ok) {
+        const evidence = result.data as VerificationEvidence;
+        assert.deepEqual(evidence.presentation, { compacted: true, totalChecks: names.length });
+        assert.equal(evidence.verificationId, durable.verificationId);
+        assert.equal(evidence.trustedPlanDigest, durable.trustedPlanDigest);
+        assert.equal(evidence.canonicalPassed, true);
+        assert.equal(evidence.checksPassed, true);
+        assert.equal(evidence.passed, true);
+        assert.equal(evidence.coverage, "full");
+      } else {
+        assert.equal(result.error.code, "VERIFY_FAILED");
+      }
+    } finally {
+      state.close();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+}

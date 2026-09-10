@@ -34,6 +34,8 @@ export interface VerificationCheckEvidence {
 }
 
 export interface VerificationEvidence {
+  /** Presentation only: omitted collections remain available via verificationId. */
+  readonly presentation?: { readonly compacted: true; readonly totalChecks: number };
   readonly verificationId: VerificationId;
   readonly id: VerificationId;
   readonly projectId: ProjectId;
@@ -178,6 +180,22 @@ function durableEvidence(evidence: VerificationEvidence): VerificationEvidence {
   };
 }
 
+function compactEvidence(evidence: VerificationEvidence): VerificationEvidence {
+  return {
+    ...evidence,
+    presentation: { compacted: true, totalChecks: evidence.checks.length },
+    summary: "",
+    checks: [],
+    executedCheckIds: [],
+    allowedEnvironmentKeys: [],
+    artifactRefs: [],
+  };
+}
+
+function serializedBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
 function mergeEffectState(current: EffectState, next: EffectState): EffectState {
   if (current === "unknown" || next === "unknown") return "unknown";
   if (current === "applied" || next === "applied") return "applied";
@@ -258,6 +276,23 @@ export class VerificationRunner {
       const verificationEnvironment = sanitizedEnvironment(this.allowedEnvironmentKeys);
       verificationId = createVerificationId();
       const startedAt = this.clock().toISOString();
+      const outputBudget = Math.min(operationContextWithSpan.budgets.maxOutputBytes, operationContextWithSpan.budgets.maxReturnedOutputBytes);
+      // Reserve the exact compact envelope before any check can apply effects.
+      // false and cancelled are the largest serialized outcome values; ISO dates
+      // reserve the extended-year width as well.
+      const compactEnvelope: VerificationEvidence = {
+        verificationId, id: verificationId, projectId: project.projectId,
+        runId: operationContextWithSpan.runId, status: "cancelled",
+        passed: false, checksPassed: false, canonicalPassed: false, coverage,
+        executedCheckIds: [], trustedPlanDigest: trustedPlan.digest,
+        trustedPlanProvenance: trustedPlan.provenance, executionPosture: "host_unisolated",
+        allowedEnvironmentKeys: [], startedAt, completedAt: "+010000-01-01T00:00:00.000Z",
+        summary: "", checks: [], artifactRefs: [],
+        presentation: { compacted: true, totalChecks: checks.length },
+      };
+      if (serializedBytes(compactEnvelope) > outputBudget) {
+        throw createRuntimeError({ code: "VERIFY_OUTPUT_BUDGET_TOO_SMALL", message: "Response budget cannot hold verification evidence", retryable: false, effect: "none" });
+      }
       this.emitVerification({
         traceId: operationContextWithSpan.traceId,
         runId: operationContextWithSpan.runId,
@@ -269,13 +304,20 @@ export class VerificationRunner {
         summary: "Verification started",
       });
       this.persistPartial(verificationId, project, operationContextWithSpan, "verifying", startedAt, [], coverage, checks.map((check) => check.checkId), verificationEnvironment.allowed);
+      // Direct limits each stream independently. Reserve metadata space and
+      // worst-case JSON escaping; the final serialization check is authoritative.
+      const artifactChunksPerCheck = 2 + Math.ceil(Math.min(operationContextWithSpan.budgets.maxRawOutputBytes, operationContextWithSpan.budgets.maxArtifactBytes) / (64 * 1024));
+      const metadataBytes = 2048 + new TextEncoder().encode(JSON.stringify(trustedPlan.provenance)).byteLength
+        + checks.reduce((bytes, check) => bytes + 512 + new TextEncoder().encode(JSON.stringify([check.checkId, check.checkId, check.name, displayCommand(check)])).byteLength + artifactChunksPerCheck * 170, 0)
+        + new TextEncoder().encode(JSON.stringify(verificationEnvironment.allowed)).byteLength;
+      const perStreamOutputBytes = Math.max(0, Math.floor((outputBudget - metadataBytes) / (checks.length * 2 * 6)));
       const evidence: VerificationCheckEvidence[] = [];
       let effectState: EffectState = "none";
       for (const check of checks) {
         try {
           const result = check.kind === "shell"
-            ? await this.direct.runShell({ command: check.command ?? "", cwd: project.rootDir, env: verificationEnvironment.env, inheritEnvironment: false, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ShellRunInput, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" })
-            : await this.direct.runExecutable({ executable: check.executable ?? "", args: check.args, cwd: project.rootDir, env: verificationEnvironment.env, inheritEnvironment: false, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), ...(check.maxOutputBytes === undefined ? {} : { maxOutputBytes: check.maxOutputBytes }) } satisfies ExecutableCommand, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" });
+            ? await this.direct.runShell({ command: check.command ?? "", cwd: project.rootDir, env: verificationEnvironment.env, inheritEnvironment: false, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), maxOutputBytes: Math.min(check.maxOutputBytes ?? perStreamOutputBytes, perStreamOutputBytes) } satisfies ShellRunInput, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" })
+            : await this.direct.runExecutable({ executable: check.executable ?? "", args: check.args, cwd: project.rootDir, env: verificationEnvironment.env, inheritEnvironment: false, ...(check.timeoutMs === undefined ? {} : { timeoutMs: check.timeoutMs }), maxOutputBytes: Math.min(check.maxOutputBytes ?? perStreamOutputBytes, perStreamOutputBytes) } satisfies ExecutableCommand, operationContextWithSpan, { instrument: false, effectClass: "workspace_write" });
           if (result.ok) {
             effectState = mergeEffectState(effectState, result.meta.effectState);
             evidence.push(processEvidence(check, result.data, undefined));
@@ -336,7 +378,8 @@ export class VerificationRunner {
       const operationEvent = status === "completed" ? span.complete({ summary, artifactRefs: resultEvidence.artifactRefs, effectState }) : status === "cancelled" ? span.cancel({ summary, artifactRefs: resultEvidence.artifactRefs, effectState }) : status === "unknown" ? span.unknown(error!, { summary, artifactRefs: resultEvidence.artifactRefs, effectState }) : span.fail(error!, { summary, artifactRefs: resultEvidence.artifactRefs, effectState });
       this.persistEvent(operationEvent);
       const meta = createOperationMeta({ context: operationContextWithSpan, operation: "verify.run", status: status === "completed" ? "completed" : status, effectClass: "workspace_write", effectState, startedAt: span.startedAt, completedAt: operationEvent.timestamp, artifactRefs: resultEvidence.artifactRefs, metrics: operationEvent, summary, verificationId });
-      if (status === "completed") return runtimeSuccess(resultEvidence, meta);
+      const returnedEvidence = serializedBytes(resultEvidence) <= outputBudget ? resultEvidence : compactEvidence(resultEvidence);
+      if (status === "completed") return runtimeSuccess(returnedEvidence, meta);
       return runtimeFailure(error!, meta);
     } catch (cause) {
       const error = errorFor(cause, "VERIFY_RUN_FAILED");
