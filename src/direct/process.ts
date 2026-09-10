@@ -450,12 +450,16 @@ export class DirectProcessManager {
       }, this.cancelGraceMs);
       if (reason === "timeout") timedOut = true;
     };
-    if (timeoutMs !== undefined) timer = setTimeout(() => requestCancel("timeout"), timeoutMs);
-    if (options.context.deadline !== undefined) {
-      const remaining = Math.max(0, options.context.deadline - Date.now());
-      if (remaining === 0) requestCancel("timeout");
-      else if (timeoutMs === undefined || remaining < timeoutMs) timer = setTimeout(() => requestCancel("timeout"), remaining);
-    }
+    const remainingDeadlineMs = options.context.deadline === undefined
+      ? undefined
+      : Math.max(0, options.context.deadline - Date.now());
+    const effectiveTimeoutMs = timeoutMs === undefined
+      ? remainingDeadlineMs
+      : remainingDeadlineMs === undefined
+        ? timeoutMs
+        : Math.min(timeoutMs, remainingDeadlineMs);
+    if (effectiveTimeoutMs === 0) requestCancel("timeout");
+    else if (effectiveTimeoutMs !== undefined) timer = setTimeout(() => requestCancel("timeout"), effectiveTimeoutMs);
     const abort = (): void => requestCancel("cancel");
     if (options.context.signal.aborted) abort();
     else options.context.signal.addEventListener("abort", abort, { once: true });

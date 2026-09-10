@@ -15,16 +15,20 @@ import {
   TaskManager,
 } from "../src/index.ts";
 
-function fixture(prefix: string): { readonly root: string; readonly runtime: string; readonly executable: string } {
+function fixture(prefix: string, approvalMode: "legacy" | "config" = "legacy"): { readonly root: string; readonly runtime: string; readonly executable: string } {
   const root = mkdtempSync(join(tmpdir(), `${prefix}-project-`));
   const runtime = mkdtempSync(join(tmpdir(), `${prefix}-runtime-`));
   const executable = join(runtime, "codex-fixture");
+  const approvalHelp = approvalMode === "legacy" ? "--ask-for-approval --config" : "--config";
+  const approvalGate = approvalMode === "legacy"
+    ? "args.includes('--ask-for-approval') && args.includes('never')"
+    : "args.includes('--config') && args.includes('approval_policy=\"never\"')";
   writeFileSync(executable, `#!/usr/bin/env node
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('codex 0.99.0'); process.exit(0); }
-if (args[0] === 'exec' && args[1] === '--help') { console.log('--json --sandbox --ask-for-approval --ignore-user-config --ignore-rules --color --ephemeral --skip-git-repo-check --config'); process.exit(0); }
+if (args[0] === 'exec' && args[1] === '--help') { console.log('--json --sandbox ${approvalHelp} --ignore-user-config --ignore-rules --color --ephemeral --skip-git-repo-check'); process.exit(0); }
 if (args[0] === 'app-server') process.exit(1);
-if (args.includes('--ignore-user-config') && args.includes('--ignore-rules') && args.includes('--ask-for-approval') && args.includes('--sandbox')) {
+if (args.includes('--ignore-user-config') && args.includes('--ignore-rules') && (${approvalGate}) && args.includes('--sandbox')) {
   const output = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
   output({ type: 'thread.started', thread_id: 'thread-fixture' });
   output({ type: 'item.completed', item: { type: 'agent_message', text: process.env.GH_TOKEN ? 'secret-visible' : (process.env.AER_REQUIRED_ORDINARY || 'missing') } });
@@ -110,6 +114,29 @@ test("Codex adapter owns bounded agent lifecycle and least-privilege child postu
     else process.env.GH_TOKEN = priorToken;
     if (priorOrdinary === undefined) delete process.env.AER_REQUIRED_ORDINARY;
     else process.env.AER_REQUIRED_ORDINARY = priorOrdinary;
+    state.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("Codex adapter supports config-based approval_policy=never used by current CLI", async () => {
+  const { root, runtime, executable } = fixture("aer-agent-modern", "config");
+  const state = new SqliteStateStore(join(runtime, "aer.db"));
+  try {
+    const registry = new ProjectRegistry({ state });
+    const project = registry.register({ rootDir: root });
+    const tasks = new TaskManager({ state });
+    const task = tasks.create({ projectId: project.projectId, title: "modern approval posture" });
+    const executor = new CodexAgentExecutor({ executable, registry, state, tasks });
+    const capabilities = await executor.capabilities();
+    assert.equal(capabilities.compatible, true);
+    assert.equal(capabilities.supportedAutomationFlags.includes("--ask-for-approval"), false);
+    assert.equal(capabilities.supportedAutomationFlags.includes("--config"), true);
+    const result = await executor.run({ taskId: task.taskId, projectId: project.projectId, runId: task.runId, prompt: "report" }, context(project.projectId, task.taskId, task.runId));
+    assert.equal(result.status, "completed");
+    assert.equal(result.capabilityPosture.approval, "never");
+  } finally {
     state.close();
     rmSync(root, { recursive: true, force: true });
     rmSync(runtime, { recursive: true, force: true });

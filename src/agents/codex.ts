@@ -47,8 +47,8 @@ const SAFE_BASELINE_KEYS = [
   "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR", "CI",
 ] as const;
 const SAFE_ORDINARY_ENVIRONMENT = /^(?:SHELL|HOSTNAME|LANGUAGE|TZ|COLORTERM|FORCE_COLOR|CONTINUOUS_INTEGRATION|AER_[A-Z0-9_]+|ACP_[A-Z0-9_]+)$/i;
-const REQUIRED_FLAGS = ["--json", "--sandbox", "--ask-for-approval", "--ignore-user-config", "--ignore-rules"] as const;
-const KNOWN_FLAGS = [...REQUIRED_FLAGS, "--color", "--ephemeral", "--config", "--skip-git-repo-check"] as const;
+const REQUIRED_FLAGS = ["--json", "--sandbox", "--ignore-user-config", "--ignore-rules"] as const;
+const KNOWN_FLAGS = [...REQUIRED_FLAGS, "--ask-for-approval", "--color", "--ephemeral", "--config", "--skip-git-repo-check"] as const;
 const DEFAULT_CREDENTIAL_CLASSIFIERS: readonly CredentialClassifier[] = [
   { name: "token", pattern: /token/i },
   { name: "secret", pattern: /secret/i },
@@ -346,11 +346,13 @@ export class CodexAgentExecutor implements AgentExecutor {
       appServer = appHelp.code === 0 ? "available" : "unsupported";
     } catch { appServer = "unsupported"; }
     const missing = REQUIRED_FLAGS.filter((flag) => !supportedFlags.includes(flag));
+    const hasNeverApprovalControl = supportedFlags.includes("--ask-for-approval") || supportedFlags.includes("--config");
     const incompatibilities = [
       ...(versionProbe.code !== 0 ? ["codex --version did not complete successfully"] : []),
       ...(installedVersion === undefined ? ["installed Codex version could not be determined"] : []),
       ...(help.code !== 0 ? ["codex exec --help did not complete successfully"] : []),
       ...(missing.length === 0 ? [] : [`required automation flags are unavailable: ${missing.join(", ")}`]),
+      ...(hasNeverApprovalControl ? [] : ["installed Codex cannot enforce non-interactive approval_policy=never"]),
     ];
     return this.capabilityResult(detectedAt, installedVersion, supportedFlags, appServer, incompatibilities);
   }
@@ -423,7 +425,9 @@ export class CodexAgentExecutor implements AgentExecutor {
     const sandbox = canWrite ? "workspace-write" : "read-only";
     const network = this.grantNetwork && canNetwork;
     if (network && !capabilities.supportedAutomationFlags.includes("--config")) throw createRuntimeError({ code: "AGENT_NETWORK_UNSUPPORTED", message: "The installed Codex cannot express the requested network posture", retryable: false, effect: "none" });
-    const args: string[] = ["exec", "--json", "--ignore-user-config", "--ignore-rules", "--sandbox", sandbox, "--ask-for-approval", "never"];
+    const args: string[] = ["exec", "--json", "--ignore-user-config", "--ignore-rules", "--sandbox", sandbox];
+    if (capabilities.supportedAutomationFlags.includes("--ask-for-approval")) args.push("--ask-for-approval", "never");
+    else args.push("--config", 'approval_policy="never"');
     if (capabilities.supportedAutomationFlags.includes("--color")) args.push("--color", "never");
     if (capabilities.supportedAutomationFlags.includes("--ephemeral")) args.push("--ephemeral");
     if (capabilities.supportedAutomationFlags.includes("--skip-git-repo-check")) args.push("--skip-git-repo-check");

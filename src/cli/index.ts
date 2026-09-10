@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import { argv, cwd as processCwd, env, exit, stdout, versions } from "node:process";
@@ -11,6 +12,7 @@ import { createSemanticOperationEnvelope } from "../remote/index.ts";
 import type { RuntimeBudgetOverrides } from "../policy/budgets.ts";
 import { sanitizeDurableText } from "../observability/redaction.ts";
 import { compareRuns } from "../benchmark/compare.ts";
+import { createSpanId, fullAlphaDefaultPolicy } from "../core/index.ts";
 
 export interface CliOptions {
   readonly dataRoot?: string;
@@ -108,10 +110,18 @@ function parseNumber(value: string | undefined): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
-function makeDaemon(dataRoot: string): AERDaemon {
-  const daemon = registerMcpOperations(new AERDaemon({ dataRoot }));
+function makeDaemon(dataRoot: string, localDestructiveApproval = false): AERDaemon {
+  const basePolicy = fullAlphaDefaultPolicy();
+  const policy = localDestructiveApproval
+    ? { ...basePolicy, name: "full-alpha-local-cli-approved", approvalRequiredClasses: (basePolicy.approvalRequiredClasses ?? []).filter((effect) => effect !== "destructive") }
+    : basePolicy;
+  const daemon = registerMcpOperations(new AERDaemon({ dataRoot, policy }));
   daemon.registerDevice({ deviceId: daemon.deviceId, presence: "online" });
   return daemon;
+}
+
+function approvalDigest(operation: string, projectId: string, input: unknown): string {
+  return createHash("sha256").update(JSON.stringify({ operation, projectId, input })).digest("hex");
 }
 
 function finishDaemon(daemon: AERDaemon): void {
@@ -147,7 +157,7 @@ export async function runCli(arguments_: readonly string[] = argv.slice(2), opti
     if (command === "doctor") return { ok: true, command, data: await doctor(dataRoot) };
     if (command === "help" || command === "--help" || command === "-h") return { ok: true, command: "help", data: { commands: ["doctor", "init", "inspect", "resume", "run", "verify", "github snapshot", "github wait", "agent codex", "runs list", "runs show", "runs compare", "device list", "mcp", "daemon"] } };
     if (command === "init") {
-      const root = resolve(args[1] ?? cwd);
+      const root = args[1] === undefined ? cwd : resolve(cwd, args[1]);
       const daemon = makeDaemon(dataRoot);
       try { return { ok: true, command, data: daemon.registerProject({ rootDir: root }) }; }
       finally { finishDaemon(daemon); }
@@ -181,11 +191,36 @@ export async function runCli(arguments_: readonly string[] = argv.slice(2), opti
         return result.ok ? { ok: true, command, data: presented(result) } : { ok: false, command, error: safeError(result.error), data: presented(result) };
       }
       if (command === "run") {
-        const projectId = projectFor(daemon, cwd);
-        const shell = args.slice(1).filter((arg) => arg !== "--json").join(" ");
-        if (shell.trim() === "") throw Object.assign(new Error("A command is required"), { code: "CLI_COMMAND_REQUIRED" });
-        const result = await execute(daemon, "shell.run", { command: shell }, projectId);
-        return result.ok ? { ok: true, command, data: presented(result) } : { ok: false, command, error: safeError(result.error), data: presented(result) };
+        const approved = args[1] === "--approve";
+        // Approval is deliberately local-CLI-only. MCP never receives a tool
+        // that can mint or resolve approval, so a model cannot widen its own
+        // authority through the AER surface.
+        const executionDaemon = approved ? makeDaemon(dataRoot, true) : daemon;
+        try {
+          const projectId = projectFor(executionDaemon, cwd);
+          const shell = args.slice(approved ? 2 : 1).filter((arg) => arg !== "--json").join(" ");
+          if (shell.trim() === "") throw Object.assign(new Error("A command is required"), { code: "CLI_COMMAND_REQUIRED" });
+          const input = { command: shell };
+          const envelope = createSemanticOperationEnvelope({ operation: "shell.run", input, projectId: projectId as never, actor: approved ? "user" : "model", ...(approved ? { principal: "local-cli" } : {}) });
+          let decisionId: string | undefined;
+          if (approved) {
+            const digest = approvalDigest("shell.run", projectId, input);
+            decisionId = `decision_${digest.slice(0, 24)}_${Date.now().toString(36)}`;
+            const timestamp = new Date().toISOString();
+            executionDaemon.state.saveEntity({ kind: "decisions", id: decisionId, projectId, runId: envelope.runId, traceId: envelope.traceId, status: "approved", createdAt: timestamp, updatedAt: timestamp, data: { source: "local-cli", operation: "shell.run", effectClass: "destructive", argumentsDigest: digest, oneShot: true } });
+            executionDaemon.tracer.emit({ traceId: envelope.traceId, runId: envelope.runId, spanId: createSpanId(), type: "approval.requested", actor: "user", projectId: projectId as never, operation: "shell.run", status: "waiting_approval", effectClass: "destructive", effectState: "none", metadata: { decisionId, source: "local-cli", argumentsDigest: digest } });
+            executionDaemon.tracer.emit({ traceId: envelope.traceId, runId: envelope.runId, spanId: createSpanId(), type: "approval.resolved", actor: "user", projectId: projectId as never, operation: "shell.run", status: "completed", effectClass: "destructive", effectState: "none", metadata: { decisionId, source: "local-cli", decision: "approved", argumentsDigest: digest } });
+          }
+          const result = await executionDaemon.execute(envelope);
+          if (decisionId !== undefined) {
+            const prior = executionDaemon.state.getEntity("decisions", decisionId);
+            const timestamp = new Date().toISOString();
+            executionDaemon.state.saveEntity({ kind: "decisions", id: decisionId, projectId, runId: envelope.runId, traceId: envelope.traceId, status: "consumed", createdAt: prior?.createdAt ?? timestamp, updatedAt: timestamp, data: { ...(prior?.data ?? {}), consumedAt: timestamp, resultStatus: result.meta.status, effectState: result.meta.effectState } });
+          }
+          return result.ok ? { ok: true, command, data: presented(result) } : { ok: false, command, error: safeError(result.error), data: presented(result) };
+        } finally {
+          if (approved) finishDaemon(executionDaemon);
+        }
       }
       if (command === "process") {
         const subcommand = args[1] ?? "start";

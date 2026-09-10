@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AERDaemon, createMcpFactory, createMcpHandler, registerMcpOperations, SqliteStateStore } from "../src/index.ts";
+import { runCli } from "../src/cli/index.ts";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 async function mcpCall(handler: (request: Request) => Promise<Response>, id: number, method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
   const response = await handler(new Request("http://127.0.0.1/mcp", {
@@ -44,4 +48,63 @@ test("MCP schema and AER effect authority fail closed", async () => {
     assert.notEqual((approval.result as { isError?: boolean }).isError, true);
     assert.equal(daemon.state.listEvents({ type: "process.started" }).length, 0);
   } finally { state.close(); }
+});
+
+
+test("CLI init resolves relative project paths against --cwd/options cwd", async () => {
+  const root = await mkdtemp(join(tmpdir(), "aer-cli-cwd-"));
+  const project = join(root, "project");
+  const dataRoot = join(root, "state");
+  await import("node:fs/promises").then(({ mkdir }) => mkdir(project));
+  try {
+    const initialized = await runCli(["init", "."], { cwd: project, dataRoot });
+    assert.equal(initialized.ok, true);
+    const data = initialized.data as { root?: string; rootDir?: string };
+    assert.equal(data.root, project);
+    assert.equal(data.rootDir, project);
+    const inspected = await runCli(["inspect"], { cwd: project, dataRoot });
+    assert.equal(inspected.ok, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+
+test("local CLI approval is explicit, one-shot, audited, and runs in the canonical project root", async () => {
+  const root = await mkdtemp(join(tmpdir(), "aer-cli-approval-"));
+  const project = join(root, "project");
+  const dataRoot = join(root, "state");
+  await mkdir(project);
+  try {
+    const initialized = await runCli(["init", "."], { cwd: project, dataRoot });
+    assert.equal(initialized.ok, true);
+
+    const blocked = await runCli(["run", "pwd"], { cwd: project, dataRoot });
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.error?.code, "EFFECT_APPROVAL_REQUIRED");
+
+    const approved = await runCli(["run", "--approve", "pwd"], { cwd: project, dataRoot });
+    assert.equal(approved.ok, true);
+    const approvedData = approved.data as { data?: { stdout?: string }; meta?: { effectClass?: string; policyDecision?: string } };
+    assert.equal(approvedData.data?.stdout?.trim(), project);
+    assert.equal(approvedData.meta?.effectClass, "destructive");
+    assert.equal(approvedData.meta?.policyDecision, "allow");
+
+    const state = new SqliteStateStore(join(dataRoot, "aer.db"));
+    try {
+      const decisions = state.listEntities("decisions", { projectId: (initialized.data as { projectId: string }).projectId });
+      assert.equal(decisions.length, 1);
+      assert.equal(decisions[0]?.status, "consumed");
+      assert.equal(decisions[0]?.data?.source, "local-cli");
+      assert.equal(decisions[0]?.data?.oneShot, true);
+      assert.equal(decisions[0]?.data?.operation, "shell.run");
+      assert.equal(typeof decisions[0]?.data?.argumentsDigest, "string");
+      assert.equal(JSON.stringify(decisions[0]?.data).includes("pwd"), false);
+      assert.equal(state.listEvents({ type: "approval.requested" }).length, 1);
+      assert.equal(state.listEvents({ type: "approval.resolved" }).length, 1);
+      assert.equal(state.listEvents({ type: "process.started" }).length, 1);
+    } finally { state.close(); }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
